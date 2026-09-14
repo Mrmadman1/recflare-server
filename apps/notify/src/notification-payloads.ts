@@ -76,7 +76,9 @@ export enum CurrencyType {
 	DraculaSilver = 101,
 	RecRoyaleSeason1 = 200,
 	RoomCurrency = 300,
+	RoomInventoryItem = 301,
 	ProgressionEvent = 400,
+	RoomieCredits = 500,
 }
 
 /** Why a player was kicked/banned/warned. Shared by ModerationKick and ModerationUnkick. */
@@ -369,15 +371,29 @@ export interface CreatorClubSubscriptionPayload {
 	MembershipType: number
 }
 
-/** `RoomCurrencyCreated` / `RoomCurrencyModified`. */
+/**
+ * `RoomCurrencyCreated` / `RoomCurrencyModified` — and the same object
+ * `POST /api/roomcurrencies/v1/createCurrency` answers with.
+ *
+ * Members are in the CLIENT'S OWN ORDER, taken from its field layout rather than guessed:
+ * `Shape` (a byte) and `Color` (an int) sit between `Limit` and `ImageName`. They were
+ * missing from this interface while it was recovered from a frame alone, and econ spread
+ * them onto the end of the payload instead — which carried them, but put them somewhere the
+ * client's model doesn't have them.
+ */
 export interface RoomCurrencyPayload {
 	CurrencyId: string
+	/** Nullable in the client's model (`long?`), though a room currency always names one. */
 	RoomId: number | null
 	Name: string
 	Description: string
 	CurrencyType: CurrencyType
 	Limit: number
-	ImageName: string
+	/** A byte in the client's model — its index into the coin shapes. */
+	Shape: number
+	Color: number
+	/** Null for a currency with no custom coin art. */
+	ImageName: string | null
 	/** ISO-8601. */
 	CreatedAt: string
 	/** ISO-8601. */

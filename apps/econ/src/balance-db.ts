@@ -39,6 +39,9 @@ import { BalancePlatform } from '../../notify/src/notification-payloads'
  *    room would spend in every other. `isSpendable` rejects them for that reason.
  *  - `ProgressionEvent` (400): an XP/progression counter the client models as a
  *    currency. Not spendable.
+ *  - `RoomieCredits` (500): the newest member of the client's enum. Nothing here grants or
+ *    spends it yet; it is listed so the enum matches the client's and a value arriving on
+ *    the wire has a name rather than reading as an unknown number.
  */
 export const CurrencyType = {
 	Invalid: 0,
@@ -50,6 +53,7 @@ export const CurrencyType = {
 	RoomCurrency: 300,
 	RoomInventoryItem: 301,
 	ProgressionEvent: 400,
+	RoomieCredits: 500,
 } as const
 
 export type CurrencyTypeValue = (typeof CurrencyType)[keyof typeof CurrencyType]

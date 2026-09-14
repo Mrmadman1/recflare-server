@@ -9,8 +9,10 @@ import {
 	getProgression,
 	INVENTORY_INVENTION_SCHEMA_DDL,
 	OUTFIT_SCHEMA_DDL,
+	PRESENCE_SCHEMA_DDL,
 	PROGRESSION_SCHEMA_DDL,
 	RECEIVED_GIFT_SCHEMA_DDL,
+	ROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
@@ -71,6 +73,7 @@ import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
+import { ROOM_BALANCE_SCHEMA_DDL, ROOM_CURRENCY_SCHEMA_DDL } from '../../room-currency-db'
 
 import type { CatalogLoadRow, CatalogRow, CatalogValue } from '../../catalog-db'
 import type { Env } from '../../context'
@@ -158,6 +161,29 @@ beforeAll(async () => {
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_CURRENCY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Presence (owned by the `match` worker) — a new room currency is pushed to everyone
+	// standing in the room, which is read from here.
+	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The rooms table (owned by the `rooms` worker) — creating a room currency reads the room
+	// blob to apply its creator/co-owner check (the blob alone: `canManageRoomById` skips the
+	// hydration that would drag in subrooms/tags/stats). Room 2511 is account 1's, with 2 as
+	// co-owner.
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	await env.DB.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
+		.bind(
+			JSON.stringify({
+				RoomId: 2511,
+				Name: 'CurrencyRoom',
+				CreatorAccountId: 1,
+				Roles: [
+					{ AccountId: 1, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+					{ AccountId: 2, Role: 30, LastChangedByAccountId: null, InvitedRole: 0 },
+				],
+			})
+		)
+		.run()
 	// A few equipment skins, which is where the WEEKLY CHALLENGE gift pool comes from now that
 	// skins are awarded rather than sold and no storefront lists one. Without these the pool is
 	// empty and the week has nothing to be themed on.
@@ -753,10 +779,688 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('GET /api/roomcurrencies/v1/currencies returns []', async () => {
+	test('GET /api/roomcurrencies/v1/currencies returns [] for a room with none', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/currencies?roomId=1`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
+
+		// An unknown room and a missing roomId read the same way — the client takes any of
+		// them as "this room has no currency of its own".
+		for (const query of ['?roomId=99999', '', '?roomId=nope']) {
+			const other = await exports.default.fetch(
+				`${ORIGIN}/api/roomcurrencies/v1/currencies${query}`
+			)
+			expect(other.status).toBe(200)
+			expect(await other.json()).toEqual([])
+		}
+	})
+
+	// Room 2511 is seeded as account 1's, with account 2 as co-owner.
+	describe('room currencies', () => {
+		type RoomCurrency = {
+			CurrencyId: string
+			RoomId: number
+			Name: string
+			Description: string
+			CurrencyType: number
+			Limit: number
+			Shape: number
+			Color: number
+			ImageName: string | null
+			CreatedAt: string
+			ModifiedAt: string
+		}
+
+		const create = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+			exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/createCurrency`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+				body: new URLSearchParams(fields),
+			})
+
+		/** Everything the stub hub was pushed since the last call (see vitest.config). */
+		const drainFrames = async (): Promise<
+			Array<{
+				accountId: number
+				notificationType: string | number
+				payload: Record<string, unknown>
+			}>
+		> =>
+			(
+				env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
+					drainFrames(): Promise<
+						Array<{
+							accountId: number
+							notificationType: string | number
+							payload: Record<string, unknown>
+						}>
+					>
+				}
+			).drainFrames()
+
+		/** The `{ Value, Success, Error, error_id }` envelope the create endpoint answers in. */
+		const envOf = async (res: Response) =>
+			(await res.json()) as {
+				Value: RoomCurrency | null
+				Success: boolean
+				Error: string | null
+				error_id: null
+			}
+
+		const currenciesOf = async (roomId: number) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/currencies?roomId=${roomId}`)
+			).json()) as RoomCurrency[]
+
+		const body = {
+			RoomId: '2511',
+			Name: 'Devintokens',
+			Description: 'this is my currency',
+			Limit: '100',
+			Shape: '0',
+			Color: '19',
+		}
+
+		test('POST createCurrency is gated to the room’s creator or a co-owner', async () => {
+			// Only the auth gates answer with a status of their own: no token → 401, a valid
+			// token with no standing in the room → 403.
+			expect((await create(body)).status).toBe(401)
+			expect((await create(body, await bearer('999'))).status).toBe(403)
+
+			// Everything else is a 200 carrying the failure envelope — an unknown room, an
+			// unusable RoomId, an empty Name. None of them writes anything.
+			for (const bad of [
+				{ ...body, RoomId: '99999' },
+				{ ...body, RoomId: 'nope' },
+				{ ...body, Name: '  ' },
+			]) {
+				const res = await create(bad, await bearer('1'))
+				expect(res.status).toBe(200)
+				expect(await envOf(res)).toEqual({
+					Value: null,
+					Success: false,
+					Error: 'Failed to create currency',
+					error_id: null,
+				})
+			}
+			expect(await currenciesOf(2511)).toEqual([])
+		})
+
+		test('POST createCurrency mints the currency and the list reads it back', async () => {
+			const res = await create(body, await bearer('1'))
+			expect(res.status).toBe(200)
+
+			// Enveloped: the client unwraps it and hands its callers `Value` alone.
+			const env = await envOf(res)
+			expect(env).toMatchObject({ Success: true, Error: null, error_id: null })
+			const created = env.Value!
+			// The client's own model, member for member and in its order.
+			expect(Object.keys(created)).toEqual([
+				'CurrencyId',
+				'RoomId',
+				'Name',
+				'Description',
+				'CurrencyType',
+				'Limit',
+				'Shape',
+				'Color',
+				'ImageName',
+				'CreatedAt',
+				'ModifiedAt',
+			])
+			expect(created).toMatchObject({
+				RoomId: 2511,
+				Name: 'Devintokens',
+				Description: 'this is my currency',
+				// A room currency is told apart by its id, not its type — the type is always 300.
+				CurrencyType: 300,
+				Limit: 100,
+				Shape: 0,
+				Color: 19,
+				// Null until custom coin art can be uploaded — null, not empty string.
+				ImageName: null,
+			})
+			// A GUID of its own, and timestamps that start equal.
+			expect(created.CurrencyId).toMatch(/^[0-9a-f-]{36}$/)
+			expect(created.ModifiedAt).toBe(created.CreatedAt)
+			expect(Date.parse(created.CreatedAt)).not.toBeNaN()
+
+			// The list serves it back, and it belongs to this room alone.
+			expect(await currenciesOf(2511)).toEqual([created])
+			expect(await currenciesOf(1)).toEqual([])
+
+			// A co-owner may mint one too, and a room can hold several — oldest first.
+			const second = await create({ ...body, Name: 'Coowner coins', Limit: '5' }, await bearer('2'))
+			expect(second.status).toBe(200)
+			const list = await currenciesOf(2511)
+			expect(list.map((c) => c.Name)).toEqual(['Devintokens', 'Coowner coins'])
+			// Each carries its own id — two currencies in one room are not one currency.
+			expect(new Set(list.map((c) => c.CurrencyId)).size).toBe(2)
+			expect(list[1]).toMatchObject({ Limit: 5, CurrencyType: 300 })
+		})
+
+		test('POST updateCurrency edits it, gated by the room that minted it', async () => {
+			const made = (await envOf(await create({ ...body, Name: 'Before' }, await bearer('1'))))
+				.Value!
+
+			const update = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/updateCurrency`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+					body: new URLSearchParams(fields),
+				})
+
+			// No token → 401. A valid token belonging to nobody in the room → 403: the room
+			// comes off the CURRENCY, so the caller can't point the gate somewhere friendlier.
+			expect((await update({ CurrencyId: made.CurrencyId, Name: 'X' })).status).toBe(401)
+			expect(
+				(await update({ CurrencyId: made.CurrencyId, Name: 'X' }, await bearer('999'))).status
+			).toBe(403)
+
+			// An unknown currency, a missing id and a blank name are the failure envelope — a
+			// name sent but empty is a bad edit, not "leave it alone".
+			const badEdits: Array<Record<string, string>> = [
+				{ CurrencyId: 'a3f1e8d2-0000-4000-8000-000000000000', Name: 'X' },
+				{ Name: 'X' },
+				{ CurrencyId: made.CurrencyId, Name: '   ' },
+			]
+			for (const bad of badEdits) {
+				const res = await update(bad, await bearer('1'))
+				expect(res.status).toBe(200)
+				expect(await envOf(res)).toEqual({
+					Value: null,
+					Success: false,
+					Error: 'Failed to update currency',
+					error_id: null,
+				})
+			}
+			// None of that touched it.
+			expect((await currenciesOf(2511)).find((cur) => cur.CurrencyId === made.CurrencyId)).toEqual(
+				made
+			)
+
+			// The owner edits every mutable field.
+			const res = await update(
+				{
+					CurrencyId: made.CurrencyId,
+					Name: 'After',
+					Description: 'edited',
+					Limit: '330',
+					Shape: '9',
+					Color: '5',
+				},
+				await bearer('1')
+			)
+			expect(res.status).toBe(200)
+			const updated = (await envOf(res)).Value!
+			expect(updated).toMatchObject({
+				CurrencyId: made.CurrencyId,
+				Name: 'After',
+				Description: 'edited',
+				Limit: 330,
+				Shape: 9,
+				Color: 5,
+				// What an edit may never change.
+				RoomId: 2511,
+				CurrencyType: 300,
+				CreatedAt: made.CreatedAt,
+			})
+			// `ModifiedAt` moves; `CreatedAt` doesn't. That is what the client carries both for.
+			expect(Date.parse(updated.ModifiedAt)).toBeGreaterThanOrEqual(Date.parse(made.CreatedAt))
+			// Persisted, and still one row rather than a second currency.
+			const listed = (await currenciesOf(2511)).filter((cur) => cur.CurrencyId === made.CurrencyId)
+			expect(listed).toEqual([updated])
+
+			// A co-owner may edit too, and a field left out is left ALONE rather than reset.
+			const partial = await update({ CurrencyId: made.CurrencyId, Limit: '7' }, await bearer('2'))
+			expect(partial.status).toBe(200)
+			expect((await envOf(partial)).Value).toMatchObject({
+				Limit: 7,
+				Name: 'After',
+				Description: 'edited',
+				Shape: 9,
+				Color: 5,
+			})
+
+			// And a name is masked on the way in, like it is on create.
+			const masked = await update(
+				{ CurrencyId: made.CurrencyId, Name: 'shit bucks' },
+				await bearer('1')
+			)
+			expect((await envOf(masked)).Value?.Name).toBe('**** bucks')
+		})
+
+		test('POST updateCurrency pushes RoomCurrencyModified to the room and the editor', async () => {
+			const made = (await envOf(await create({ ...body, Name: 'Watched' }, await bearer('1'))))
+				.Value!
+
+			const now = Math.floor(Date.now() / 1000)
+			await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId: 320,
+						roomInstance: { roomInstanceId: 1002511, roomId: 2511, subRoomId: 2511 },
+						expiresAt: now + 900,
+					})
+				)
+				.run()
+			await drainFrames()
+
+			const res = await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/updateCurrency`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					...(await bearer('1')),
+				},
+				body: new URLSearchParams({ CurrencyId: made.CurrencyId, Name: 'Renamed' }),
+			})
+			expect(res.status).toBe(200)
+
+			// An edit reaches the room, not just the editor — otherwise everyone else keeps
+			// spending the currency under its old name and cap.
+			const frames = await drainFrames()
+			expect(frames.map((f) => f.accountId).sort((a, b) => a - b)).toEqual([1, 320])
+			expect(
+				frames.every((f) => f.notificationType === NotificationType.RoomCurrencyModified)
+			).toBe(true)
+			expect(frames[0].payload).toMatchObject({
+				CurrencyId: made.CurrencyId,
+				Name: 'Renamed',
+				RoomId: 2511,
+				CurrencyType: 300,
+			})
+
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 320').run()
+		})
+
+		test('POST awardCurrency/bulk credits players, reporting each entry on its own', async () => {
+			const coin = (
+				await envOf(await create({ ...body, Name: 'Payable', Limit: '10' }, await bearer('1')))
+			).Value!
+
+			type AwardResult = {
+				AccountId: number
+				CurrencyId: string
+				Success: boolean
+				Error: string | null
+				Response: {
+					AccountId: number
+					CurrencyId: string
+					Balance: number
+					AmountAwarded: number
+					AwardedAt: string
+				} | null
+			}
+			const award = async (awards: unknown, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/awardCurrency/bulk`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', ...headers },
+					body: JSON.stringify(awards),
+				})
+			const resultsOf = async (res: Response) => (await res.json()) as AwardResult[]
+
+			const one = [
+				{
+					CurrencyId: coin.CurrencyId,
+					RecipientId: 205,
+					Amount: 1,
+					TransactionId: '6f523936-7aa8-4660-b02e-cfd388902402',
+				},
+			]
+
+			// Only the token is answered at the call level.
+			expect((await award(one)).status).toBe(401)
+
+			// A caller with no standing in the minting room is refused PER ENTRY, not with a
+			// 403 over the whole call — and nothing is awarded.
+			const outsider = await award(one, await bearer('999'))
+			expect(outsider.status).toBe(200)
+			expect(await resultsOf(outsider)).toEqual([
+				{
+					AccountId: 205,
+					CurrencyId: coin.CurrencyId,
+					Success: false,
+					Error: 'Not permitted',
+					Response: null,
+				},
+			])
+
+			// The owner awards: the result names the entry and carries what the award did.
+			const res = await award(one, await bearer('1'))
+			expect(res.status).toBe(200)
+			const results = await resultsOf(res)
+			expect(results).toHaveLength(1)
+			expect(results[0]).toMatchObject({
+				AccountId: 205,
+				CurrencyId: coin.CurrencyId,
+				Success: true,
+				Error: null,
+				Response: {
+					AccountId: 205,
+					CurrencyId: coin.CurrencyId,
+					Balance: 1,
+					AmountAwarded: 1,
+				},
+			})
+			expect(Date.parse(results[0].Response!.AwardedAt)).not.toBeNaN()
+			expect(Object.keys(results[0])).toEqual([
+				'AccountId',
+				'CurrencyId',
+				'Success',
+				'Error',
+				'Response',
+			])
+			expect(Object.keys(results[0].Response!)).toEqual([
+				'AccountId',
+				'CurrencyId',
+				'Balance',
+				'AmountAwarded',
+				'AwardedAt',
+			])
+
+			// Awards accumulate, and a co-owner may award too.
+			const more = await award(
+				[{ CurrencyId: coin.CurrencyId, RecipientId: 205, Amount: 4 }],
+				await bearer('2')
+			)
+			expect((await resultsOf(more))[0].Response).toMatchObject({ Balance: 5, AmountAwarded: 4 })
+
+			// A mixed batch: the good entries land and the bad ones are reported in place, in
+			// the order sent, so nothing is lost and nothing is silently skipped.
+			const mixed = await award(
+				[
+					{ CurrencyId: coin.CurrencyId, RecipientId: 206, Amount: 2 },
+					{ CurrencyId: 'a3f1e8d2-0000-4000-8000-000000000000', RecipientId: 206, Amount: 5 },
+					{ CurrencyId: coin.CurrencyId, RecipientId: 'nope', Amount: 1 },
+					{ CurrencyId: coin.CurrencyId, RecipientId: 205, Amount: 1 },
+				],
+				await bearer('1')
+			)
+			const mixedResults = await resultsOf(mixed)
+			expect(mixedResults.map((r) => r.Success)).toEqual([true, false, false, true])
+			expect(mixedResults.map((r) => r.Error)).toEqual([
+				null,
+				'No such currency',
+				'Invalid award',
+				null,
+			])
+			expect(mixedResults[0].Response).toMatchObject({ Balance: 2, AmountAwarded: 2 })
+			// The two entries for 205 in this batch and the one before it ran in order.
+			expect(mixedResults[3].Response).toMatchObject({ Balance: 6, AmountAwarded: 1 })
+
+			// A body that is not a list of awards has no entries to report on.
+			for (const bad of [{ CurrencyId: coin.CurrencyId }, 'nope', null]) {
+				const res = await award(bad, await bearer('1'))
+				expect(res.status).toBe(200)
+				expect(await resultsOf(res)).toEqual([])
+			}
+			expect(await resultsOf(await award([], await bearer('1')))).toEqual([])
+		})
+
+		test('POST awardCurrency/bulk floors at zero and ignores the Limit', async () => {
+			// `Limit` is the most the room may award PER DAY — a faucet rate, not a ceiling on
+			// holdings — and nothing tracks a day's awards yet, so it must not bound a balance.
+			// It once did, which left every player of a Limit-3 currency stuck at 3 coins.
+			const capped = (
+				await envOf(await create({ ...body, Name: 'Limited', Limit: '3' }, await bearer('1')))
+			).Value!
+			const award = async (currencyId: string, recipientId: number, amount: number) =>
+				(
+					(await (
+						await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/awardCurrency/bulk`, {
+							method: 'POST',
+							headers: {
+								'Content-Type': 'application/json',
+								...(await bearer('1')),
+							},
+							body: JSON.stringify([
+								{ CurrencyId: currencyId, RecipientId: recipientId, Amount: amount },
+							]),
+						})
+					).json()) as Array<{ Response: { Balance: number; AmountAwarded: number } }>
+				)[0].Response
+			const landed = async (currencyId: string, recipientId: number, amount: number) => {
+				const { Balance, AmountAwarded } = await award(currencyId, recipientId, amount)
+				return { Balance, AmountAwarded }
+			}
+
+			// Straight past the `Limit` of 3, and on past it again.
+			expect(await landed(capped.CurrencyId, 210, 3)).toEqual({ Balance: 3, AmountAwarded: 3 })
+			expect(await landed(capped.CurrencyId, 210, 5)).toEqual({ Balance: 8, AmountAwarded: 5 })
+			expect(await landed(capped.CurrencyId, 210, 999)).toEqual({
+				Balance: 1007,
+				AmountAwarded: 999,
+			})
+
+			// Negative deducts, and floors at zero — a player cannot owe a room currency, and
+			// `AmountAwarded` reports the part that had somewhere to come from.
+			expect(await landed(capped.CurrencyId, 211, 10)).toEqual({ Balance: 10, AmountAwarded: 10 })
+			expect(await landed(capped.CurrencyId, 211, -3)).toEqual({ Balance: 7, AmountAwarded: -3 })
+			expect(await landed(capped.CurrencyId, 211, -99)).toEqual({ Balance: 0, AmountAwarded: -7 })
+
+			// A `Limit` of 0 is no different from any other — it bounds nothing either way.
+			const unlimited = (
+				await envOf(await create({ RoomId: '2511', Name: 'Unlimited' }, await bearer('1')))
+			).Value!
+			expect(await landed(unlimited.CurrencyId, 212, 50_000)).toEqual({
+				Balance: 50_000,
+				AmountAwarded: 50_000,
+			})
+		})
+
+		test('GET getPurchaseOffersBatch groups each currency’s shop', async () => {
+			type Offer = {
+				CurrencyPurchaseOfferId: string
+				CurrencyId: string
+				Order: number
+				Name: string
+				CurrencyAmount: number
+				Price: number
+				ModifiedAt: string
+			}
+			type Group = { CurrencyId: string; PurchaseOffers: Offer[] }
+			const groupsFor = async (query: string) =>
+				(await (
+					await exports.default.fetch(
+						`${ORIGIN}/api/roomcurrencies/v1/getPurchaseOffersBatch${query}`
+					)
+				).json()) as Group[]
+
+			const shopped = (await envOf(await create({ ...body, Name: 'Shopped' }, await bearer('1'))))
+				.Value!
+			const alsoShopped = (
+				await envOf(await create({ ...body, Name: 'AlsoShopped' }, await bearer('1')))
+			).Value!
+			const unshopped = (
+				await envOf(await create({ ...body, Name: 'Unshopped' }, await bearer('1')))
+			).Value!
+
+			// Seeded directly, deliberately out of `Order`, to prove the read sorts them.
+			const setOffers = (currencyId: string, offers: unknown[]) =>
+				env.DB.prepare('UPDATE room_currency SET purchase_offers = ?2 WHERE currency_id = ?1')
+					.bind(currencyId, JSON.stringify(offers))
+					.run()
+
+			await setOffers(shopped.CurrencyId, [
+				{
+					CurrencyPurchaseOfferId: 'ffffffff-0000-4000-8000-000000000002',
+					Order: 2,
+					Name: 'Handful',
+					CurrencyAmount: 5,
+					Price: 500,
+					ModifiedAt: '2026-09-14T12:00:00Z',
+				},
+				{
+					CurrencyPurchaseOfferId: 'ffffffff-0000-4000-8000-000000000001',
+					Order: 1,
+					Name: 'Pile',
+					CurrencyAmount: 50,
+					Price: 4000,
+					ModifiedAt: '2026-09-14T12:00:00Z',
+				},
+			])
+			await setOffers(alsoShopped.CurrencyId, [
+				{
+					CurrencyPurchaseOfferId: 'ffffffff-0000-4000-8000-000000000003',
+					Order: 1,
+					Name: 'Single',
+					CurrencyAmount: 1,
+					Price: 100,
+					ModifiedAt: '2026-09-14T12:00:00Z',
+				},
+			])
+
+			// One currency: one group, its shop in `Order` rather than stored order, and
+			// `CurrencyId` on every offer projected in from the row that owns it.
+			const one = await groupsFor(`?ids=${shopped.CurrencyId}`)
+			expect(one).toHaveLength(1)
+			expect(Object.keys(one[0])).toEqual(['CurrencyId', 'PurchaseOffers'])
+			expect(one[0].CurrencyId).toBe(shopped.CurrencyId)
+			expect(one[0].PurchaseOffers.map((o) => o.Name)).toEqual(['Pile', 'Handful'])
+			expect(one[0].PurchaseOffers[0]).toEqual({
+				CurrencyPurchaseOfferId: 'ffffffff-0000-4000-8000-000000000001',
+				CurrencyId: shopped.CurrencyId,
+				Order: 1,
+				Name: 'Pile',
+				CurrencyAmount: 50,
+				Price: 4000,
+				ModifiedAt: '2026-09-14T12:00:00Z',
+			})
+			// The client's own model, member for member and in its order.
+			expect(Object.keys(one[0].PurchaseOffers[0])).toEqual([
+				'CurrencyPurchaseOfferId',
+				'CurrencyId',
+				'Order',
+				'Name',
+				'CurrencyAmount',
+				'Price',
+				'ModifiedAt',
+			])
+
+			// Several: a group each, in the order the ids were given. Both spellings of `ids`
+			// reach the same answer, and a repeated id is one group.
+			for (const query of [
+				`?ids=${shopped.CurrencyId},${alsoShopped.CurrencyId}`,
+				`?ids=${shopped.CurrencyId}&ids=${alsoShopped.CurrencyId}`,
+				`?ids=${shopped.CurrencyId},${alsoShopped.CurrencyId},${shopped.CurrencyId}`,
+			]) {
+				const groups = await groupsFor(query)
+				expect(groups.map((g) => g.CurrencyId)).toEqual([
+					shopped.CurrencyId,
+					alsoShopped.CurrencyId,
+				])
+				expect(groups.flatMap((g) => g.PurchaseOffers.map((o) => o.Name))).toEqual([
+					'Pile',
+					'Handful',
+					'Single',
+				])
+			}
+			// Reversing the ids reverses the groups.
+			expect(
+				(await groupsFor(`?ids=${alsoShopped.CurrencyId},${shopped.CurrencyId}`)).map(
+					(g) => g.CurrencyId
+				)
+			).toEqual([alsoShopped.CurrencyId, shopped.CurrencyId])
+
+			// A currency with no shop still gets a GROUP, with an empty list — "sells nothing"
+			// and "you didn't ask about it" are different answers.
+			expect(await groupsFor(`?ids=${unshopped.CurrencyId}`)).toEqual([
+				{ CurrencyId: unshopped.CurrencyId, PurchaseOffers: [] },
+			])
+
+			// An id naming no currency at all is omitted, and doesn't fail the batch it was
+			// sent in. No ids is an empty list.
+			expect(await groupsFor('?ids=a3f1e8d2-0000-4000-8000-000000000000')).toEqual([])
+			expect(await groupsFor('')).toEqual([])
+			expect(await groupsFor('?ids=')).toEqual([])
+			expect(
+				(
+					await groupsFor(`?ids=a3f1e8d2-0000-4000-8000-000000000000,${alsoShopped.CurrencyId}`)
+				).map((g) => g.CurrencyId)
+			).toEqual([alsoShopped.CurrencyId])
+
+			// A column that doesn't parse shows an empty shop rather than failing the call.
+			await env.DB.prepare('UPDATE room_currency SET purchase_offers = ?2 WHERE currency_id = ?1')
+				.bind(unshopped.CurrencyId, 'not json')
+				.run()
+			expect(await groupsFor(`?ids=${unshopped.CurrencyId}`)).toEqual([
+				{ CurrencyId: unshopped.CurrencyId, PurchaseOffers: [] },
+			])
+		})
+
+		test('POST createCurrency pushes RoomCurrencyCreated to the room and the creator', async () => {
+			// Two players standing in 2511, one somewhere else, and one whose presence lapsed.
+			const now = Math.floor(Date.now() / 1000)
+			const putInRoom = async (accountId: number, roomId: number, expired = false) =>
+				env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+					.bind(
+						JSON.stringify({
+							accountId,
+							roomInstance: { roomInstanceId: 1000000 + roomId, roomId, subRoomId: roomId },
+							expiresAt: expired ? now - 1 : now + 900,
+						})
+					)
+					.run()
+			await putInRoom(310, 2511)
+			await putInRoom(311, 2511)
+			await putInRoom(312, 1)
+			await putInRoom(313, 2511, true)
+			await drainFrames()
+
+			// Account 1 owns the room but is NOT standing in it — the settings UI opens from
+			// anywhere, so the creator is added to the audience separately.
+			const res = await create({ ...body, Name: 'Broadcast bucks' }, await bearer('1'))
+			expect(res.status).toBe(200)
+			const created = (await envOf(res)).Value!
+
+			const frames = await drainFrames()
+			expect(frames.map((f) => f.accountId).sort((a, b) => a - b)).toEqual([1, 310, 311])
+			expect(frames.every((f) => f.notificationType === NotificationType.RoomCurrencyCreated)).toBe(
+				true
+			)
+			// The frame IS the create response — same object, same member order, so the two
+			// cannot drift apart.
+			expect(Object.keys(frames[0].payload)).toEqual(Object.keys(created))
+			expect(frames[0].payload).toEqual({
+				CurrencyId: created.CurrencyId,
+				RoomId: 2511,
+				Name: 'Broadcast bucks',
+				Description: 'this is my currency',
+				CurrencyType: 300,
+				Limit: 100,
+				ImageName: null,
+				CreatedAt: created.CreatedAt,
+				ModifiedAt: created.ModifiedAt,
+				Shape: 0,
+				Color: 19,
+			})
+
+			for (const id of [310, 311, 312, 313]) {
+				await env.DB.prepare('DELETE FROM presence WHERE account_id = ?1').bind(id).run()
+			}
+		})
+
+		test('POST createCurrency masks a name players will see, and defaults the rest', async () => {
+			const res = await create({ RoomId: '2511', Name: 'shit bucks' }, await bearer('1'))
+			expect(res.status).toBe(200)
+			const created = (await envOf(res)).Value!
+			// Masked per character like every other player-typed string (see the gift message
+			// above) — a currency's name is shown to everyone who walks into the room.
+			expect(created.Name).toBe('**** bucks')
+			// Everything the body left out falls back rather than landing as NaN.
+			expect(created).toMatchObject({ Description: '', Limit: 0, Shape: 0, Color: 0 })
+		})
+
+		test('POST createCurrency keeps a negative Color and a large Limit', async () => {
+			// `Color` is signed — the client sends -1 for "no colour chosen" — and `Limit` is a
+			// long. Neither may be clamped or dropped on the way through.
+			const res = await create(
+				{ RoomId: '2511', Name: 'Uncoloured', Limit: '1000000', Color: '-1' },
+				await bearer('1')
+			)
+			expect(res.status).toBe(200)
+			expect((await envOf(res)).Value).toMatchObject({ Limit: 1000000, Color: -1 })
+		})
 	})
 
 	test('GET /api/roomkeys/v1/room returns []', async () => {
@@ -4064,6 +4768,7 @@ describe('econ endpoints', () => {
 			'GET /api/roomconsumables/v1/roomConsumable/room/{roomId}/me',
 			'GET /api/roomcurrencies/v1/currencies',
 			'GET /api/roomcurrencies/v1/getAllBalances',
+			'GET /api/roomcurrencies/v1/getPurchaseOffersBatch',
 			'GET /api/roomkeys/v1/mine',
 			'GET /api/roomkeys/v1/room',
 			'GET /api/storefronts/v1/adcarouselitems',
@@ -4096,6 +4801,10 @@ describe('econ endpoints', () => {
 			'POST /api/items/purchaseInfos',
 			'POST /api/objectives/v1/cleargroup',
 			'POST /api/objectives/v1/updateobjective',
+			'POST /api/roomcurrencies/v1/awardCurrency/bulk',
+			'POST /api/roomcurrencies/v1/createCurrency',
+			'POST /api/roomcurrencies/v1/createPurchaseOffer',
+			'POST /api/roomcurrencies/v1/updateCurrency',
 			'POST /api/storefronts/v2/buyItem',
 			'POST /api/storefronts/v3/buyInvention',
 			'POST /api/ugcPurchasables/v1/items/bulk',

@@ -554,6 +554,187 @@ export const LockedItemsBulkRequest = z.object({
 
 export const ErrorResponse = z.object({ error: z.string() })
 
+/**
+ * A room currency — a custom currency minted for use inside one room. The client's own model,
+ * member for member and in its order (see the `notify` worker's `RoomCurrencyPayload`, which
+ * the `RoomCurrencyCreated`/`Modified` frames carry: the create response and those frames are
+ * the same object). `CurrencyType` is always 300 (RoomCurrency) — a room currency is told
+ * apart from the others by its `CurrencyId`, not by its type.
+ */
+export const RoomCurrencyDto = z.object({
+	CurrencyId: z.string().describe('GUID — how the client names this currency afterwards'),
+	RoomId: z.int(),
+	Name: z.string(),
+	Description: z.string(),
+	CurrencyType: z
+		.literal(300)
+		.describe('Always 300 (RoomCurrency) — the same enum `buyInvention` prices in'),
+	Limit: z
+		.int()
+		.describe(
+			'The most the room may award PER DAY — a faucet rate, not a holding cap. Stored and ' +
+				'served, but not enforced: nothing tracks a day’s awards yet'
+		),
+	Shape: z.int().describe('A byte — the client’s index into its coin shapes; uninterpreted'),
+	Color: z
+		.int()
+		.describe('The client’s index into its coin colours, signed — it sends -1 for none'),
+	ImageName: z.string().nullable().describe('Null — custom coin art is not uploadable yet'),
+	CreatedAt: z.string().describe('ISO-8601 UTC'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC; equal to `CreatedAt` until an edit'),
+})
+
+/**
+ * The envelope `POST /api/roomcurrencies/v1/createCurrency` answers in. The client unwraps it
+ * and hands its callers `Value` alone, so the envelope exists on the wire but never reaches
+ * the code that uses the currency.
+ *
+ * PascalCase `Value`/`Success`/`Error` beside a lowercase `error_id` — the same mixed casing
+ * the client's other envelopes use (see the `rooms` worker's isBanned and publish-state
+ * envelopes). NOT the lowercase `{ success, error, value }` the room mutations answer with;
+ * the two live in different workers and must not be unified.
+ */
+export const RoomCurrencyEnvelope = z.object({
+	Value: RoomCurrencyDto.nullable().describe('The currency, or null on a failure'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success; the failure message otherwise'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
+
+/** `POST /api/roomcurrencies/v1/createCurrency` — form-encoded. */
+export const CreateRoomCurrencyRequest = z.object({
+	RoomId: z.string().describe('The room the currency belongs to'),
+	Name: z.string().describe('Shown to players; profanity-masked like every typed string'),
+	Description: z.string().optional().describe('Defaults to empty'),
+	Limit: z
+		.string()
+		.optional()
+		.describe('The most the room may award per day; defaults to 0. Not enforced yet'),
+	Shape: z.string().optional().describe('Coin shape index; defaults to 0'),
+	Color: z.string().optional().describe('Coin colour index; defaults to 0'),
+})
+
+/**
+ * One purchase offer on a room currency — a way to BUY that currency, priced in another
+ * ("5 SuperTokens for 500 Rec Center Tokens"). The client's own model, member for member and
+ * in its order.
+ */
+export const RoomCurrencyPurchaseOfferDto = z.object({
+	CurrencyPurchaseOfferId: z.string().describe('GUID — names this offer'),
+	CurrencyId: z.string().describe('GUID of the currency being SOLD'),
+	Order: z.int().describe('Where it sits in the currency’s shop; the list is sorted by it'),
+	Name: z.string(),
+	CurrencyAmount: z.int().describe('How much of the currency the offer hands over'),
+	Price: z.int().describe('What it costs'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC'),
+})
+
+/**
+ * One currency's shop, as `GET /api/roomcurrencies/v1/getPurchaseOffersBatch` groups them —
+ * one entry per currency asked for, the whole answer an array of these.
+ *
+ * Grouped rather than flat even though every offer already carries its own `CurrencyId`: the
+ * group is what says a currency was ASKED ABOUT, which a flat list cannot. A currency with no
+ * shop still gets a group with an empty `PurchaseOffers`.
+ */
+export const RoomCurrencyPurchaseOffersDto = z.object({
+	CurrencyId: z.string(),
+	PurchaseOffers: z
+		.array(RoomCurrencyPurchaseOfferDto)
+		.describe('Sorted by `Order`; empty for a currency that sells nothing yet'),
+})
+
+/**
+ * `POST /api/roomcurrencies/v1/createPurchaseOffer` — form-encoded.
+ *
+ * Note `Amount` here against `CurrencyAmount` on the offer it becomes: the body and the model
+ * spell the same number differently, and the route maps between them rather than serving the
+ * body’s spelling back.
+ */
+export const CreatePurchaseOfferRequest = z.object({
+	CurrencyId: z.string().describe('The currency this offer sells'),
+	Name: z.string().describe('The offer’s name; the client has been seen sending a GUID'),
+	Amount: z.string().describe('How much of the currency the offer hands over (`CurrencyAmount`)'),
+	Price: z.string().describe('What it costs'),
+	Order: z.string().optional().describe('Where it sits in the shop; defaults to 0'),
+})
+
+/**
+ * The envelope the create-offer endpoint answers in — the same
+ * `{ Value, Success, Error, error_id }` the currency writes use, with the offer in `Value`.
+ */
+export const RoomCurrencyPurchaseOfferEnvelope = z.object({
+	Value: RoomCurrencyPurchaseOfferDto.nullable(),
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	error_id: z.null(),
+})
+
+/**
+ * One entry of `POST /api/roomcurrencies/v1/awardCurrency/bulk` — a JSON ARRAY of these,
+ * not an object wrapping one. Each names its own currency and recipient, so a single call can
+ * pay several players, or one player in several currencies.
+ */
+export const AwardRoomCurrencyRequest = z.object({
+	CurrencyId: z.string().describe('The room currency being awarded'),
+	RecipientId: z.int().describe('The player receiving it'),
+	Amount: z.int().describe('How much to add; negative deducts, and a balance floors at 0'),
+	TransactionId: z
+		.string()
+		.optional()
+		.describe(
+			'The client’s id for this award, so a retry is the same award. NOT YET DEDUPLICATED — ' +
+				'accepted and validated, but a replay currently awards twice'
+		),
+})
+
+/** What one award actually did, on the result that reports it. */
+export const AwardRoomCurrencyResponse = z.object({
+	AccountId: z.int().describe('The player paid'),
+	CurrencyId: z.string(),
+	Balance: z.int().describe('The RESULTING total, never the change'),
+	AmountAwarded: z
+		.int()
+		.describe(
+			'What actually landed — less than asked for when the `Limit` or the zero floor clamped it'
+		),
+	AwardedAt: z.string().describe('ISO-8601 UTC'),
+})
+
+/**
+ * One entry's result from `POST /api/roomcurrencies/v1/awardCurrency/bulk`, in the order sent.
+ *
+ * Success is PER ENTRY: `Success`/`Error` are this entry's alone and `Response` is null when
+ * it failed, so one bad entry neither fails the others nor the call. That includes an entry
+ * whose currency belongs to a room the caller cannot manage — a rejection here rather than a
+ * 403 over everything. `AccountId` and `CurrencyId` are repeated outside `Response` so a
+ * caller can line a failure up with what it sent, where there is no `Response` to read them
+ * from.
+ */
+export const AwardRoomCurrencyResult = z.object({
+	AccountId: z.int(),
+	CurrencyId: z.string(),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success'),
+	Response: AwardRoomCurrencyResponse.nullable().describe('Null when this entry failed'),
+})
+
+export const AwardRoomCurrencyResultList = z.array(AwardRoomCurrencyResult)
+
+/**
+ * `POST /api/roomcurrencies/v1/updateCurrency` — form-encoded. Names the currency by id
+ * rather than by room: the room it belongs to is whichever one minted it, and an edit cannot
+ * move it. Every field but `CurrencyId` is optional and an absent one is left as it was.
+ */
+export const UpdateRoomCurrencyRequest = z.object({
+	CurrencyId: z.string().describe('The currency to edit, as the create response named it'),
+	Name: z.string().optional().describe('Profanity-masked like every typed string'),
+	Description: z.string().optional(),
+	Limit: z.string().optional().describe('The most the room may award per day. Not enforced yet'),
+	Shape: z.string().optional().describe('Coin shape index'),
+	Color: z.string().optional().describe('Coin colour index, signed'),
+})
+
 // ---- Request schemas -------------------------------------------------------
 
 /**

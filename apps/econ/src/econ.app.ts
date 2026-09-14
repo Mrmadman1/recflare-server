@@ -4,12 +4,14 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	addXp,
+	canManageRoomById,
 	consumeGift,
 	createGift,
 	getAccount,
 	getGift,
 	getOutfits,
 	getPendingGifts,
+	getPlayerIdsInRoom,
 	grantInvention,
 	levelReward,
 	levelsReached,
@@ -78,6 +80,8 @@ import {
 	AUTHED,
 	AvatarItemV4Dto,
 	AvatarV2Dto,
+	AwardRoomCurrencyRequest,
+	AwardRoomCurrencyResultList,
 	BalanceEntry,
 	BulkPurchaseRequest,
 	BulkPurchaseResponse,
@@ -94,6 +98,8 @@ import {
 	ConsumeConsumableRequest,
 	ConsumeEnvelope,
 	ConsumeGiftRequest,
+	CreatePurchaseOfferRequest,
+	CreateRoomCurrencyRequest,
 	CustomAvatarItemsResponse,
 	EquipmentUpdateRequest,
 	ErrorResponse,
@@ -112,6 +118,11 @@ import {
 	OpaqueJsonBody,
 	OPTIONAL_AUTHED,
 	ReferralProgressResponse,
+	RoomCurrencyDto,
+	RoomCurrencyEnvelope,
+	RoomCurrencyPurchaseOfferDto,
+	RoomCurrencyPurchaseOfferEnvelope,
+	RoomCurrencyPurchaseOffersDto,
 	RoomEconConfig,
 	RRPlusSignUpBonus,
 	SaveOutfitRequest,
@@ -122,8 +133,18 @@ import {
 	UNAUTHORIZED_RESPONSE,
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
+	UpdateRoomCurrencyRequest,
 } from './openapi'
 import { claimReward } from './reward-db'
+import {
+	awardRoomCurrency,
+	createPurchaseOffer,
+	createRoomCurrency,
+	getPurchaseOffers,
+	getRoomCurrencies,
+	getRoomCurrency,
+	updateRoomCurrency,
+} from './room-currency-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -132,6 +153,7 @@ import type { SavedInvention } from '../../api/src/inventions-db'
 import type {
 	BalanceResponsePayload,
 	PurchaseBalanceModificationPayload,
+	RoomCurrencyPayload,
 } from '../../notify/src/notification-payloads'
 import type { Avatar } from './avatar-db'
 import type { CatalogRow } from './catalog-db'
@@ -144,6 +166,7 @@ import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
 import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
+import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
@@ -223,6 +246,122 @@ async function persistPostedOutfit(c: Context<App>): Promise<Outfit | Response> 
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
+
+/**
+ * The messages the room-currency failure paths carry. One string per endpoint, not per
+ * reason: the client unwraps the envelope and hands its callers `Value`, so a more specific
+ * message would reach nobody but a log.
+ *
+ * The create string is the reference's own. The update one is its obvious counterpart and has
+ * not been seen on the wire — if the real client ever shows it and the wording is wrong, this
+ * is the line to fix.
+ */
+const CREATE_CURRENCY_FAILED = 'Failed to create currency'
+const UPDATE_CURRENCY_FAILED = 'Failed to update currency'
+const CREATE_OFFER_FAILED = 'Failed to create purchase offer'
+
+/**
+ * The envelope the create endpoint answers in: `{ Value, Success, Error, error_id }`.
+ *
+ * PascalCase beside a lowercase `error_id` — the client's own mixed casing, not a typo, and
+ * NOT the lowercase `{ success, error, value }` the `rooms` worker's room mutations use.
+ * A failure answers 200 with `Success: false` and a null `Value`, the way the reference's
+ * failure path does; only the auth gates answer with a status of their own.
+ */
+function roomCurrencyEnvelope(c: Context<App>, value: RoomCurrency | null, error?: string) {
+	return c.json({
+		Value: value,
+		Success: error === undefined,
+		Error: error ?? null,
+		error_id: null,
+	})
+}
+
+/**
+ * The create-offer envelope — the same `{ Value, Success, Error, error_id }` shape again,
+ * carrying one purchase offer.
+ */
+function purchaseOfferEnvelope(
+	c: Context<App>,
+	value: RoomCurrencyPurchaseOffer | null,
+	error?: string
+) {
+	return c.json({
+		Value: value,
+		Success: error === undefined,
+		Error: error ?? null,
+		error_id: null,
+	})
+}
+
+/**
+ * Push `RoomCurrencyCreated` or `RoomCurrencyModified` for a room currency to everyone
+ * standing in the room, plus whoever made the change.
+ *
+ * Room-wide because a room currency is room-wide: every client in there prices the room's
+ * shops in it and shows what the player holds of it, so all of them need the change, not just
+ * the owner who made it. An EDIT matters to them just as much as a creation — a renamed or
+ * re-capped currency that only the editor hears about leaves everyone else spending the old
+ * one. Read from live presence across the room's instances. The editor is added separately:
+ * the settings UI opens from outside the room, and their own client is the one certain to be
+ * showing the currency list right now.
+ *
+ * The frame is typed as the hub's {@link RoomCurrencyPayload} — the client's own model — so a
+ * renamed key fails the build here rather than vanishing on the wire. It is the stored record
+ * verbatim: the two are the same object, which is why the HTTP response and this frame cannot
+ * drift apart.
+ *
+ * Best-effort, like the other pushes here — the currency has already committed, so a hub
+ * hiccup must not fail the request. One unreachable player doesn't cost the rest theirs.
+ */
+async function pushRoomCurrencyChange(
+	c: Context<App>,
+	currency: RoomCurrency,
+	changedByAccountId: number,
+	notificationType:
+		typeof NotificationType.RoomCurrencyCreated | typeof NotificationType.RoomCurrencyModified
+): Promise<void> {
+	const frame: RoomCurrencyPayload = currency
+
+	// Presence is another worker's table, and this whole push is best-effort: a currency that
+	// has already committed must not fail the request because the audience couldn't be read.
+	// The editor still hears about it either way.
+	let occupants: number[] = []
+	try {
+		occupants = await getPlayerIdsInRoom(c.env.DB, currency.RoomId)
+	} catch (err) {
+		logger.error('failed to read room presence for a room-currency push', {
+			notificationType,
+			roomId: currency.RoomId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+
+	const playerIds = new Set(occupants)
+	playerIds.add(changedByAccountId)
+
+	await Promise.all(
+		[...playerIds].map(async (playerId) => {
+			try {
+				await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+					playerId,
+					notificationType,
+					// Spread because `notifyPlayer` takes an index-signature record, which an
+					// interface doesn't satisfy implicitly.
+					{ ...frame }
+				)
+			} catch (err) {
+				logger.error('failed to push a room-currency notification', {
+					notificationType,
+					playerId,
+					roomId: currency.RoomId,
+					currencyId: currency.CurrencyId,
+					error: err instanceof Error ? err.message : String(err),
+				})
+			}
+		})
+	)
+}
 
 /**
  * Push a ConsumableMappingRemoved notification to a player after they consume a
@@ -2909,8 +3048,621 @@ const app = new Hono<App>({ strict: false })
 		listRoute('The caller’s room consumables', 'Empty stub'),
 		(c) => c.json([])
 	)
-	.get('/api/roomcurrencies/v1/currencies', listRoute('Room currencies', 'Empty stub'), (c) =>
-		c.json([])
+	// The custom currencies a room has minted. Public, like the room itself: a room's
+	// currencies are shown to every player who walks into it, so the list is not a secret
+	// the way its ban list is. A room with none — or an unknown room — is an empty list.
+	.get(
+		'/api/roomcurrencies/v1/currencies',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'A room’s currencies',
+			description: [
+				'Every custom currency the room named by `roomId` has minted, oldest first — the',
+				'order its owner built them up in.',
+				'',
+				'Public, like the room itself: a room’s currencies are shown to everyone who walks',
+				'into it. A room with none, an unknown room, and a missing `roomId` are all the same',
+				'empty list, which the client reads as "this room has no currency of its own".',
+				'',
+				'These are DEFINITIONS, not balances — what a player holds of one is',
+				'`getAllBalances`, which is still a stub.',
+			].join('\n'),
+			parameters: [
+				{
+					name: 'roomId',
+					in: 'query',
+					required: false,
+					description: 'The room whose currencies to list',
+					schema: { type: 'string' },
+				},
+			],
+			responses: { 200: json(RoomCurrencyDto.array(), 'The room’s currencies, oldest first') },
+		}),
+		async (c) => {
+			const roomId = Number.parseInt(c.req.query('roomId') ?? '', 10)
+			if (!Number.isInteger(roomId)) return c.json([])
+			return c.json(await getRoomCurrencies(c.env.DB, roomId))
+		}
+	)
+
+	// Mint a custom currency for a room. Auth-gated (401) and gated to the room's creator or
+	// a co-owner (403) — the same owner-level check the `rooms` worker applies to its own
+	// room-admin writes, reading the same room blob.
+	.post(
+		'/api/roomcurrencies/v1/createCurrency',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Create a room currency',
+			description: [
+				'Mints a custom currency for one room — its name, its description, its coin art and',
+				'the most of it the room may award per day. Form-encoded',
+				'(`RoomId=2511&Name=Devintokens&Description=…&Limit=100&Shape=0&Color=19`).',
+				'',
+				'Gated to the room’s CREATOR or a CO-OWNER — minting a currency is room',
+				'administration, so it takes the same standing as the room’s other settings. A valid',
+				'token from anyone else is a 403.',
+				'',
+				'`Name` and `Description` are masked by the same word list as every other string a',
+				'player types, since a currency’s name is shown to everyone in the room.',
+				'',
+				'Answers the created currency inside the `{ Value, Success, Error, error_id }`',
+				'envelope — PascalCase beside a lowercase `error_id`, which is the client’s own mixed',
+				'casing. The client unwraps it and hands its callers `Value` alone. A recoverable',
+				'refusal (an unusable `RoomId`, an empty `Name`, an unknown room) is a 200 carrying',
+				'`Success: false`, a null `Value` and the reference’s own message; only the auth',
+				'gates answer with a status of their own.',
+				'',
+				'`CurrencyId` is how the client names this currency everywhere afterwards.',
+				'`CurrencyType` is always 300 (RoomCurrency) and `ImageName` is null until custom',
+				'coin art can be uploaded.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(CreateRoomCurrencyRequest, 'The currency to mint'),
+			responses: {
+				200: json(
+					RoomCurrencyEnvelope,
+					'The currency as created, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+			const int = (v: unknown, fallback: number): number => {
+				const parsed = Number.parseInt(str(v), 10)
+				return Number.isInteger(parsed) ? parsed : fallback
+			}
+
+			const roomId = int(body.RoomId, Number.NaN)
+			if (!Number.isInteger(roomId)) return roomCurrencyEnvelope(c, null, CREATE_CURRENCY_FAILED)
+			const name = str(body.Name).trim()
+			if (name === '') return roomCurrencyEnvelope(c, null, CREATE_CURRENCY_FAILED)
+
+			// The room is the `rooms` worker's, read here only to apply its owner check — the
+			// same `canManageRoom` that worker gates its own room-admin writes on, so the two
+			// can't drift into disagreeing about who runs a room. Null is no such room, which
+			// answers differently from a room somebody else runs.
+			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
+			if (canManage === null) return roomCurrencyEnvelope(c, null, CREATE_CURRENCY_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			const currency = await createRoomCurrency(c.env.DB, {
+				RoomId: roomId,
+				// Masked like every other player-typed string (see the gift note above): a
+				// currency's name is shown to everyone who walks into the room.
+				Name: censorSwears(name),
+				Description: censorSwears(str(body.Description)),
+				Limit: int(body.Limit, 0),
+				Shape: int(body.Shape, 0),
+				Color: int(body.Color, 0),
+			})
+
+			await pushRoomCurrencyChange(c, currency, accountId, NotificationType.RoomCurrencyCreated)
+			return roomCurrencyEnvelope(c, currency)
+		}
+	)
+
+	// Edit a room currency. Auth-gated (401) and gated to the creator or a co-owner of the room
+	// that MINTED it (403) — the currency names the room, so the caller doesn't get to say
+	// which room's permissions apply. Answers the same envelope the create does.
+	.post(
+		'/api/roomcurrencies/v1/updateCurrency',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Edit a room currency',
+			description: [
+				'Changes a currency’s name, description, daily award limit or coin art. Form-encoded,',
+				'naming the',
+				'currency by `CurrencyId`',
+				'(`CurrencyId=b9f41a7c-\u2026&Name=\u2026&Description=\u2026&Limit=330&Shape=9&Color=5`).',
+				'',
+				'The room is not in the body and cannot be: it is whichever room minted the currency,',
+				'which is also the room whose creator/co-owner check applies. A valid token from',
+				'anyone else is a 403.',
+				'',
+				'Every field but `CurrencyId` is optional, and one left out is left ALONE rather than',
+				'reset — the client sends the whole form, so this only bites a partial request, and',
+				'blanking a description because it went unmentioned is the worse reading. What can',
+				'never change: the id, the room, the `CurrencyType`, and `CreatedAt`. `ModifiedAt`',
+				'moves to now, which is what the client’s model carries both for.',
+				'',
+				'`Name` and `Description` are masked by the same word list as every other string a',
+				'player types. Answers the created-currency envelope: the updated currency in',
+				'`Value`, or a 200 carrying `Success: false` when there is no such currency or the',
+				'body is unusable.',
+				'',
+				'Everyone standing in the room gets a `RoomCurrencyModified` frame — a renamed or',
+				'recapped currency that only the editor hears about leaves the rest of the room',
+				'spending the old one.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(UpdateRoomCurrencyRequest, 'The currency and the fields to change'),
+			responses: {
+				200: json(
+					RoomCurrencyEnvelope,
+					'The currency as it now stands, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: {
+					description: 'Not the creator or a co-owner of the room that minted it (empty body)',
+				},
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
+			const int = (v: unknown): number | undefined => {
+				const raw = str(v)
+				if (raw === undefined) return undefined
+				const parsed = Number.parseInt(raw, 10)
+				return Number.isInteger(parsed) ? parsed : undefined
+			}
+
+			const currencyId = str(body.CurrencyId)?.trim() ?? ''
+			if (currencyId === '') return roomCurrencyEnvelope(c, null, UPDATE_CURRENCY_FAILED)
+
+			const existing = await getRoomCurrency(c.env.DB, currencyId)
+			if (!existing) return roomCurrencyEnvelope(c, null, UPDATE_CURRENCY_FAILED)
+
+			// The room comes off the CURRENCY, never the request: the caller names what to edit,
+			// not whose permissions to check against. Same gate as minting one.
+			const canManage = await canManageRoomById(c.env.DB, existing.RoomId, accountId)
+			// A currency whose room has since been deleted is unowned and so uneditable by
+			// anyone — a rejection rather than a 403, since nobody is being turned away.
+			if (canManage === null) return roomCurrencyEnvelope(c, null, UPDATE_CURRENCY_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			// A name sent but blank is a bad edit, not an instruction to leave it alone: the
+			// currency would be left nameless in every list that shows it.
+			const name = str(body.Name)?.trim()
+			if (name !== undefined && name === '') {
+				return roomCurrencyEnvelope(c, null, UPDATE_CURRENCY_FAILED)
+			}
+
+			const updated = await updateRoomCurrency(c.env.DB, existing, {
+				Name: name === undefined ? undefined : censorSwears(name),
+				Description:
+					str(body.Description) === undefined ? undefined : censorSwears(str(body.Description)!),
+				Limit: int(body.Limit),
+				Shape: int(body.Shape),
+				Color: int(body.Color),
+			})
+
+			await pushRoomCurrencyChange(c, updated, accountId, NotificationType.RoomCurrencyModified)
+			return roomCurrencyEnvelope(c, updated)
+		}
+	)
+
+	// The purchase offers on one or more room currencies — a currency's shop, the ways a
+	// player can BUY it. Public, like the currencies themselves: a shop is shown to everyone
+	// who walks into the room.
+	.get(
+		'/api/roomcurrencies/v1/getPurchaseOffersBatch',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Purchase offers for room currencies',
+			description: [
+				'The offers on each currency named in `ids` — the ways a player can buy that',
+				'currency, priced in another ("5 SuperTokens for 500 Rec Center Tokens").',
+				'',
+				'`ids` takes several currencies: comma-separated, repeated (`ids=a&ids=b`), or both.',
+				'The answer is one GROUP per currency — `{ CurrencyId, PurchaseOffers }` — in the',
+				'order the ids were given, each shop sorted by its offers’ `Order`. Grouped even',
+				'though every offer carries its own `CurrencyId`, because the group is what says a',
+				'currency was asked about: a currency with no shop still gets one, with an empty',
+				'`PurchaseOffers`.',
+				'',
+				'An id naming no currency at all is omitted — there is no shop to report, empty or',
+				'otherwise — the way the other batch lookups here treat an unknown id, and never an',
+				'error for the whole call. No `ids` at all is an empty list.',
+				'',
+				'Public, like `GET /api/roomcurrencies/v1/currencies`. Nothing writes offers yet, so',
+				'every currency answers empty until there is an endpoint that builds a shop.',
+			].join('\n'),
+			parameters: [
+				{
+					name: 'ids',
+					in: 'query',
+					required: false,
+					description: 'Currency ids — comma-separated, repeated, or both',
+					schema: { type: 'string' },
+				},
+			],
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOffersDto.array(),
+					'One group per currency asked for, in the order given'
+				),
+			},
+		}),
+		async (c) => {
+			// Both spellings, since nothing says which the client uses: `ids=a&ids=b` and
+			// `ids=a,b` reach the same list, and blanks from a trailing comma are dropped.
+			const ids = c.req
+				.queries('ids')
+				?.flatMap((value) => value.split(','))
+				.map((value) => value.trim())
+				.filter((value) => value !== '')
+
+			// De-duplicated: an id sent twice is one shop, not the same shop twice.
+			return c.json(await getPurchaseOffers(c.env.DB, [...new Set(ids ?? [])]))
+		}
+	)
+
+	// Add a purchase offer to a room currency's shop. Auth-gated (401) and gated to the
+	// creator or a co-owner of the room that minted the currency (403) — a shop is the room's
+	// to build, and the room comes off the currency rather than the request.
+	.post(
+		'/api/roomcurrencies/v1/createPurchaseOffer',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Add a purchase offer to a room currency',
+			description: [
+				'Appends an offer to the currency named by `CurrencyId` — a way for players to buy',
+				'that currency ("5 SuperTokens for 500 Rec Center Tokens"). Form-encoded',
+				'(`CurrencyId=…&Name=…&Amount=5&Price=55&Order=0`).',
+				'',
+				'Note `Amount` in the body against `CurrencyAmount` on the offer it becomes: the',
+				'body and the client’s model spell the same number differently, and the answer uses',
+				'the model’s spelling.',
+				'',
+				'`CurrencyPurchaseOfferId` and `ModifiedAt` are minted here — the offer’s id is how',
+				'the client names it afterwards. `Order` places it in the shop and defaults to 0;',
+				'offers are served sorted by it, so several at 0 keep the order they were added in.',
+				'',
+				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
+				'token from anyone else is a 403. Answers the same',
+				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
+				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
+				'or the body unusable.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(CreatePurchaseOfferRequest, 'The offer to add'),
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOfferEnvelope,
+					'The offer as created, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+			const int = (v: unknown, fallback: number): number => {
+				const parsed = Number.parseInt(str(v), 10)
+				return Number.isInteger(parsed) ? parsed : fallback
+			}
+
+			const currencyId = str(body.CurrencyId).trim()
+			if (currencyId === '') return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+
+			const amount = int(body.Amount, Number.NaN)
+			const price = int(body.Price, Number.NaN)
+			if (!Number.isInteger(amount) || !Number.isInteger(price)) {
+				return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+			}
+
+			const currency = await getRoomCurrency(c.env.DB, currencyId)
+			if (!currency) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+
+			// The room comes off the CURRENCY, never the request — the same gate minting and
+			// editing one take. A shop is the room's to build.
+			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
+			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
+				// The body's `Amount` is the model's `CurrencyAmount`.
+				CurrencyAmount: amount,
+				Price: price,
+				// Stored verbatim, NOT profanity-masked like a currency's name: the client has
+				// been seen sending a GUID here, and the mask works on substrings — it would
+				// happily corrupt an identifier that happened to contain a word. If this turns
+				// out to be player-typed display text, it wants masking.
+				Name: str(body.Name),
+				Order: int(body.Order, 0),
+			})
+			return purchaseOfferEnvelope(c, offer)
+		}
+	)
+
+	// Award room currency to players, several awards per call. Auth-gated (401); everything
+	// else is reported PER ENTRY, including whether the caller may award that currency at all.
+	.post(
+		'/api/roomcurrencies/v1/awardCurrency/bulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Award room currency in bulk',
+			description: [
+				'Adds to what players hold of a room currency. The body is a JSON ARRAY, each entry',
+				'naming its own `CurrencyId` and `RecipientId`, so one call can pay several players',
+				'or one player in several currencies.',
+				'',
+				'The answer is a BARE ARRAY, one result per entry IN THE ORDER SENT, and each result',
+				'stands alone: `Success` and `Error` are that entry’s, and `Response` carries the',
+				'outcome or is null. So one entry failing neither fails the others nor the call —',
+				'including an entry whose currency belongs to a room the caller cannot manage, which',
+				'is that entry’s failure rather than a 403 for everything. Only a missing or invalid',
+				'token is answered at the call level, with a 401.',
+				'',
+				'Each entry is authorised against the room that MINTED its currency: the caller must',
+				'be that room’s creator or a co-owner. The room comes off the currency, never the',
+				'request — a faucet a caller could point at any room would let anyone print another',
+				'room’s money.',
+				'',
+				'`Amount` may be negative, which deducts. A balance floors at zero in the write',
+				'itself — a player cannot owe a room currency — and `AmountAwarded` reports what',
+				'actually landed, which is less than was asked for only when a deduction ran out of',
+				'balance to take. `Balance` is the RESULTING total.',
+				'',
+				'The currency’s `Limit` is NOT applied here. It is the most a room may award PER DAY',
+				'— a faucet rate, not a ceiling on holdings — and nothing tracks a day’s awards yet,',
+				'so no award is refused for it.',
+				'',
+				'`TransactionId` is the client’s id for an award so that a retry is the same award.',
+				'It is accepted and validated, but NOT yet deduplicated — replaying a request',
+				'currently awards twice. That needs a table of its own.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: jsonBody(
+				AwardRoomCurrencyRequest.array(),
+				'The awards to apply, as a bare JSON array'
+			),
+			responses: {
+				200: json(AwardRoomCurrencyResultList, 'One result per entry, in the order sent'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const parsed = await c.req.json<unknown>().catch(() => null)
+			// A body that isn't a list of awards has no entries to report on, and the answer is
+			// a list of entry results — so there is nothing to say but "none".
+			if (!Array.isArray(parsed)) return c.json([])
+
+			// Cached across entries, so paying twenty players in one currency is one currency
+			// lookup and one permission check rather than twenty of each. `null` caches a
+			// currency that doesn't exist; `false` one the caller may not award.
+			const currencies = new Map<string, RoomCurrency | null | false>()
+			const resolve = async (currencyId: string): Promise<RoomCurrency | null | false> => {
+				const cached = currencies.get(currencyId)
+				if (cached !== undefined) return cached
+
+				const found = await getRoomCurrency(c.env.DB, currencyId)
+				// The room comes off the CURRENCY, never the request — the same gate minting and
+				// editing one take.
+				const canManage = found && (await canManageRoomById(c.env.DB, found.RoomId, accountId))
+				const resolved = !found || canManage === null ? null : canManage ? found : false
+				currencies.set(currencyId, resolved)
+				return resolved
+			}
+
+			const results = []
+			for (const entry of parsed as Array<Record<string, unknown>>) {
+				const currencyId = typeof entry?.CurrencyId === 'string' ? entry.CurrencyId.trim() : ''
+				const playerId = Number(entry?.RecipientId)
+				const amount = Number(entry?.Amount)
+
+				// Every result names its entry even when the entry was unusable, so a caller can
+				// line the answer up with what it sent.
+				const fail = (error: string) => ({
+					AccountId: Number.isInteger(playerId) ? playerId : 0,
+					CurrencyId: currencyId,
+					Success: false,
+					Error: error,
+					Response: null,
+				})
+
+				if (currencyId === '' || !Number.isInteger(playerId) || !Number.isInteger(amount)) {
+					results.push(fail('Invalid award'))
+					continue
+				}
+
+				const currency = await resolve(currencyId)
+				if (currency === null) {
+					results.push(fail('No such currency'))
+					continue
+				}
+				if (currency === false) {
+					results.push(fail('Not permitted'))
+					continue
+				}
+
+				const { Balance, AmountAwarded } = await awardRoomCurrency(
+					c.env.DB,
+					currency.CurrencyId,
+					playerId,
+					amount
+				)
+				results.push({
+					AccountId: playerId,
+					CurrencyId: currency.CurrencyId,
+					Success: true,
+					Error: null,
+					Response: {
+						AccountId: playerId,
+						CurrencyId: currency.CurrencyId,
+						Balance,
+						AmountAwarded,
+						AwardedAt: new Date().toISOString(),
+					},
+				})
+			}
+
+			return c.json(results)
+		}
+	)
+
+	// The purchase offers on one or more room currencies — a currency's shop, the ways a
+	// player can BUY it. Public, like the currencies themselves: a shop is shown to everyone
+	// who walks into the room.
+	.get(
+		'/api/roomcurrencies/v1/getPurchaseOffersBatch',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Purchase offers for room currencies',
+			description: [
+				'The offers on each currency named in `ids` — the ways a player can buy that',
+				'currency, priced in another ("5 SuperTokens for 500 Rec Center Tokens").',
+				'',
+				'`ids` takes several currencies: comma-separated, repeated (`ids=a&ids=b`), or both.',
+				'The answer is FLAT rather than grouped, because every offer carries its own',
+				'`CurrencyId` — the client groups them itself, and one currency’s answer looks like',
+				'twenty’s. Ordered by the ids as given, then by each offer’s `Order`, so a caller',
+				'gets its own batch back in its own order with each shop in shop order.',
+				'',
+				'An id naming no currency contributes nothing, the way the other batch lookups here',
+				'treat an unknown id: a shop that does not exist is an empty one, not an error for',
+				'the whole call. No `ids` at all is an empty list.',
+				'',
+				'Public, like `GET /api/roomcurrencies/v1/currencies`. Nothing writes offers yet, so',
+				'every currency answers empty until there is an endpoint that builds a shop.',
+			].join('\n'),
+			parameters: [
+				{
+					name: 'ids',
+					in: 'query',
+					required: false,
+					description: 'Currency ids — comma-separated, repeated, or both',
+					schema: { type: 'string' },
+				},
+			],
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOfferDto.array(),
+					'The offers, flattened across the currencies asked for'
+				),
+			},
+		}),
+		async (c) => {
+			// Both spellings, since nothing says which the client uses: `ids=a&ids=b` and
+			// `ids=a,b` reach the same list, and blanks from a trailing comma are dropped.
+			const ids = c.req
+				.queries('ids')
+				?.flatMap((value) => value.split(','))
+				.map((value) => value.trim())
+				.filter((value) => value !== '')
+
+			// De-duplicated: an id sent twice is one shop, not the same shop twice.
+			return c.json(await getPurchaseOffers(c.env.DB, [...new Set(ids ?? [])]))
+		}
+	)
+
+	// Add a purchase offer to a room currency's shop. Auth-gated (401) and gated to the
+	// creator or a co-owner of the room that minted the currency (403) — a shop is the room's
+	// to build, and the room comes off the currency rather than the request.
+	.post(
+		'/api/roomcurrencies/v1/createPurchaseOffer',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Add a purchase offer to a room currency',
+			description: [
+				'Appends an offer to the currency named by `CurrencyId` — a way for players to buy',
+				'that currency ("5 SuperTokens for 500 Rec Center Tokens"). Form-encoded',
+				'(`CurrencyId=…&Name=…&Amount=5&Price=55&Order=0`).',
+				'',
+				'Note `Amount` in the body against `CurrencyAmount` on the offer it becomes: the',
+				'body and the client’s model spell the same number differently, and the answer uses',
+				'the model’s spelling.',
+				'',
+				'`CurrencyPurchaseOfferId` and `ModifiedAt` are minted here — the offer’s id is how',
+				'the client names it afterwards. `Order` places it in the shop and defaults to 0;',
+				'offers are served sorted by it, so several at 0 keep the order they were added in.',
+				'',
+				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
+				'token from anyone else is a 403. Answers the same',
+				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
+				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
+				'or the body unusable.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(CreatePurchaseOfferRequest, 'The offer to add'),
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOfferEnvelope,
+					'The offer as created, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+			const int = (v: unknown, fallback: number): number => {
+				const parsed = Number.parseInt(str(v), 10)
+				return Number.isInteger(parsed) ? parsed : fallback
+			}
+
+			const currencyId = str(body.CurrencyId).trim()
+			if (currencyId === '') return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+
+			const amount = int(body.Amount, Number.NaN)
+			const price = int(body.Price, Number.NaN)
+			if (!Number.isInteger(amount) || !Number.isInteger(price)) {
+				return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+			}
+
+			const currency = await getRoomCurrency(c.env.DB, currencyId)
+			if (!currency) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+
+			// The room comes off the CURRENCY, never the request — the same gate minting and
+			// editing one take. A shop is the room's to build.
+			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
+			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
+				// The body's `Amount` is the model's `CurrencyAmount`.
+				CurrencyAmount: amount,
+				Price: price,
+				// Stored verbatim, NOT profanity-masked like a currency's name: the client has
+				// been seen sending a GUID here, and the mask works on substrings — it would
+				// happily corrupt an identifier that happened to contain a word. If this turns
+				// out to be player-typed display text, it wants masking.
+				Name: str(body.Name),
+				Order: int(body.Order, 0),
+			})
+			return purchaseOfferEnvelope(c, offer)
+		}
 	)
 	.get('/api/roomcurrencies/v1/getAllBalances', listRoute('Room balances', 'Empty stub'), (c) =>
 		c.json([])
