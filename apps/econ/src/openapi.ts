@@ -630,6 +630,113 @@ export const RoomCurrencyPurchaseOfferDto = z.object({
 })
 
 /**
+ * One room consumable — a thing a room sells, priced in the room's own currency. The client's
+ * own model, member for member and in its order.
+ *
+ * Note `Price`/`PurchaseCurrencyId` here against the nested `PriceAndCurrency` the WRITE
+ * takes: the client sends them nested and reads them flat, so the two shapes genuinely differ.
+ */
+export const RoomConsumableDto = z.object({
+	RoomConsumableId: z.string().describe('GUID — how the client names this listing afterwards'),
+	RoomId: z.int(),
+	Name: z.string(),
+	Description: z.string(),
+	ImageName: z.string().nullable().describe('Null for a listing with no picture'),
+	Price: z.int(),
+	PurchaseCurrencyId: z
+		.string()
+		.nullable()
+		.describe('A `room_currency` id — the room’s own money. Not resolved or validated yet'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC'),
+	MaximumCountPerPurchase: z
+		.int()
+		.describe('How many may be bought at once. Stored and served; nothing buys one yet'),
+})
+
+/**
+ * `PUT /api/roomconsumables/v1/roomConsumable` — JSON, creating a listing or replacing one.
+ *
+ * `RoomConsumableId` null (or absent) creates; naming an existing listing replaces it. An edit
+ * REPLACES rather than merges — the client sends the whole form back — which is the opposite
+ * of the currency edit, whose body is genuinely partial.
+ */
+export const UpsertRoomConsumableRequest = z.object({
+	RoomConsumableId: z.string().nullable().optional().describe('Null to create; an id to replace'),
+	RoomId: z.int().describe('The room whose shop this is. Ignored when editing — see the route'),
+	Name: z.string(),
+	Description: z.string().optional().describe('Defaults to empty'),
+	ImageName: z.string().nullable().optional(),
+	PriceAndCurrency: z
+		.object({
+			Price: z.int(),
+			CurrencyId: z.string().nullable().optional().describe('A `room_currency` id'),
+		})
+		.optional()
+		.describe('Collapsed into `Price`/`PurchaseCurrencyId` on the stored listing'),
+	MaximumCountPerPurchase: z
+		.int()
+		.optional()
+		.describe('The client has not been seen sending this; defaults to 0'),
+})
+
+/**
+ * `POST /api/roomconsumables/v1/roomConsumable/awardBulk` — the consumables to give the
+ * CALLER. `Requests` is a MAP keyed by consumable id, not a list: the id is the key, and each
+ * value is what to do with it.
+ */
+export const AwardRoomConsumablesRequest = z.object({
+	Requests: z
+		.record(
+			z.string(),
+			z.object({
+				Quantity: z.int().describe('How many to give; negative takes them away'),
+				ConcurrencyCodes: z
+					.object({
+						CurrentConcurrencyCode: z.string().nullable().optional(),
+						NewConcurrencyCode: z.string().nullable().optional(),
+					})
+					.optional()
+					.describe('Accepted and IGNORED — no optimistic concurrency is implemented yet'),
+			})
+		)
+		.describe('Keyed by consumable id'),
+})
+
+/**
+ * One entry's result from the consumable award, in the order its key appeared in `Requests`.
+ *
+ * Shaped after the room-currency bulk award, which is the one response in this family the
+ * client has been seen reading: success is PER ENTRY, so one bad id neither fails the others
+ * nor the call, and `Response` is null when the entry failed.
+ */
+export const AwardRoomConsumableResult = z.object({
+	ConsumableId: z.string(),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success'),
+	Response: z
+		.object({
+			PlayerId: z.int(),
+			ConsumableId: z.string(),
+			Quantity: z.int().describe('The RESULTING total owned, never the change'),
+			AwardedAt: z.string().describe('ISO-8601 UTC'),
+		})
+		.nullable(),
+})
+
+export const AwardRoomConsumableResultList = z.array(AwardRoomConsumableResult)
+
+/**
+ * The envelope the consumable write answers in — the same
+ * `{ Value, Success, Error, error_id }` the room-currency writes use.
+ */
+export const RoomConsumableEnvelope = z.object({
+	Value: RoomConsumableDto.nullable(),
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	error_id: z.null(),
+})
+
+/**
  * One currency's shop, as `GET /api/roomcurrencies/v1/getPurchaseOffersBatch` groups them —
  * one entry per currency asked for, the whole answer an array of these.
  *

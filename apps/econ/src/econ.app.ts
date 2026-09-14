@@ -80,6 +80,8 @@ import {
 	AUTHED,
 	AvatarItemV4Dto,
 	AvatarV2Dto,
+	AwardRoomConsumableResultList,
+	AwardRoomConsumablesRequest,
 	AwardRoomCurrencyRequest,
 	AwardRoomCurrencyResultList,
 	BalanceEntry,
@@ -118,6 +120,8 @@ import {
 	OpaqueJsonBody,
 	OPTIONAL_AUTHED,
 	ReferralProgressResponse,
+	RoomConsumableDto,
+	RoomConsumableEnvelope,
 	RoomCurrencyDto,
 	RoomCurrencyEnvelope,
 	RoomCurrencyPurchaseOfferDto,
@@ -134,8 +138,15 @@ import {
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
 	UpdateRoomCurrencyRequest,
+	UpsertRoomConsumableRequest,
 } from './openapi'
 import { claimReward } from './reward-db'
+import {
+	awardRoomConsumable,
+	getRoomConsumable,
+	getRoomConsumables,
+	upsertRoomConsumable,
+} from './room-consumable-db'
 import {
 	awardRoomCurrency,
 	createPurchaseOffer,
@@ -166,6 +177,7 @@ import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
 import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
+import type { RoomConsumable } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
@@ -259,6 +271,7 @@ const HUB_INSTANCE = 'global'
 const CREATE_CURRENCY_FAILED = 'Failed to create currency'
 const UPDATE_CURRENCY_FAILED = 'Failed to update currency'
 const CREATE_OFFER_FAILED = 'Failed to create purchase offer'
+const SAVE_CONSUMABLE_FAILED = 'Failed to save consumable'
 
 /**
  * The envelope the create endpoint answers in: `{ Value, Success, Error, error_id }`.
@@ -269,6 +282,19 @@ const CREATE_OFFER_FAILED = 'Failed to create purchase offer'
  * failure path does; only the auth gates answer with a status of their own.
  */
 function roomCurrencyEnvelope(c: Context<App>, value: RoomCurrency | null, error?: string) {
+	return c.json({
+		Value: value,
+		Success: error === undefined,
+		Error: error ?? null,
+		error_id: null,
+	})
+}
+
+/**
+ * The consumable write's envelope — the same `{ Value, Success, Error, error_id }` shape the
+ * room-currency writes answer in, carrying one listing.
+ */
+function roomConsumableEnvelope(c: Context<App>, value: RoomConsumable | null, error?: string) {
 	return c.json({
 		Value: value,
 		Success: error === undefined,
@@ -3036,12 +3062,240 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// Room consumables/currencies for a given room. Stubbed as empty lists so the
-	// client doesn't 404.
+	// A room's shop — the things it sells for its own currency. Public, like the room's
+	// currencies: a shop is shown to everyone who walks in.
 	.get(
 		'/api/roomconsumables/v1/roomConsumable/room/:roomId',
-		listRoute('Room consumables', 'Empty stub so the client doesn’t 404'),
-		(c) => c.json([])
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'A room’s consumables',
+			description: [
+				'Everything the room sells — a Health Potion for 25 tokens, a custom shirt for 500 —',
+				'oldest first, which is the order its owner built the shop up in.',
+				'',
+				'`Price` and `PurchaseCurrencyId` are FLAT here, against the nested',
+				'`PriceAndCurrency` the write takes: the client sends them nested and reads them',
+				'flat, so the two shapes genuinely differ. `PurchaseCurrencyId` names one of the',
+				'room’s own currencies and is not resolved or validated — a listing priced in a',
+				'currency that has since been deleted still shows, at a price nobody can pay.',
+				'',
+				'Public, like `GET /api/roomcurrencies/v1/currencies`. A room that sells nothing, and',
+				'an unknown room, are both an empty list — which the client reads as "no shop here"',
+				'where a 404 would stall the room load.',
+			].join('\n'),
+			parameters: [
+				{
+					name: 'roomId',
+					in: 'path',
+					required: true,
+					description: 'The room whose shop to list',
+					schema: { type: 'string' },
+				},
+			],
+			responses: { 200: json(RoomConsumableDto.array(), 'The room’s consumables, oldest first') },
+		}),
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			if (!Number.isInteger(roomId)) return c.json([])
+			return c.json(await getRoomConsumables(c.env.DB, roomId))
+		}
+	)
+
+	// Give the CALLER some of a room's consumables. Auth-gated (401); everything else is
+	// reported per entry, like the room-currency award.
+	.post(
+		'/api/roomconsumables/v1/roomConsumable/awardBulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Award room consumables to the caller',
+			description: [
+				'Adds to what the CALLER owns of a room’s consumables — the token says who is being',
+				'given them, and there is no recipient in the body.',
+				'',
+				'`Requests` is a MAP keyed by consumable id, not a list: `{ "<id>": { "Quantity": 1,',
+				'"ConcurrencyCodes": { … } } }`. `ConcurrencyCodes` is accepted and IGNORED — no',
+				'optimistic concurrency is implemented, so `NewConcurrencyCode` is neither stored nor',
+				'echoed and a stale `CurrentConcurrencyCode` does not refuse the write.',
+				'',
+				'The answer is one result per entry, in the order the keys appeared, each standing',
+				'alone: an id naming no listing fails that entry and leaves the rest to land. Shaped',
+				'after the room-currency bulk award rather than observed.',
+				'',
+				'`Quantity` may be negative, which takes items away; a player’s count floors at zero.',
+				'`Quantity` on the result is the RESULTING total owned, never the change.',
+				'',
+				'NOTE: this awards to whoever is asking, and nothing is spent for it — no room',
+				'currency is debited and no room membership is checked. It is a self-service faucet',
+				'until a purchase flow sits in front of it.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: jsonBody(AwardRoomConsumablesRequest, 'The consumables to give the caller'),
+			responses: {
+				200: json(
+					AwardRoomConsumableResultList,
+					'One result per entry, in the order the keys appeared'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = await c.req.json<{ Requests?: unknown }>().catch(() => null)
+			const requests = body?.Requests
+			// A body carrying no map of requests has no entries to report on, and the answer is
+			// a list of entry results — so there is nothing to say but "none".
+			if (typeof requests !== 'object' || requests === null || Array.isArray(requests)) {
+				return c.json([])
+			}
+
+			const results = []
+			for (const [consumableId, request] of Object.entries(requests as Record<string, unknown>)) {
+				const quantity = Number(
+					(typeof request === 'object' && request !== null
+						? (request as { Quantity?: unknown }).Quantity
+						: Number.NaN) ?? Number.NaN
+				)
+				if (!Number.isInteger(quantity)) {
+					results.push({
+						ConsumableId: consumableId,
+						Success: false,
+						Error: 'Invalid quantity',
+						Response: null,
+					})
+					continue
+				}
+
+				// Checked before writing: an inventory row naming no listing would be a thing a
+				// player owns that cannot be described.
+				const consumable = await getRoomConsumable(c.env.DB, consumableId)
+				if (!consumable) {
+					results.push({
+						ConsumableId: consumableId,
+						Success: false,
+						Error: 'No such consumable',
+						Response: null,
+					})
+					continue
+				}
+
+				const owned = await awardRoomConsumable(c.env.DB, accountId, consumableId, quantity)
+				results.push({
+					ConsumableId: consumableId,
+					Success: true,
+					Error: null,
+					Response: {
+						PlayerId: accountId,
+						ConsumableId: consumableId,
+						Quantity: owned,
+						AwardedAt: new Date().toISOString(),
+					},
+				})
+			}
+
+			return c.json(results)
+		}
+	)
+
+	// Create a consumable, or replace one when the body names an existing id. Auth-gated (401)
+	// and gated to the room's creator or a co-owner (403) — a shop is the room's to stock.
+	.put(
+		'/api/roomconsumables/v1/roomConsumable',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Create or replace a room consumable',
+			description: [
+				'Puts a thing in the room’s shop. JSON, with the price nested:',
+				'`{ "RoomConsumableId": null, "RoomId": 1162, "Name": "…", "Description": "…",',
+				'"ImageName": null, "PriceAndCurrency": { "Price": 50, "CurrencyId": "…" } }`.',
+				'',
+				'`RoomConsumableId` null (or absent) CREATES a listing and mints its id; naming an',
+				'existing listing REPLACES it. A replace is a replace, not a merge — the client',
+				'sends the whole form back, so an absent field is a cleared one. (The currency edit',
+				'is the opposite: its body is genuinely partial.)',
+				'',
+				'On a create the room is the body’s `RoomId`. On a replace it is the STORED',
+				'listing’s, and the body’s is ignored — an edit cannot move a listing into another',
+				'room, and the permission check must not be pointed somewhere friendlier than where',
+				'the thing actually lives.',
+				'',
+				'Gated to the room’s creator or a co-owner; a valid token from anyone else is a 403.',
+				'`PriceAndCurrency` is collapsed into the flat `Price`/`PurchaseCurrencyId` the read',
+				'serves. Answers the `{ Value, Success, Error, error_id }` envelope the room-currency',
+				'writes use, or a 200 carrying `Success: false` when the body is unusable or the',
+				'listing is unknown.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: jsonBody(UpsertRoomConsumableRequest, 'The listing to create or replace'),
+			responses: {
+				200: json(
+					RoomConsumableEnvelope,
+					'The listing as stored, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.json<Record<string, unknown>>().catch(() => null)) as Record<
+				string,
+				unknown
+			> | null
+			if (!body) return roomConsumableEnvelope(c, null, SAVE_CONSUMABLE_FAILED)
+
+			const str = (v: unknown): string | null => (typeof v === 'string' ? v : null)
+			const int = (v: unknown, fallback: number): number =>
+				typeof v === 'number' && Number.isInteger(v) ? v : fallback
+
+			const name = str(body.Name)?.trim() ?? ''
+			if (name === '') return roomConsumableEnvelope(c, null, SAVE_CONSUMABLE_FAILED)
+
+			// On a replace the room comes off the STORED listing, never the body — the same rule
+			// the currency edit follows. Otherwise a caller could name a listing in one room and
+			// a room they happen to own, and have the check pass against the wrong one.
+			const roomConsumableId = str(body.RoomConsumableId)
+			let roomId: number
+			if (roomConsumableId === null) {
+				roomId = int(body.RoomId, Number.NaN)
+				if (!Number.isInteger(roomId)) {
+					return roomConsumableEnvelope(c, null, SAVE_CONSUMABLE_FAILED)
+				}
+			} else {
+				const existing = await getRoomConsumable(c.env.DB, roomConsumableId)
+				if (!existing) return roomConsumableEnvelope(c, null, SAVE_CONSUMABLE_FAILED)
+				roomId = existing.RoomId
+			}
+
+			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
+			if (canManage === null) return roomConsumableEnvelope(c, null, SAVE_CONSUMABLE_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			// One price in one currency, flattened out of the body's nested object.
+			const priceAndCurrency = (
+				typeof body.PriceAndCurrency === 'object' && body.PriceAndCurrency !== null
+					? body.PriceAndCurrency
+					: {}
+			) as Record<string, unknown>
+
+			const consumable = await upsertRoomConsumable(c.env.DB, roomConsumableId, {
+				RoomId: roomId,
+				// Masked like every other player-typed string: a shop's contents are shown to
+				// everyone who walks into the room.
+				Name: censorSwears(name),
+				Description: censorSwears(str(body.Description) ?? ''),
+				ImageName: str(body.ImageName),
+				Price: int(priceAndCurrency.Price, 0),
+				PurchaseCurrencyId: str(priceAndCurrency.CurrencyId),
+				// The client has not been seen sending this, so it falls back to the CLR default
+				// for an int rather than to a guess at what the shop should allow.
+				MaximumCountPerPurchase: int(body.MaximumCountPerPurchase, 0),
+			})
+			return roomConsumableEnvelope(c, consumable)
+		}
 	)
 	.get(
 		'/api/roomconsumables/v1/roomConsumable/room/:roomId/me',

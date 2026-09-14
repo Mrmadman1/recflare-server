@@ -73,6 +73,7 @@ import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
+import { ROOM_CONSUMABLE_SCHEMA_DDL, ROOM_INVENTORY_SCHEMA_DDL } from '../../room-consumable-db'
 import { ROOM_BALANCE_SCHEMA_DDL, ROOM_CURRENCY_SCHEMA_DDL } from '../../room-currency-db'
 
 import type { CatalogLoadRow, CatalogRow, CatalogValue } from '../../catalog-db'
@@ -163,6 +164,8 @@ beforeAll(async () => {
 	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_CURRENCY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence (owned by the `match` worker) — a new room currency is pushed to everyone
 	// standing in the room, which is read from here.
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -771,7 +774,7 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('GET /api/roomconsumables/v1/roomConsumable/room/:id returns []', async () => {
+	test('GET /api/roomconsumables/v1/roomConsumable/room/:id returns [] for a room with no shop', async () => {
 		const res = await exports.default.fetch(
 			`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/1`
 		)
@@ -793,6 +796,317 @@ describe('econ endpoints', () => {
 			expect(other.status).toBe(200)
 			expect(await other.json()).toEqual([])
 		}
+	})
+
+	// Room 2511 is seeded as account 1's, with account 2 as co-owner.
+	describe('room consumables', () => {
+		type Consumable = {
+			RoomConsumableId: string
+			RoomId: number
+			Name: string
+			Description: string
+			ImageName: string | null
+			Price: number
+			PurchaseCurrencyId: string | null
+			ModifiedAt: string
+			MaximumCountPerPurchase: number
+		}
+
+		const save = async (payload: unknown, headers?: Record<string, string>) =>
+			exports.default.fetch(`${ORIGIN}/api/roomconsumables/v1/roomConsumable`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json', ...headers },
+				body: JSON.stringify(payload),
+			})
+		const envOf = async (res: Response) =>
+			(await res.json()) as {
+				Value: Consumable | null
+				Success: boolean
+				Error: string | null
+				error_id: null
+			}
+		const shopOf = async (roomId: number) =>
+			(await (
+				await exports.default.fetch(
+					`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/${roomId}`
+				)
+			).json()) as Consumable[]
+
+		const body = {
+			RoomConsumableId: null,
+			RoomId: 2511,
+			Name: 'test',
+			Description: 'test444444',
+			ImageName: null,
+			PriceAndCurrency: { Price: 50, CurrencyId: 'b9f41a7c-32f1-4456-b84f-fdb94b240955' },
+		}
+
+		test('PUT roomConsumable stocks the shop, gated to the room', async () => {
+			// No token → 401; a valid token with no standing in the room → 403.
+			expect((await save(body)).status).toBe(401)
+			expect((await save(body, await bearer('999'))).status).toBe(403)
+
+			// An unusable body is the failure envelope, and stocks nothing.
+			const badBodies: unknown[] = [
+				{ ...body, RoomId: 'nope' },
+				{ ...body, Name: '   ' },
+				{ ...body, RoomConsumableId: 'a3f1e8d2-0000-4000-8000-000000000000' },
+				'not an object',
+			]
+			for (const bad of badBodies) {
+				const res = await save(bad, await bearer('1'))
+				expect(res.status).toBe(200)
+				expect(await envOf(res)).toEqual({
+					Value: null,
+					Success: false,
+					Error: 'Failed to save consumable',
+					error_id: null,
+				})
+			}
+			expect(await shopOf(2511)).toEqual([])
+
+			// The owner stocks it. `PriceAndCurrency` collapses to the flat pair the read serves.
+			const res = await save(body, await bearer('1'))
+			expect(res.status).toBe(200)
+			const env = await envOf(res)
+			expect(env).toMatchObject({ Success: true, Error: null, error_id: null })
+			const created = env.Value!
+			expect(created).toMatchObject({
+				RoomId: 2511,
+				Name: 'test',
+				Description: 'test444444',
+				ImageName: null,
+				Price: 50,
+				PurchaseCurrencyId: 'b9f41a7c-32f1-4456-b84f-fdb94b240955',
+				// The client doesn't send this, so it falls back rather than landing as NaN.
+				MaximumCountPerPurchase: 0,
+			})
+			expect(created.RoomConsumableId).toMatch(/^[0-9a-f-]{36}$/)
+			expect(Date.parse(created.ModifiedAt)).not.toBeNaN()
+			// The client's own model, member for member and in its order.
+			expect(Object.keys(created)).toEqual([
+				'RoomConsumableId',
+				'RoomId',
+				'Name',
+				'Description',
+				'ImageName',
+				'Price',
+				'PurchaseCurrencyId',
+				'ModifiedAt',
+				'MaximumCountPerPurchase',
+			])
+
+			// The list serves it back, and it belongs to this room alone.
+			expect(await shopOf(2511)).toEqual([created])
+			expect(await shopOf(1)).toEqual([])
+		})
+
+		test('PUT roomConsumable replaces when the body names a listing', async () => {
+			const created = (await envOf(await save({ ...body, Name: 'Before' }, await bearer('1'))))
+				.Value!
+
+			// Naming the listing REPLACES it rather than adding a second, and a co-owner may.
+			const edited = (
+				await envOf(
+					await save(
+						{
+							RoomConsumableId: created.RoomConsumableId,
+							// Deliberately another room: an edit must not move a listing, and the
+							// permission check must not follow the body.
+							RoomId: 1,
+							Name: 'After',
+							Description: 'edited',
+							ImageName: 'potion.png',
+							PriceAndCurrency: { Price: 25, CurrencyId: null },
+							MaximumCountPerPurchase: 10,
+						},
+						await bearer('2')
+					)
+				)
+			).Value!
+
+			expect(edited).toMatchObject({
+				RoomConsumableId: created.RoomConsumableId,
+				// Still room 2511 — the body's RoomId is ignored on a replace.
+				RoomId: 2511,
+				Name: 'After',
+				Description: 'edited',
+				ImageName: 'potion.png',
+				Price: 25,
+				PurchaseCurrencyId: null,
+				MaximumCountPerPurchase: 10,
+			})
+			const shop = await shopOf(2511)
+			expect(shop.filter((it) => it.RoomConsumableId === created.RoomConsumableId)).toEqual([
+				edited,
+			])
+
+			// A replace is a REPLACE, not a merge: a field left out is cleared, since the client
+			// sends the whole form back.
+			const cleared = (
+				await envOf(
+					await save(
+						{ RoomConsumableId: created.RoomConsumableId, Name: 'Bare' },
+						await bearer('1')
+					)
+				)
+			).Value!
+			expect(cleared).toMatchObject({
+				Name: 'Bare',
+				Description: '',
+				ImageName: null,
+				Price: 0,
+				PurchaseCurrencyId: null,
+				MaximumCountPerPurchase: 0,
+			})
+		})
+
+		test('PUT roomConsumable masks a name players will see, and a room can stock several', async () => {
+			const masked = (await envOf(await save({ ...body, Name: 'shit potion' }, await bearer('1'))))
+				.Value!
+			expect(masked.Name).toBe('**** potion')
+
+			await save({ ...body, Name: 'Second' }, await bearer('1'))
+			const shop = await shopOf(2511)
+			expect(shop.length).toBeGreaterThanOrEqual(2)
+			// Each listing has its own id — two things in a shop are not one thing.
+			expect(new Set(shop.map((it) => it.RoomConsumableId)).size).toBe(shop.length)
+		})
+
+		test('POST roomConsumable/awardBulk gives them to the CALLER, reporting each entry', async () => {
+			type AwardResult = {
+				ConsumableId: string
+				Success: boolean
+				Error: string | null
+				Response: {
+					PlayerId: number
+					ConsumableId: string
+					Quantity: number
+					AwardedAt: string
+				} | null
+			}
+			const potion = (await envOf(await save({ ...body, Name: 'Potion' }, await bearer('1'))))
+				.Value!
+			const elixir = (await envOf(await save({ ...body, Name: 'Elixir' }, await bearer('1'))))
+				.Value!
+
+			const awardBulk = async (payload: unknown, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomconsumables/v1/roomConsumable/awardBulk`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', ...headers },
+					body: JSON.stringify(payload),
+				})
+			const resultsOf = async (res: Response) => (await res.json()) as AwardResult[]
+			const ownedBy = async (playerId: number, consumableId: string) =>
+				(
+					await env.DB.prepare(
+						'SELECT quantity FROM room_inventory WHERE player_id = ?1 AND consumable_id = ?2'
+					)
+						.bind(playerId, consumableId)
+						.first<{ quantity: number }>()
+				)?.quantity ?? 0
+
+			const request = (id: string, Quantity: number) => ({
+				Requests: {
+					[id]: {
+						Quantity,
+						ConcurrencyCodes: {
+							CurrentConcurrencyCode: null,
+							NewConcurrencyCode: '8792f49a-703d-4906-8320-dc9c5f616e21',
+						},
+					},
+				},
+			})
+
+			// No token → 401. Nothing else is answered at the call level.
+			expect((await awardBulk(request(potion.RoomConsumableId, 1))).status).toBe(401)
+
+			// The award goes to whoever is ASKING — account 42 here, not the room's owner.
+			const res = await awardBulk(request(potion.RoomConsumableId, 1), await bearer('42'))
+			expect(res.status).toBe(200)
+			const results = await resultsOf(res)
+			expect(results).toHaveLength(1)
+			expect(results[0]).toMatchObject({
+				ConsumableId: potion.RoomConsumableId,
+				Success: true,
+				Error: null,
+				Response: {
+					PlayerId: 42,
+					ConsumableId: potion.RoomConsumableId,
+					Quantity: 1,
+				},
+			})
+			expect(Date.parse(results[0].Response!.AwardedAt)).not.toBeNaN()
+			expect(await ownedBy(42, potion.RoomConsumableId)).toBe(1)
+			// Nobody else got one.
+			expect(await ownedBy(1, potion.RoomConsumableId)).toBe(0)
+
+			// Awards accumulate, and `Quantity` on the result is the RESULTING total.
+			expect(
+				(
+					await resultsOf(await awardBulk(request(potion.RoomConsumableId, 4), await bearer('42')))
+				)[0].Response
+			).toMatchObject({ Quantity: 5 })
+
+			// Negative takes them away, and the count floors at zero.
+			expect(
+				(
+					await resultsOf(await awardBulk(request(potion.RoomConsumableId, -2), await bearer('42')))
+				)[0].Response
+			).toMatchObject({ Quantity: 3 })
+			expect(
+				(
+					await resultsOf(
+						await awardBulk(request(potion.RoomConsumableId, -99), await bearer('42'))
+					)
+				)[0].Response
+			).toMatchObject({ Quantity: 0 })
+
+			// Several keys in one call: each entry stands alone, in the order the keys appeared,
+			// so an id naming no listing leaves the rest to land.
+			const mixed = await awardBulk(
+				{
+					Requests: {
+						[elixir.RoomConsumableId]: { Quantity: 2 },
+						'a3f1e8d2-0000-4000-8000-000000000000': { Quantity: 9 },
+						[potion.RoomConsumableId]: { Quantity: 'lots' },
+					},
+				},
+				await bearer('42')
+			)
+			const mixedResults = await resultsOf(mixed)
+			expect(mixedResults.map((r) => r.ConsumableId)).toEqual([
+				elixir.RoomConsumableId,
+				'a3f1e8d2-0000-4000-8000-000000000000',
+				potion.RoomConsumableId,
+			])
+			expect(mixedResults.map((r) => r.Success)).toEqual([true, false, false])
+			expect(mixedResults.map((r) => r.Error)).toEqual([
+				null,
+				'No such consumable',
+				'Invalid quantity',
+			])
+			expect(await ownedBy(42, elixir.RoomConsumableId)).toBe(2)
+			// The bad entries wrote nothing.
+			expect(await ownedBy(42, 'a3f1e8d2-0000-4000-8000-000000000000')).toBe(0)
+			expect(await ownedBy(42, potion.RoomConsumableId)).toBe(0)
+
+			// A body with no `Requests` map has no entries to report on.
+			for (const bad of [{}, { Requests: null }, { Requests: [] }, 'nope']) {
+				const res = await awardBulk(bad, await bearer('42'))
+				expect(res.status).toBe(200)
+				expect(await resultsOf(res)).toEqual([])
+			}
+		})
+
+		test('GET roomConsumable/room/:id is public and empty for an unknown room', async () => {
+			expect(await shopOf(99999)).toEqual([])
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/nope`
+			)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual([])
+		})
 	})
 
 	// Room 2511 is seeded as account 1's, with account 2 as co-owner.
@@ -4801,6 +5115,7 @@ describe('econ endpoints', () => {
 			'POST /api/items/purchaseInfos',
 			'POST /api/objectives/v1/cleargroup',
 			'POST /api/objectives/v1/updateobjective',
+			'POST /api/roomconsumables/v1/roomConsumable/awardBulk',
 			'POST /api/roomcurrencies/v1/awardCurrency/bulk',
 			'POST /api/roomcurrencies/v1/createCurrency',
 			'POST /api/roomcurrencies/v1/createPurchaseOffer',
@@ -4809,6 +5124,7 @@ describe('econ endpoints', () => {
 			'POST /api/storefronts/v3/buyInvention',
 			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
+			'PUT /api/roomconsumables/v1/roomConsumable',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not
