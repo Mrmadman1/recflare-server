@@ -115,11 +115,15 @@ export interface HubState {
  */
 export const MAX_PENDING_PER_PLAYER = 500
 
-/** The Coach system account — the `FromPlayerId` on a coach message (see coachMessageAll). */
-const COACH_PLAYER_ID = 1
+/**
+ * The Coach system account — the `FromPlayerId` on a coach message (see coachMessageAll).
+ * Exported because the targeted send stores its message before pushing it, and the row has
+ * to name the same sender the frame does.
+ */
+export const COACH_PLAYER_ID = 1
 
 /** The Message `Type` a coach/system message carries (a Message-model enum, not a NotificationType). */
-const COACH_MESSAGE_TYPE = 100
+export const COACH_MESSAGE_TYPE = 100
 
 export class NotificationsHub extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -131,7 +135,7 @@ export class NotificationsHub extends DurableObject<Env> {
 		// way — it just leaves a trace when it happens.
 		ctx
 			.blockConcurrencyWhile(async () => {
-			this.ctx.storage.sql.exec(`
+				this.ctx.storage.sql.exec(`
 				CREATE TABLE IF NOT EXISTS subscriptions (
 					connectionId TEXT NOT NULL,
 					playerId INTEGER NOT NULL
@@ -550,20 +554,26 @@ export class NotificationsHub extends DurableObject<Env> {
 	 * the Coach account (player 1), addressed to one player with a `ToPlayerId` — the shape
 	 * `api`'s player-to-player send uses.
 	 *
+	 * Takes the ALREADY-STORED message rather than building one, so the frame carries the
+	 * row's `Id` and `SentTime` and the player can read the same message back from
+	 * `GET /api/messages/v2/get`. The worker route writes the row (the DO has no business
+	 * doing D1 writes — every hub call funnels through this one global instance).
+	 *
 	 * Unlike the broadcast this one QUEUES when the recipient is offline (see
 	 * {@link notifyPlayer}). The broadcast is online-only because it has no recipient to
-	 * hold anything for; a message written to a named player is worth keeping until they
-	 * next connect.
+	 * hold anything for — and, for the same reason, nothing to store: a message written to
+	 * a named player is worth keeping until they next connect.
 	 */
-	async coachMessage(
-		playerId: number,
-		content: string
-	): Promise<{ delivered: number; queued: boolean }> {
-		return this.notifyPlayer(playerId, NotificationType.MessageReceived, {
-			FromPlayerId: COACH_PLAYER_ID,
-			ToPlayerId: playerId,
-			Type: COACH_MESSAGE_TYPE,
-			Data: content,
+	async coachMessage(message: {
+		Id: number
+		FromPlayerId: number
+		ToPlayerId: number
+		SentTime: string
+		Type: number
+		Data: string | null
+	}): Promise<{ delivered: number; queued: boolean }> {
+		return this.notifyPlayer(message.ToPlayerId, NotificationType.MessageReceived, {
+			...message,
 		})
 	}
 

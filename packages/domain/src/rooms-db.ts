@@ -184,11 +184,28 @@ export const SUBROOM_SCHEMA_DDL: string[] = [
 export type Room = Record<string, unknown>
 
 /** A room role assignment (the client's RoomRole shape). */
-interface RoomRole {
+export interface RoomRole {
 	AccountId: number
 	Role: number
 	LastChangedByAccountId: number | null
 	InvitedRole: number
+}
+
+/**
+ * A room's `Roles`, always as whole {@link RoomRole} records. Roles live inside the room
+ * blob, and the older rooms either have no `Roles` key at all or carry entries written
+ * before `LastChangedByAccountId`/`InvitedRole` existed; every reader wants the complete
+ * shape, so the missing keys are filled in here rather than at each call site. Returns
+ * copies, so a caller that edits an entry must write the returned array back to the room.
+ */
+export function roomRoles(room: Room): RoomRole[] {
+	const roles = Array.isArray(room.Roles) ? (room.Roles as Array<Partial<RoomRole>>) : []
+	return roles.map((r) => ({
+		AccountId: Number(r.AccountId ?? 0),
+		Role: Number(r.Role ?? Role.None),
+		LastChangedByAccountId: r.LastChangedByAccountId ?? null,
+		InvitedRole: Number(r.InvitedRole ?? Role.None),
+	}))
 }
 
 /**
@@ -207,8 +224,7 @@ const MANAGE_ROLES: ReadonlySet<number> = new Set([Role.Creator, Role.CoOwner])
  */
 export function canManageRoom(room: Room, accountId: number): boolean {
 	if (room.CreatorAccountId === accountId) return true
-	const roles = Array.isArray(room.Roles) ? (room.Roles as RoomRole[]) : []
-	return roles.some((r) => r.AccountId === accountId && MANAGE_ROLES.has(r.Role))
+	return roomRoles(room).some((r) => r.AccountId === accountId && MANAGE_ROLES.has(r.Role))
 }
 
 /**
@@ -223,8 +239,19 @@ export function canManageRoom(room: Room, accountId: number): boolean {
  */
 export function canModerateRoom(room: Room, accountId: number): boolean {
 	if (room.CreatorAccountId === accountId) return true
-	const roles = Array.isArray(room.Roles) ? (room.Roles as RoomRole[]) : []
-	return roles.some((r) => r.AccountId === accountId && r.Role >= Role.Moderator)
+	return roomRoles(room).some((r) => r.AccountId === accountId && r.Role >= Role.Moderator)
+}
+
+/**
+ * Whether an account OWNS a room — its `CreatorAccountId`, or the holder of the Creator
+ * (255) role. The narrowest of the three room gates: {@link canManageRoom} lets a CoOwner
+ * through and {@link canModerateRoom} a Moderator, but handing out co-ownership is the
+ * owner's alone, or a co-owner could quietly grow the set of people who can change the
+ * room, an offer the invited player then accepts themselves.
+ */
+export function isRoomOwner(room: Room, accountId: number): boolean {
+	if (room.CreatorAccountId === accountId) return true
+	return roomRoles(room).some((r) => r.AccountId === accountId && r.Role === Role.Creator)
 }
 
 /** A player banned from a room (a `room_ban` row). */
@@ -414,7 +441,12 @@ export async function cloneRoom(
 	// any co-owners, e.g. the seeded base-room roles for accounts 1/2) must NOT
 	// carry over, or the clone would still list the template's owner as owner.
 	const roles: RoomRole[] = [
-		{ AccountId: accountId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: 0 },
+		{
+			AccountId: accountId,
+			Role: Role.Creator,
+			LastChangedByAccountId: null,
+			InvitedRole: Role.None,
+		},
 	]
 
 	const cloned: Room = {
@@ -509,10 +541,37 @@ export async function updateRoomFields(
 }
 
 /**
- * Set a target account's room `Role` — updating their existing `Roles` entry or
- * appending a new one — and stamp `LastChangedByAccountId` with the editor. The
- * caller supplies the already-loaded room (after its owner/co-owner check) to avoid
- * a re-read; the whole room JSON is rewritten. Returns the updated room.
+ * Whether a role tier can only be taken by INVITATION — offered with
+ * {@link inviteRoomRole} and accepted by the player themselves via
+ * {@link answerRoomRoleInvite} — rather than granted outright.
+ *
+ * {@link Role.CoOwner} is the tier this rule exists for: nobody can force-add a co-owner,
+ * it is always an invite the player accepts. {@link Role.Creator} is included because it is
+ * strictly more than co-ownership — it would make no sense for the bigger grant to be the
+ * one that skips the ceremony. Expressed as `>=` so a tier added between or above them is
+ * covered by default: a new high-privilege role should have to be accepted until someone
+ * decides otherwise, not be grantable because nobody updated this list.
+ */
+export function roleRequiresInvite(role: number): boolean {
+	return role >= Role.CoOwner
+}
+
+/**
+ * GRANT a room role outright — updating the target account's existing `Roles` entry or
+ * appending one — and stamp `LastChangedByAccountId` with the editor. This is the owner's
+ * half of role management, and it takes effect immediately: the helper tiers
+ * ({@link Role.Host}, {@link Role.Moderator} and whatever else the client hands out) are the
+ * owner's to give.
+ *
+ * Returns null, writing nothing, for a tier that {@link roleRequiresInvite} — nobody can
+ * force-add a co-owner, whoever is asking. The rule lives HERE rather than in the route that
+ * currently calls this, because it is an invariant of the room's `Roles` and not a policy of
+ * one endpoint: the only way a `Role` of {@link Role.CoOwner} may ever appear on an entry is
+ * {@link answerRoomRoleInvite} promoting an `InvitedRole` the room's owner offered.
+ *
+ * The caller supplies the already-loaded room (after its gate) to avoid a re-read; the whole
+ * room JSON is rewritten. Any pending `InvitedRole` on the entry is left standing — a granted
+ * Host with a co-owner invite open still has it to answer.
  */
 export async function setRoomRole(
 	db: D1Database,
@@ -521,8 +580,10 @@ export async function setRoomRole(
 	role: number,
 	changedByAccountId: number,
 	room: Room
-): Promise<Room> {
-	const roles = Array.isArray(room.Roles) ? (room.Roles as RoomRole[]) : []
+): Promise<Room | null> {
+	if (roleRequiresInvite(role)) return null
+
+	const roles = roomRoles(room)
 	const existing = roles.find((r) => r.AccountId === targetAccountId)
 	if (existing) {
 		existing.Role = role
@@ -532,7 +593,109 @@ export async function setRoomRole(
 			AccountId: targetAccountId,
 			Role: role,
 			LastChangedByAccountId: changedByAccountId,
-			InvitedRole: 0,
+			InvitedRole: Role.None,
+		})
+	}
+
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * ANSWER a standing room-role invite — accept it, or decline it with `role` 0.
+ *
+ * Accepting promotes the account's `Roles` entry from its pending `InvitedRole` to the real
+ * `Role` and clears the pending one, so an accepted entry reads `Role: 30, InvitedRole: 0`
+ * and the invite cannot be answered twice. `role` is what the ACCEPTING PLAYER asked for, and
+ * it must equal the `InvitedRole` already on their entry. That equality is the whole security
+ * of this call: the answer is made by the invited player themselves, so without it they could
+ * answer an invite to Host by asking for Creator and award themselves the room. The invited
+ * role is the server's own record of what the owner offered, written by
+ * {@link inviteRoomRole}, and nothing the caller sends can move it.
+ *
+ * Declining (`role` 0 — not a real tier, so it can't be confused for one) REMOVES the entry
+ * outright rather than just clearing `InvitedRole`: a declined invite should leave the room's
+ * `Roles` as it was before the offer. Note that this takes any role the player already held
+ * with it, so someone re-invited to a different tier who declines is left with nothing at
+ * all. That is deliberate — an invite is answered as a whole — but it means a decline is not
+ * a no-op for an existing member.
+ *
+ * Returns null — changing nothing — when there is no entry for the account, no invite
+ * standing on it, or (when accepting) the requested role isn't the one offered. The three are
+ * deliberately one answer: a caller probing for a higher role learns only that it didn't work.
+ *
+ * `LastChangedByAccountId` is left alone rather than restamped with the accepter: it names
+ * who put this role on the entry, and that is the owner who offered it. The caller supplies
+ * the already-loaded room to avoid a re-read; the whole room JSON is rewritten.
+ */
+export async function answerRoomRoleInvite(
+	db: D1Database,
+	roomId: number,
+	accountId: number,
+	role: number,
+	room: Room
+): Promise<Room | null> {
+	const roles = roomRoles(room)
+	const index = roles.findIndex((r) => r.AccountId === accountId)
+	if (index === -1) return null
+
+	const entry = roles[index]
+	// `Role.None` is "nothing pending" — the resting state of every entry, and what an
+	// already-answered invite leaves behind, so neither answer can be replayed.
+	if (entry.InvitedRole === Role.None) return null
+
+	if (role === Role.None) {
+		roles.splice(index, 1)
+	} else if (entry.InvitedRole !== role) {
+		return null
+	} else {
+		entry.Role = entry.InvitedRole
+		entry.InvitedRole = Role.None
+	}
+
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * INVITE an account to a room role — setting `InvitedRole` on their `Roles` entry (adding
+ * the entry when they have none) and stamping `LastChangedByAccountId` with the inviter.
+ *
+ * `InvitedRole` is the PENDING half of a role entry: an invited account holds it until
+ * they accept, at which point {@link answerRoomRoleInvite} promotes it to the real `Role`.
+ * So an entry added here starts at {@link Role.None} — no role yet, only an offer — and an
+ * account who already holds a role keeps it while a higher one is pending.
+ *
+ * Like {@link answerRoomRoleInvite}, the caller supplies the already-loaded room to
+ * avoid a re-read, and the whole room JSON is rewritten. Returns the updated room.
+ */
+export async function inviteRoomRole(
+	db: D1Database,
+	roomId: number,
+	targetAccountId: number,
+	invitedRole: number,
+	changedByAccountId: number,
+	room: Room
+): Promise<Room> {
+	const roles = roomRoles(room)
+	const existing = roles.find((r) => r.AccountId === targetAccountId)
+	if (existing) {
+		existing.InvitedRole = invitedRole
+		existing.LastChangedByAccountId = changedByAccountId
+	} else {
+		roles.push({
+			AccountId: targetAccountId,
+			Role: Role.None,
+			LastChangedByAccountId: changedByAccountId,
+			InvitedRole: invitedRole,
 		})
 	}
 	const updated: Room = { ...room, Roles: roles }
@@ -2915,7 +3078,12 @@ export async function getOrCreateDormRoom(db: D1Database, accountId: number): Pr
 		CreatorAccountId: accountId,
 		IsDorm: true,
 		Roles: [
-			{ AccountId: accountId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: 0 },
+			{
+				AccountId: accountId,
+				Role: Role.Creator,
+				LastChangedByAccountId: null,
+				InvitedRole: Role.None,
+			},
 		],
 		// Counters start at zero rather than inheriting the template dorm's (see cloneRoom).
 		Stats: storedStats(template?.Stats),

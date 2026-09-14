@@ -2,11 +2,13 @@ import { adminSecretsStore, env, runInDurableObject } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
+import { NOTIFICATION_SCHEMA_DDL } from '@repo/domain'
+
 import '../../notify.app'
 
-import type { Env } from '../../context'
 import { MAX_PENDING_PER_PLAYER } from '../../notifications-hub'
 
+import type { Env } from '../../context'
 import type { HubState } from '../../notifications-hub'
 
 declare module 'cloudflare:test' {
@@ -50,6 +52,9 @@ async function bearer(
 // Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 beforeAll(async () => {
 	await adminSecretsStore(env.JWT_SECRET).create(TEST_SECRET)
+	// The notification store a targeted coach message writes to. Owned by the `api` worker's
+	// migrations, which don't run here, so build it from the mirrored DDL.
+	for (const ddl of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(ddl).run()
 })
 
 /** Who `connect` is by default — kept clear of the player ids the tests notify. */
@@ -400,6 +405,43 @@ describe('notification delivery', () => {
 			(JSON.parse((note.arguments as string[])[0]) as { Msg: Record<string, unknown> }).Msg
 		).toMatchObject({ FromPlayerId: 1, ToPlayerId: playerId, Data: 'catch you later' })
 		ws.close()
+	})
+
+	test('coach-message stores a notification; the broadcast does not', async () => {
+		const stored = async (playerId: number) =>
+			(
+				await env.DB.prepare(
+					'SELECT notification_id, from_player_id, type, data FROM notification WHERE to_player_id = ?1'
+				)
+					.bind(playerId)
+					.all<{ notification_id: number; from_player_id: number; type: number; data: string }>()
+			).results
+
+		// A message to ONE player is a real message: stored, so they read it from their
+		// inbox on next login whether or not the hub reached them, and the frame carries
+		// the stored row's id.
+		const playerId = 9013
+		const res = await post('/internal/coach-message', { playerId, messageContent: 'kept' })
+		const { notificationId } = (await res.json()) as { notificationId: number }
+
+		const rows = await stored(playerId)
+		expect(rows).toHaveLength(1)
+		expect(rows[0]).toMatchObject({
+			notification_id: notificationId,
+			from_player_id: 1,
+			type: 100,
+			data: 'kept',
+		})
+
+		// The BROADCAST stores nothing — it reaches everyone online at once, so a row per
+		// player would be thousands of writes per maintenance notice.
+		const listener = await connect('coach-nostore', {
+			headers: await bearer('9014', ['gameClient']),
+		})
+		await post('/internal/coach-message-all', { messageContent: 'everyone' })
+		await listener.waitFor((r) => r.type === 1 && r.target === 'Notification')
+		expect(await stored(9014)).toEqual([])
+		listener.ws.close()
 	})
 
 	test('coach-message 400s without a player or a message', async () => {

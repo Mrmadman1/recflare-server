@@ -15,6 +15,7 @@ import {
 	LEVEL_REWARDS,
 	MAX_LEVEL,
 	MessageType,
+	NOTIFICATION_SCHEMA_DDL,
 	OUTFIT_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	PRESENCE_TTL_SECONDS,
@@ -177,6 +178,10 @@ beforeAll(async () => {
 
 	// Custom avatar items (owned by the api worker).
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// The message store (owned by the api worker) — the inbox reads it and every send
+	// writes to it.
+	for (const stmt of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -5996,7 +6001,17 @@ describe('messages', () => {
 	type Sent = {
 		playerId: number
 		notificationType: number
-		data: { FromPlayerId: number; ToPlayerId: number; Type: number; Data: string }
+		// The frame carries the STORED message, so `Id` and `SentTime` come off the row.
+		data: {
+			Id: number
+			FromPlayerId: number
+			ToPlayerId: number
+			SentTime: string
+			Type: number
+			Data: string | null
+			RoomId: number | null
+			PlayerEventId: number | null
+		}
 	}
 	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
 	const pushed = async (): Promise<Sent[]> =>
@@ -6014,26 +6029,60 @@ describe('messages', () => {
 	// NotificationType.MessageReceived — the same frame the Coach broadcast uses.
 	const MESSAGE_RECEIVED = 2
 
+	/** One player's inbox, as the client reads it on login. */
+	const inboxOf = async (playerId: string) =>
+		(await (
+			await exports.default.fetch(`${ORIGIN}/api/messages/v2/get`, {
+				headers: await bearer(playerId),
+			})
+		).json()) as Array<{
+			Id: number
+			FromPlayerId: number
+			ToPlayerId: number
+			SentTime: string
+			Type: number
+			Data: string | null
+		}>
+
+	const del = async (body: unknown, headers?: Record<string, string>) =>
+		exports.default.fetch(`${ORIGIN}/api/messages/v3/delete`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...headers },
+			body: JSON.stringify(body),
+		})
+
 	test('POST /api/messages/v2/send pushes MessageReceived to the recipient', async () => {
 		const res = await send({ ToPlayerId: '2', Type: '10', Data: '' }, await bearer('42'))
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ success: true, error: '' })
 
-		expect(await pushed()).toEqual([
-			{
-				// Delivered to the recipient, not the sender.
-				playerId: 2,
-				notificationType: MESSAGE_RECEIVED,
-				// FromPlayerId is the token's subject, not a body field.
-				data: { FromPlayerId: 42, ToPlayerId: 2, Type: 10, Data: '' },
-			},
-		])
+		const sent = await pushed()
+		expect(sent).toHaveLength(1)
+		// Delivered to the recipient, not the sender.
+		expect(sent[0]?.playerId).toBe(2)
+		expect(sent[0]?.notificationType).toBe(MESSAGE_RECEIVED)
+		// FromPlayerId is the token's subject, not a body field. The frame carries the
+		// STORED message, so it has the row's Id and SentTime on it too.
+		expect(sent[0]?.data).toMatchObject({
+			FromPlayerId: 42,
+			ToPlayerId: 2,
+			Type: 10,
+			Data: '',
+			RoomId: null,
+			PlayerEventId: null,
+		})
+		const frameId = sent[0]!.data.Id
+		expect(frameId).toBeGreaterThan(0)
+
+		// ...and the recipient reads the same message, under the same id, from their inbox.
+		const inbox = await inboxOf('2')
+		expect(inbox[0]).toMatchObject({ Id: frameId, FromPlayerId: 42, Type: 10, Data: '' })
 	})
 
 	test('POST /api/messages/v2/send defaults Type and Data when omitted', async () => {
 		const res = await send({ ToPlayerId: '2' }, await bearer('42'))
 		expect(res.status).toBe(200)
-		expect((await pushed())[0]?.data).toEqual({
+		expect((await pushed())[0]?.data).toMatchObject({
 			FromPlayerId: 42,
 			ToPlayerId: 2,
 			Type: 0,
@@ -6073,18 +6122,17 @@ describe('messages', () => {
 		expect(await res.json()).toEqual({ success: true, error: '' })
 
 		// Each frame is addressed to its own recipient; the sender is the token's subject.
-		expect(await pushed()).toEqual([
-			{
-				playerId: 205,
-				notificationType: MESSAGE_RECEIVED,
-				data: { FromPlayerId: 42, ToPlayerId: 205, Type: 20, Data: 'hi' },
-			},
-			{
-				playerId: 206,
-				notificationType: MESSAGE_RECEIVED,
-				data: { FromPlayerId: 42, ToPlayerId: 206, Type: 20, Data: 'hi' },
-			},
-		])
+		const sent = await pushed()
+		expect(sent.map((n) => n.playerId)).toEqual([205, 206])
+		expect(sent.map((n) => n.notificationType)).toEqual([MESSAGE_RECEIVED, MESSAGE_RECEIVED])
+		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 20, Data: 'hi' })
+		expect(sent[1]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 206, Type: 20, Data: 'hi' })
+
+		// One STORED message each, with ids of their own — not one message shared.
+		const ids = sent.map((n) => n.data.Id)
+		expect(new Set(ids).size).toBe(2)
+		expect((await inboxOf('205'))[0]).toMatchObject({ Id: ids[0], Data: 'hi' })
+		expect((await inboxOf('206'))[0]).toMatchObject({ Id: ids[1], Data: 'hi' })
 	})
 
 	test('POST /api/messages/v1/sendMultiple defaults Type and Data, and de-duplicates ids', async () => {
@@ -6093,7 +6141,7 @@ describe('messages', () => {
 
 		const sent = await pushed()
 		expect(sent).toHaveLength(1)
-		expect(sent[0]?.data).toEqual({ FromPlayerId: 42, ToPlayerId: 205, Type: 0, Data: '' })
+		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 0, Data: '' })
 	})
 
 	test('POST /api/messages/v1/sendMultiple 400s with no usable recipient, pushing nothing', async () => {
@@ -6111,18 +6159,65 @@ describe('messages', () => {
 		expect(await pushed()).toEqual([])
 	})
 
-	test('POST /api/messages/v3/delete accepts anything with an empty 200', async () => {
-		// No message store, so no id can be real and nothing is gated — an unknown id, an
-		// empty list and a missing body all land the same way.
-		for (const body of [{ MessageIds: [1787377235629] }, { MessageIds: [] }, {}]) {
-			const res = await exports.default.fetch(`${ORIGIN}/api/messages/v3/delete`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(body),
-			})
+	test('GET /api/messages/v2/get serves the caller’s inbox, newest first', async () => {
+		// Two messages to 9600, one to somebody else — an inbox is the caller's own.
+		await send({ ToPlayerId: '9600', Data: 'first' }, await bearer('42'))
+		await send({ ToPlayerId: '9600', Data: 'second' }, await bearer('43'))
+		await send({ ToPlayerId: '9601', Data: 'not yours' }, await bearer('42'))
+
+		const inbox = await inboxOf('9600')
+		expect(inbox.map((m) => m.Data)).toEqual(['second', 'first'])
+		expect(inbox[0]).toMatchObject({ FromPlayerId: 43, ToPlayerId: 9600, Type: 0 })
+		// Every message carries the full Message model, ids and all.
+		expect(Date.parse(inbox[0].SentTime)).not.toBeNaN()
+		expect(inbox.every((m) => m.Id > 0)).toBe(true)
+		// The other player's message is not in it.
+		expect(inbox.some((m) => m.Data === 'not yours')).toBe(false)
+	})
+
+	test('GET /api/messages/v2/get is auth-gated', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/messages/v2/get`)
+		expect(res.status).toBe(401)
+	})
+
+	test('POST /api/messages/v3/delete removes only the caller’s messages', async () => {
+		await send({ ToPlayerId: '9610', Data: 'keep' }, await bearer('42'))
+		await send({ ToPlayerId: '9610', Data: 'drop' }, await bearer('42'))
+		await send({ ToPlayerId: '9611', Data: 'someone else' }, await bearer('42'))
+
+		const before = await inboxOf('9610')
+		const drop = before.find((m) => m.Data === 'drop')!
+		const theirs = (await inboxOf('9611'))[0]
+
+		// The caller deletes their own message, and takes a swing at another player's id
+		// in the same call — an id names a message globally, so this must not reach it.
+		const res = await del({ MessageIds: [drop.Id, theirs.Id] }, await bearer('9610'))
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('')
+
+		expect((await inboxOf('9610')).map((m) => m.Data)).toEqual(['keep'])
+		expect((await inboxOf('9611')).map((m) => m.Data)).toEqual(['someone else'])
+	})
+
+	test('POST /api/messages/v3/delete takes a bare array, and shrugs off the rest', async () => {
+		await send({ ToPlayerId: '9620', Data: 'bare' }, await bearer('42'))
+		const message = (await inboxOf('9620'))[0]
+
+		// The client posts a bare array; the documented `{ MessageIds }` object works too.
+		expect((await del([message.Id], await bearer('9620'))).status).toBe(200)
+		expect(await inboxOf('9620')).toEqual([])
+
+		// An unknown id, an empty list and a missing body are all an empty 200 — the client
+		// removes its rows locally and re-reads the list either way.
+		for (const body of [{ MessageIds: [1787377235629] }, { MessageIds: [] }, {}, []]) {
+			const res = await del(body, await bearer('9620'))
 			expect(res.status).toBe(200)
 			expect(await res.text()).toBe('')
 		}
+	})
+
+	test('POST /api/messages/v3/delete is auth-gated', async () => {
+		expect((await del({ MessageIds: [1] })).status).toBe(401)
 	})
 })
 
@@ -6740,9 +6835,7 @@ describe('player events', () => {
 			upcoming.PlayerEventId,
 		])
 		// The same base projection the POST serves: one path, one shape.
-		expect(events.find((e) => e.PlayerEventId === upcoming.PlayerEventId)).toEqual(
-			asBase(upcoming)
-		)
+		expect(events.find((e) => e.PlayerEventId === upcoming.PlayerEventId)).toEqual(asBase(upcoming))
 
 		// No ids is an empty list, not every event.
 		expect(await (await get('/api/playerevents/v1/bulk')).json()).toEqual([])

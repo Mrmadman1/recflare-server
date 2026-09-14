@@ -236,7 +236,12 @@ export interface MessageReceivedPayload {
 	/** ISO-8601. */
 	SentTime: string
 	Type: number
-	Data: string
+	/**
+	 * Always a STRING on the wire — a payload with structure to it goes in escaped, never
+	 * as a nested object. Null on the message types that carry no data of their own (a
+	 * room-role invite, say), which the hub then drops from the frame entirely.
+	 */
+	Data: string | null
 	RoomId: number | null
 	PlayerEventId: number | null
 }

@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	Accessibility,
+	answerRoomRoleInvite,
 	applyRoomTagEdit,
 	areFriends,
 	autocompleteRoomSearch,
@@ -12,6 +13,7 @@ import {
 	cloneRoom,
 	cloneSubRoom,
 	countRoomsByCreator,
+	createNotification,
 	createSubRoom,
 	deleteRoom,
 	deleteRoomLeaderboard,
@@ -24,6 +26,7 @@ import {
 	getHotRooms,
 	getInteraction,
 	getOrCreateDormRoom,
+	getPlayerIdsInRoom,
 	getPresence,
 	getPublicRoomsByCreator,
 	getRecommendedRooms,
@@ -38,12 +41,17 @@ import {
 	getSubRoomSaves,
 	getTrendingRooms,
 	getVisitedRooms,
+	inviteRoomRole,
 	isPlayerBannedFromRoom,
+	isRoomOwner,
+	MessageType,
 	modifySubRoom,
 	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
+	Role,
 	roomNameRejection,
+	roomRoles,
 	saveSubRoomData,
 	searchRooms,
 	setRoomDescription,
@@ -88,6 +96,7 @@ import {
 	ImageRequest,
 	InteractionDto,
 	intQuery,
+	InviteRoleRequest,
 	IsBannedEnvelope,
 	IsBannedPascalEnvelope,
 	json,
@@ -118,6 +127,7 @@ import {
 	roomIdParam,
 	RoomLookup,
 	RoomResultEnvelope,
+	RoomRoleDto,
 	RoomSaveEnvelope,
 	saveIdParam,
 	SaveSubRoomDataRequest,
@@ -131,6 +141,7 @@ import {
 	SubRoomPermissionsRequest,
 	SubRoomSavesNoUnityAssetsPage,
 	SubRoomSavesPage,
+	SuccessEnvelope,
 	TagRequest,
 	TooManyLookupIds,
 	UNAUTHORIZED_EMPTY,
@@ -141,6 +152,7 @@ import {
 
 import type { Context } from 'hono'
 import type { RoomBan, RoomPermission } from '@repo/domain'
+import type { MessageReceivedPayload } from '../../notify/src/notification-payloads'
 import type { App } from './context'
 
 /**
@@ -496,6 +508,95 @@ async function pushRoomUpdate(
 	} catch (err) {
 		logger.error('failed to push RoomUpdate notification', {
 			playerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * Push a `RoomUpdate` to everyone standing in a room right now, plus anyone in `alsoNotify`.
+ *
+ * The fan-out for a change to the ROOM rather than to one player's relationship with it — a
+ * role changing alters what the room lets people do, and every client in it is rendering that
+ * room. Read from live presence across all of the room's instances, so it is whoever is
+ * actually there; a room nobody is in pushes to nobody.
+ *
+ * `alsoNotify` is for the player the change is ABOUT, who may not be standing in the room at
+ * all — a role granted to someone across the map still changes what they can do when they
+ * arrive. De-duplicated against the occupants, so being both doesn't earn two pushes.
+ *
+ * Each push is independent and failures are swallowed by {@link pushRoomUpdate}, so one
+ * unreachable player doesn't cost the rest theirs.
+ */
+async function pushRoomUpdateToRoom(
+	c: Context<App>,
+	roomId: number,
+	room: Record<string, unknown>,
+	alsoNotify: number[] = []
+): Promise<void> {
+	const playerIds = new Set(await getPlayerIdsInRoom(c.env.DB, roomId))
+	for (const playerId of alsoNotify) playerIds.add(playerId)
+	await Promise.all([...playerIds].map((playerId) => pushRoomUpdate(c, playerId, room)))
+}
+
+/**
+ * Store and deliver a room-role invite — a Message of type 62 (`RoomCoOwnerInvited`), which
+ * is what the invited player accepts or declines from. The `Roles` entry alone is silent:
+ * it records the offer, this delivers it.
+ *
+ * STORED first, then pushed from the stored record, so the frame carries the row's `Id` and
+ * the invite survives a failed or unheard push: the invited player reads it from
+ * `GET /api/messages/v2/get` on their next login instead of losing it to the hub's
+ * best-effort queue. The frame is typed as the hub's {@link MessageReceivedPayload} so a
+ * renamed key fails the build rather than vanishing on the wire.
+ *
+ * `Data` is the ROLE being offered, as a string (a Message's `Data` is always a string on
+ * the wire). It is what the invited player's client reads the offer off, and what it must
+ * send back as `role` when it accepts — the accept refuses anything that isn't the role
+ * standing on their entry, so an invite the client can't read the tier of is one it can't
+ * answer. `PlayerEventId` is null; the room is in `RoomId`. The hub drops null keys when it
+ * builds the frame, so it reaches the client absent rather than as null, which its decoder
+ * reads the same way.
+ *
+ * Best-effort on the PUSH only: the role entry and the message row have both committed, so
+ * a hub hiccup must not fail the request.
+ */
+async function pushRoleInvite(
+	c: Context<App>,
+	roomId: number,
+	fromAccountId: number,
+	toAccountId: number,
+	role: number
+): Promise<void> {
+	const stored = await createNotification(c.env.DB, {
+		FromPlayerId: fromAccountId,
+		ToPlayerId: toAccountId,
+		Type: MessageType.RoomCoOwnerInvited,
+		// The role being offered, as a string — a Message's `Data` is a string on the wire.
+		Data: String(role),
+		RoomId: roomId,
+	})
+
+	const message: MessageReceivedPayload = {
+		Id: stored.Id,
+		FromPlayerId: stored.FromPlayerId,
+		SentTime: stored.SentTime,
+		Type: stored.Type,
+		Data: stored.Data,
+		RoomId: stored.RoomId,
+		PlayerEventId: stored.PlayerEventId,
+	}
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			toAccountId,
+			NotificationType.MessageReceived,
+			{ ...message, ToPlayerId: stored.ToPlayerId }
+		)
+	} catch (err) {
+		logger.error('failed to push RoomCoOwnerInvited MessageReceived notification', {
+			messageId: stored.Id,
+			roomId,
+			toAccountId,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
@@ -1942,23 +2043,83 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Set a member's role in a room (`Roles[].Role`). Auth-gated (401) and gated to
-	// the room creator or a co-owner (403 otherwise) — the same owner/co-owner check
-	// the other room-admin actions use. Body is the `role` form field (an integer role
-	// tier). Updates the target account's existing role entry or adds one, notifies the
-	// affected member so their client refreshes permissions, and returns the updated
-	// room in the lowercase `{ success, error, value }` envelope.
+	// A room's role list — the same `Roles` the room DTO already carries, served on its own
+	// so the client can refresh the member list without re-reading the whole room. Public,
+	// like the room itself, and a BARE array rather than the room-write envelope. An unknown
+	// room is an empty list.
+	.get(
+		'/rooms/:roomId{[0-9]+}/roles',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'A room’s roles',
+			description: [
+				'Everyone with a role in the room — its creator plus whoever has been granted Host,',
+				'Moderator or CoOwner — as whole `RoomRole` records. This is the same array the',
+				'room DTO serves under `Roles`, on its own endpoint, so it is public exactly like the',
+				'room is: a role list says who runs a room, which the room page already shows.',
+				'',
+				'A bare array, NOT the `{ success, error, value }` envelope the role WRITE answers. An',
+				'unknown room is an empty list rather than an error — it reads the same as a room',
+				'nobody holds a role in.',
+			].join('\n'),
+			parameters: [roomIdParam],
+			responses: {
+				200: json(RoomRoleDto.array(), 'The room’s role assignments'),
+			},
+		}),
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			return c.json(room ? roomRoles(room) : [])
+		}
+	)
+
+	// Set a player's role in a room (`Roles[].Role`). ONE path, two callers:
+	//
+	//   - the room's owner/co-owner GRANTING a role to somebody else, which takes effect
+	//     immediately — the helper tiers are theirs to hand out;
+	//   - the invited player ANSWERING their own standing co-owner invite, accepting it by
+	//     naming the offered tier or declining with `role=0`.
+	//
+	// Which one it is comes from whether the path account IS the caller. CoOwner is the one
+	// tier a grant cannot reach: it has to be offered (`…/invite`) and accepted, so the
+	// second path exists at all. Creator is refused for the same reason — it is strictly
+	// more than the tier that needs an invite.
+	//
+	// Auth-gated (401), and a 403 for a valid token with no standing to do either. Everyone
+	// in the room gets a `RoomUpdate` push, plus the affected player wherever they are.
 	.put(
 		'/rooms/:roomId{[0-9]+}/roles/:accountId{[0-9]+}',
 		describeRoute({
 			tags: ['Room settings'],
-			summary: 'Set a member’s role in a room',
+			summary: 'Set a player’s role in a room',
 			description: [
-				'Updates the target account’s entry in the room’s `Roles` (or adds one). Gated to the',
-				'room’s creator or a co-owner — a valid token from anyone else is a 403. The affected',
-				'MEMBER gets the `RoomUpdate` push, not the caller, so their client refreshes the',
-				'permissions it just gained or lost.',
-			].join(' '),
+				'Two callers share this path, told apart by whether the `accountId` in it is the',
+				'caller’s own.',
+				'',
+				'**The room’s owner or a co-owner, granting a role to someone else.** Takes effect',
+				'immediately, updating the target’s entry in `Roles` or adding one. `Role` 30',
+				'(CoOwner) is refused: co-ownership is offered with `PUT …/roles/{accountId}/invite`',
+				'and accepted by the invited player, which is what the other half of this endpoint',
+				'is for. `Role` 255 (Creator) is refused too — it is strictly more than the tier',
+				'that needs an invite, so it cannot be the one grant that skips the ceremony.',
+				'Any pending invite on the entry is left standing.',
+				'',
+				'**The invited player, answering their own co-owner invite.** Accepting promotes',
+				'their entry from its pending `InvitedRole` to the real `Role` and clears the',
+				'pending one — an accepted entry reads `Role: 30, InvitedRole: 0`, so an invite',
+				'cannot be answered twice. The `role` body field must equal the `InvitedRole` the',
+				'owner offered: without that check the invited player could answer an invite to',
+				'Host by asking for Creator and award themselves the room. Declining is `role=0`',
+				'and drops the entry outright, leaving `Roles` as it was before the offer — note',
+				'that this takes any role they already held with it. No entry, no invite standing,',
+				'and the wrong role are all the same rejection, so probing tells the caller nothing.',
+				'',
+				'Everyone standing in the room right now gets the `RoomUpdate` push, and so does the',
+				'affected player wherever they are — a role change alters what the room lets people',
+				'do, and every client showing it re-renders from the room they are pushed. The',
+				'caller reads the same room out of the envelope.',
+			].join('\n'),
 			security: AUTHED,
 			parameters: [
 				roomIdParam,
@@ -1966,11 +2127,11 @@ const app = new Hono<App>()
 					name: 'accountId',
 					in: 'path',
 					required: true,
-					description: 'The member whose role changes',
+					description: 'The player whose role changes — the caller’s own id to answer an invite',
 					schema: { type: 'string', pattern: '^[0-9]+$' },
 				},
 			],
-			requestBody: form(RoleRequest, 'The role tier to grant'),
+			requestBody: form(RoleRequest, 'The role tier, or 0 to decline an invite'),
 			responses: {
 				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
@@ -1985,19 +2146,104 @@ const app = new Hono<App>()
 			const targetAccountId = Number.parseInt(c.req.param('accountId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
 			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-			// already returned 401 for a missing/invalid token).
-			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const role = typeof body.role === 'string' ? Number.parseInt(body.role, 10) : Number.NaN
 			if (Number.isNaN(role)) return roomEnvelope(c, null, 'You must provide a valid role!')
 
+			// Acting on your OWN entry is answering an invite — the only thing a player with
+			// no standing in the room may do here, and the only way a co-owner role is ever
+			// taken. An owner targeting themselves lands here too, and has no invite to answer.
+			if (targetAccountId === accountId) {
+				const answered = await answerRoomRoleInvite(c.env.DB, roomId, accountId, role, room)
+				if (!answered) return roomEnvelope(c, null, 'You have no such invite to this room!')
+				await pushRoomUpdateToRoom(c, roomId, answered)
+				return roomEnvelope(c, answered)
+			}
+
+			// Otherwise it is a grant, and the room's owner/co-owner gate applies.
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			// `role=0` is the invited player's decline, not an owner-side revoke — there is no
+			// revoke yet, and letting one in here would let a co-owner strip the other.
+			if (role === Role.None) return roomEnvelope(c, null, 'You must provide a valid role!')
+
+			// Null means the tier has to be ACCEPTED rather than handed over: nobody force-adds
+			// a co-owner. `setRoomRole` refuses it itself — the rule belongs to the room's
+			// `Roles`, not to this route — so there is no check here to forget to copy.
 			const updated = await setRoomRole(c.env.DB, roomId, targetAccountId, role, accountId, room)
-			// Notify the member whose role changed so their client refreshes the room
-			// (and the permissions it grants them).
-			await pushRoomUpdate(c, targetAccountId, updated)
+			if (!updated) return roomEnvelope(c, null, 'Co-ownership must be invited, not granted!')
+
+			await pushRoomUpdateToRoom(c, roomId, updated, [targetAccountId])
 			return roomEnvelope(c, updated)
+		}
+	)
+
+	// Invite a player to a room role (`Roles[].InvitedRole`). Auth-gated (401) and gated to
+	// the room's OWNER alone (403 otherwise) — narrower than the role WRITE above, which a
+	// co-owner may also use. Body is the `role` form field. Records the pending offer on the
+	// target's role entry (adding one at `Role` 0 when they have none), pushes the
+	// `RoomCoOwnerInvited` message that raises the invite on their client, and answers a
+	// bare `{ success: true }` — the inviter's client re-renders nothing from it.
+	.put(
+		'/rooms/:roomId{[0-9]+}/roles/:accountId{[0-9]+}/invite',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Invite a player to a room role',
+			description: [
+				'Sets `InvitedRole` on the target’s entry in the room’s `Roles` (adding an entry at',
+				'`Role` 0 when they have none) — the PENDING half of a role entry, held until they',
+				'accept, at which point the role proper is granted. Someone who already holds a role',
+				'keeps it while a higher one is pending.',
+				'',
+				'Gated to the room’s OWNER — its creator, or the holder of the Creator role. Narrower',
+				'than setting a role outright, which a co-owner may also do: otherwise a co-owner',
+				'could quietly grow the set of people who can change the room. A valid token from',
+				'anyone else is a 403.',
+				'',
+				'The INVITED player gets a durable `MessageReceived` frame carrying a Message of type',
+				'62 (`RoomCoOwnerInvited`), naming the inviter, the room, and the offered role as its',
+				'`Data` — that message, not the `Roles` entry, is what their client raises the invite',
+				'from, and the role in it is what they send back to accept.',
+				'',
+				'Answers a bare `{ success: true }`, NOT the `{ success, error, value }` room',
+				'envelope: nothing on the inviter’s screen re-renders from an invite.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				roomIdParam,
+				{
+					name: 'accountId',
+					in: 'path',
+					required: true,
+					description: 'The player being invited',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			requestBody: form(InviteRoleRequest, 'The role tier being offered'),
+			responses: {
+				200: json(SuccessEnvelope, 'The invite was recorded and pushed'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const targetAccountId = Number.parseInt(c.req.param('accountId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			// An unknown room and a room somebody else owns answer the same 403: the gate is
+			// the owner check, and there is no envelope here to carry a message in.
+			if (!room || !isRoomOwner(room, accountId)) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const role = typeof body.role === 'string' ? Number.parseInt(body.role, 10) : Number.NaN
+			if (Number.isNaN(role)) return c.body(null, 400)
+
+			await inviteRoomRole(c.env.DB, roomId, targetAccountId, role, accountId, room)
+			await pushRoleInvite(c, roomId, accountId, targetAccountId, role)
+			return c.json({ success: true })
 		}
 	)
 

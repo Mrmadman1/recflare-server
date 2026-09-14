@@ -6,6 +6,8 @@ import '../../rooms.app'
 import {
 	createRoomInstance,
 	getRoomInstance,
+	MessageType,
+	NOTIFICATION_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
@@ -99,6 +101,9 @@ beforeAll(async () => {
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (read by the photon access-token handler).
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Message store (owned by the api worker) — a room-role invite is written there before
+	// it is pushed, so the invited player can read it back from their inbox.
+	for (const stmt of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -1629,49 +1634,373 @@ describe('rooms endpoints', () => {
 		expect(interactions!.n).toBe(0)
 	})
 
-	it('PUT /rooms/:id/roles/:accountId is auth-gated, owner/co-owner-only, and persists', async () => {
-		const rolesOf = async (): Promise<Array<{ AccountId: number; Role: number }>> => {
-			const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
-				Roles?: Array<{ AccountId: number; Role: number }>
-			}
-			return room.Roles ?? []
+	it('PUT /rooms/:id/roles/:accountId grants a helper role outright, but never co-owner', async () => {
+		type Role = {
+			AccountId: number
+			Role: number
+			InvitedRole: number
+			LastChangedByAccountId: number | null
 		}
+		const roleOf = async (accountId: number): Promise<Role | undefined> =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]).find(
+				(r) => r.AccountId === accountId
+			)
+
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		// No token → 401; a valid token with no standing in the room → 403.
+		expect((await putForm('/rooms/2/roles/860', { role: '20' })).status).toBe(401)
+		expect((await putForm('/rooms/2/roles/860', { role: '20' }, '999')).status).toBe(403)
+
+		// The owner grants Moderator, which takes effect immediately — no invite, no accept.
+		const ok = await putForm('/rooms/2/roles/860', { role: '20' }, '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({ success: true, error: '' })
+		expect(await roleOf(860)).toMatchObject({
+			Role: 20,
+			InvitedRole: 0,
+			LastChangedByAccountId: 1,
+		})
+
+		// A co-owner may hand out the helper tiers too, updating the entry in place rather
+		// than adding a second.
+		expect((await putForm('/rooms/2/roles/860', { role: '10' }, '2')).status).toBe(200)
+		const roles = (await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]
+		expect(roles.filter((r) => r.AccountId === 860)).toHaveLength(1)
+		expect(await roleOf(860)).toMatchObject({ Role: 10, LastChangedByAccountId: 2 })
+
+		// The two tiers a grant may never reach — co-ownership has to be accepted, and
+		// Creator is more than co-ownership. Neither writes anything.
+		for (const role of ['30', '255']) {
+			expect(await envOf(await putForm('/rooms/2/roles/860', { role }, '1'))).toMatchObject({
+				success: false,
+				error: 'Co-ownership must be invited, not granted!',
+			})
+		}
+		// `role=0` is the invited player's decline, not an owner-side revoke.
+		expect(await envOf(await putForm('/rooms/2/roles/860', { role: '0' }, '1'))).toMatchObject({
+			success: false,
+		})
+		expect(await roleOf(860)).toMatchObject({ Role: 10 })
+
+		// A grant leaves a pending co-owner invite standing — the two are answered separately.
+		expect((await putForm('/rooms/2/roles/861/invite', { role: '30' }, '1')).status).toBe(200)
+		expect((await putForm('/rooms/2/roles/861', { role: '20' }, '1')).status).toBe(200)
+		expect(await roleOf(861)).toMatchObject({ Role: 20, InvitedRole: 30 })
+	})
+
+	it('a grant pushes a RoomUpdate to the room and to the affected player', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: { RoomId: number } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+		// One bystander in room 4, and the player being granted the role standing somewhere
+		// else entirely — a role they can use when they arrive, so they hear about it too.
+		await putInRoom(870, 4)
+		await putInRoom(871, 2)
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		expect((await putForm('/rooms/4/roles/871', { role: '20' }, '1')).status).toBe(200)
+
+		const pushed = await sent()
+		expect(pushed.map((n) => n.playerId).sort((a, b) => a - b)).toEqual([870, 871])
+		expect(
+			pushed.every((n) => n.notificationType === NotificationType.SubscriptionUpdateRoom)
+		).toBe(true)
+		expect(pushed.every((n) => n.data.RoomId === 4)).toBe(true)
+
+		for (const id of [870, 871]) await clearPresence(id)
+	})
+
+	it('PUT /rooms/:id/roles/:accountId accepts a standing invite, and only that one', async () => {
+		type Role = {
+			AccountId: number
+			Role: number
+			InvitedRole: number
+			LastChangedByAccountId: number | null
+		}
+		const roleOf = async (accountId: number): Promise<Role | undefined> =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]).find(
+				(r) => r.AccountId === accountId
+			)
+
+		// RecCenter (room 2) is owned by account 1. The owner invites 850 to co-ownership,
+		// leaving a pending offer and no role yet.
+		expect((await putForm('/rooms/2/roles/850/invite', { role: '30' }, '1')).status).toBe(200)
+		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 
 		// No token → 401 (auth gate).
-		expect((await putForm('/rooms/2/roles/5', { role: '20' })).status).toBe(401)
-		// A valid token but no role on the room (RecCenter is owned by account 1, with
-		// account 2 as co-owner) → 403.
-		expect((await putForm('/rooms/2/roles/5', { role: '20' }, '999')).status).toBe(403)
+		expect((await putForm('/rooms/2/roles/850', { role: '30' })).status).toBe(401)
+		// Nobody can accept on 850's behalf. A stranger has no standing here at all (403);
+		// the owner and the co-owner fall through to the GRANT path, where co-ownership is
+		// exactly the tier they may not hand over.
+		expect((await putForm('/rooms/2/roles/850', { role: '30' }, '999')).status).toBe(403)
+		for (const caller of ['1', '2']) {
+			expect(
+				await envOf(await putForm('/rooms/2/roles/850', { role: '30' }, caller))
+			).toMatchObject({ success: false, error: 'Co-ownership must be invited, not granted!' })
+		}
+		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 		// Unknown room → failure envelope.
-		expect(await envOf(await putForm('/rooms/99999/roles/5', { role: '20' }, '1'))).toMatchObject({
-			success: false,
-			error: 'This room does not exist!',
-		})
+		expect(
+			await envOf(await putForm('/rooms/99999/roles/850', { role: '30' }, '850'))
+		).toMatchObject({ success: false, error: 'This room does not exist!' })
 		// Non-numeric role → failure envelope.
-		expect(await envOf(await putForm('/rooms/2/roles/5', { role: 'nope' }, '1'))).toMatchObject({
+		expect(await envOf(await putForm('/rooms/2/roles/850', { role: 'nope' }, '850'))).toMatchObject(
+			{
+				success: false,
+			}
+		)
+
+		// Asking for a HIGHER role than the one offered is the attack this guards against:
+		// refused, and the entry is untouched — still no role, invite still standing.
+		expect(await envOf(await putForm('/rooms/2/roles/850', { role: '255' }, '850'))).toMatchObject({
 			success: false,
 		})
+		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 
-		// Owner sets account 5's role to 20, adding a new Roles entry that persists. The
-		// success envelope carries the updated room as `value`.
-		const ok = await putForm('/rooms/2/roles/5', { role: '20' }, '1')
+		// A player with no entry in the room at all is the same rejection — probing tells
+		// them nothing.
+		expect(await envOf(await putForm('/rooms/2/roles/833', { role: '30' }, '833'))).toMatchObject({
+			success: false,
+		})
+		expect(await roleOf(833)).toBeUndefined()
+
+		// Accepting the role actually offered promotes the entry and consumes the invite.
+		const ok = await putForm('/rooms/2/roles/850', { role: '30' }, '850')
 		expect(ok.status).toBe(200)
 		const okBody = await envOf(ok)
 		expect(okBody).toMatchObject({ success: true, error: '' })
-		expect(okBody.value?.Roles as Array<{ AccountId: number; Role: number }>).toContainEqual(
-			expect.objectContaining({ AccountId: 5, Role: 20 })
+		expect(okBody.value?.Roles as Role[]).toContainEqual(
+			expect.objectContaining({ AccountId: 850, Role: 30, InvitedRole: 0 })
 		)
-		expect(await rolesOf()).toContainEqual(expect.objectContaining({ AccountId: 5, Role: 20 }))
+		expect(await roleOf(850)).toMatchObject({
+			Role: 30,
+			InvitedRole: 0,
+			// Left as the OWNER who offered the role, not restamped with the accepter.
+			LastChangedByAccountId: 1,
+		})
 
-		// The co-owner (account 2, Role 30) may also change it — updating the existing
-		// entry in place rather than adding a duplicate.
-		const byCoOwner = await putForm('/rooms/2/roles/5', { role: '10' }, '2')
-		expect(byCoOwner.status).toBe(200)
-		const roles = await rolesOf()
-		expect(roles.filter((r) => r.AccountId === 5)).toHaveLength(1)
-		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 5, Role: 10 }))
-		// The seeded co-owner (account 2) is left intact.
-		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 2, Role: 30 }))
+		// The invite is spent: the same call again is refused, so it can't be replayed.
+		expect(await envOf(await putForm('/rooms/2/roles/850', { role: '30' }, '850'))).toMatchObject({
+			success: false,
+		})
+		expect(await roleOf(850)).toMatchObject({ Role: 30, InvitedRole: 0 })
+	})
+
+	it('PUT /rooms/:id/roles/:accountId with role=0 declines, dropping the entry', async () => {
+		type Role = { AccountId: number; Role: number; InvitedRole: number }
+		const roleOf = async (accountId: number): Promise<Role | undefined> =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]).find(
+				(r) => r.AccountId === accountId
+			)
+
+		// Declining with nothing standing is the same rejection as any other unanswerable
+		// invite — it can't be used to drop a role nobody offered to change.
+		expect(await envOf(await putForm('/rooms/2/roles/851', { role: '0' }, '851'))).toMatchObject({
+			success: false,
+		})
+
+		// Invited, then declined: the whole entry goes, leaving `Roles` as it was before the
+		// offer rather than an entry with nothing pending on it.
+		expect((await putForm('/rooms/2/roles/851/invite', { role: '30' }, '1')).status).toBe(200)
+		expect(await roleOf(851)).toMatchObject({ Role: 0, InvitedRole: 30 })
+
+		const declined = await putForm('/rooms/2/roles/851', { role: '0' }, '851')
+		expect(declined.status).toBe(200)
+		expect(await envOf(declined)).toMatchObject({ success: true, error: '' })
+		expect(await roleOf(851)).toBeUndefined()
+
+		// And the decline can't be replayed either — there is no entry left to answer.
+		expect(await envOf(await putForm('/rooms/2/roles/851', { role: '0' }, '851'))).toMatchObject({
+			success: false,
+		})
+
+		// Declining takes a role the player ALREADY held with it: the invite is answered as a
+		// whole, so a re-invited member who declines is left with nothing.
+		expect((await putForm('/rooms/2/roles/852/invite', { role: '10' }, '1')).status).toBe(200)
+		expect((await putForm('/rooms/2/roles/852', { role: '10' }, '852')).status).toBe(200)
+		expect(await roleOf(852)).toMatchObject({ Role: 10, InvitedRole: 0 })
+		expect((await putForm('/rooms/2/roles/852/invite', { role: '30' }, '1')).status).toBe(200)
+		expect((await putForm('/rooms/2/roles/852', { role: '0' }, '852')).status).toBe(200)
+		expect(await roleOf(852)).toBeUndefined()
+	})
+
+	it('accepting an invite pushes a RoomUpdate to everyone in the room', async () => {
+		type Sent = {
+			playerId: number
+			notificationType: string | number
+			data: { RoomId: number; Roles: Array<{ AccountId: number; Role: number }> }
+		}
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+		// Room 3's owner invites 840, who is standing in the room with two others. A fourth
+		// player is in a DIFFERENT room, and a fifth's presence has lapsed — neither is there.
+		expect((await putForm('/rooms/3/roles/840/invite', { role: '20' }, '1')).status).toBe(200)
+		await putInRoom(840, 3)
+		await putInRoom(841, 3)
+		await putInRoom(842, 2)
+		await putInRoom(843, 3, { expired: true })
+
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect((await putForm('/rooms/3/roles/840', { role: '20' }, '840')).status).toBe(200)
+
+		// A role change alters what the room lets people do, so everyone standing in it
+		// re-renders — including the accepter, who is one of them.
+		const pushed = await sent()
+		expect(pushed.map((n) => n.playerId).sort((a, b) => a - b)).toEqual([840, 841])
+		expect(
+			pushed.every((n) => n.notificationType === NotificationType.SubscriptionUpdateRoom)
+		).toBe(true)
+		// Each carries the room as it now stands, with the accepted role on it.
+		expect(pushed[0].data).toMatchObject({ RoomId: 3 })
+		expect(pushed[0].data.Roles).toContainEqual(
+			expect.objectContaining({ AccountId: 840, Role: 20, InvitedRole: 0 })
+		)
+
+		for (const id of [840, 841, 842, 843]) await clearPresence(id)
+	})
+
+	it('GET /rooms/:id/roles serves the room’s roles as a bare array', async () => {
+		// RecCenter (room 2) is seeded with its creator (255) and a co-owner (30). Public,
+		// like the room itself — no token.
+		const res = await SELF.fetch(`${ORIGIN}/rooms/2/roles`)
+		expect(res.status).toBe(200)
+		// Containment, not equality: the role-write test above grants account 5 a role on
+		// this same room, and the two tests share a database.
+		expect(await res.json()).toEqual(
+			expect.arrayContaining([
+				{ AccountId: 1, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+				{ AccountId: 2, Role: 30, LastChangedByAccountId: null, InvitedRole: 0 },
+			])
+		)
+
+		// An unknown room reads the same as a room nobody holds a role in.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/99999/roles`)).status).toBe(200)
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/99999/roles`)).json()).toEqual([])
+
+		// A role written without `LastChangedByAccountId`/`InvitedRole` (the older rooms) is
+		// still served as a whole record — the client's parser wants every key.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					RoomId: 30601,
+					Name: 'PartialRoles',
+					CreatorAccountId: 830,
+					SubRooms: [],
+					Roles: [{ AccountId: 830, Role: 255 }],
+				})
+			)
+			.run()
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/30601/roles`)).json()).toEqual([
+			{ AccountId: 830, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+		])
+
+		// A room with no `Roles` key at all is an empty list, not a failure.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(JSON.stringify({ RoomId: 30602, Name: 'NoRoles', CreatorAccountId: 830, SubRooms: [] }))
+			.run()
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/30602/roles`)).json()).toEqual([])
+	})
+
+	it('PUT /rooms/:id/roles/:accountId/invite records the offer and pushes the invite', async () => {
+		type Sent = {
+			playerId: number
+			notificationType: string | number
+			data: Record<string, unknown>
+		}
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+		const rolesOf = async (roomId: number) =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/${roomId}/roles`)).json()) as Array<{
+				AccountId: number
+				Role: number
+				InvitedRole: number
+				LastChangedByAccountId: number | null
+			}>
+
+		// No token → 401 (auth gate).
+		expect((await putForm('/rooms/2/roles/187/invite', { role: '30' })).status).toBe(401)
+		// A valid token with no standing on the room → 403...
+		expect((await putForm('/rooms/2/roles/187/invite', { role: '30' }, '999')).status).toBe(403)
+		// ...and so does the CO-OWNER (account 2, Role 30), who may set roles outright but
+		// may not hand out co-ownership. This is the gate that is narrower than the write.
+		expect((await putForm('/rooms/2/roles/187/invite', { role: '30' }, '2')).status).toBe(403)
+		// An unknown room answers the same 403 rather than leaking that it doesn't exist.
+		expect((await putForm('/rooms/99999/roles/187/invite', { role: '30' }, '1')).status).toBe(403)
+		// A non-numeric role is a bad request — there is no envelope here to carry a message.
+		expect((await putForm('/rooms/2/roles/187/invite', { role: 'nope' }, '1')).status).toBe(400)
+		// None of the refusals wrote a role entry.
+		expect((await rolesOf(2)).find((r) => r.AccountId === 187)).toBeUndefined()
+
+		// The owner invites 187 to co-ownership.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const res = await putForm('/rooms/2/roles/187/invite', { role: '30' }, '1')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true })
+
+		// A new entry, holding no role yet — only the pending offer, stamped with the inviter.
+		expect(await rolesOf(2)).toContainEqual({
+			AccountId: 187,
+			Role: 0,
+			InvitedRole: 30,
+			LastChangedByAccountId: 1,
+		})
+
+		// One MessageReceived to the INVITED player carrying a type 62 RoomCoOwnerInvited —
+		// the entry alone is silent, this is what raises the invite on their client.
+		const pushed = await sent()
+		expect(pushed).toHaveLength(1)
+		expect(pushed[0].playerId).toBe(187)
+		expect(pushed[0].notificationType).toBe(NotificationType.MessageReceived)
+		expect(pushed[0].data).toMatchObject({
+			FromPlayerId: 1,
+			Type: MessageType.RoomCoOwnerInvited,
+			// The offered role, as a string — what the client reads the tier off, and sends
+			// back as `role` to accept.
+			Data: '30',
+			RoomId: 2,
+			PlayerEventId: null,
+		})
+		// The invite is STORED before it is pushed, and the frame carries the row's id and
+		// timestamp — so the invited player reads the same invite from their inbox
+		// (`GET /api/messages/v2/get`) even if the push never reached them.
+		const row = await env.DB.prepare(
+			'SELECT notification_id, from_player_id, type, data, room_id, sent_time FROM notification WHERE to_player_id = 187'
+		).first<{
+			notification_id: number
+			from_player_id: number
+			type: number
+			data: string | null
+			room_id: number
+			sent_time: string
+		}>()
+		expect(row).toMatchObject({
+			from_player_id: 1,
+			type: MessageType.RoomCoOwnerInvited,
+			data: '30',
+			room_id: 2,
+		})
+		expect(pushed[0].data.Id).toBe(row!.notification_id)
+		expect(pushed[0].data.SentTime).toBe(row!.sent_time)
+		expect(Date.parse(row!.sent_time)).not.toBeNaN()
+
+		// Re-inviting someone who already has an entry sets the pending role in place rather
+		// than adding a second entry — and leaves the role they already hold alone. 187
+		// accepts the invite above first, so they hold a real role to be re-invited over.
+		expect((await putForm('/rooms/2/roles/187', { role: '30' }, '187')).status).toBe(200)
+		await putForm('/rooms/2/roles/187/invite', { role: '20' }, '1')
+		const after = await rolesOf(2)
+		expect(after.filter((r) => r.AccountId === 187)).toHaveLength(1)
+		expect(after).toContainEqual({
+			AccountId: 187,
+			Role: 30,
+			InvitedRole: 20,
+			LastChangedByAccountId: 1,
+		})
 	})
 
 	it('POST /rooms/:id/bans is gated to the room’s owners or staff, and persists', async () => {
@@ -4100,6 +4429,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/experience/player',
 			'GET /rooms/{roomId}/interactionby/me',
 			'GET /rooms/{roomId}/playerdata/me',
+			'GET /rooms/{roomId}/roles',
 			'GET /rooms/{roomId}/similar',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves/no_unity_assets',
@@ -4124,6 +4454,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/name',
 			'PUT /rooms/{roomId}/restrictions',
 			'PUT /rooms/{roomId}/roles/{accountId}',
+			'PUT /rooms/{roomId}/roles/{accountId}/invite',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/accessibility',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/modify',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions',

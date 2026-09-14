@@ -203,8 +203,13 @@ export enum MatchmakingErrorCode {
  * and Creator are the owner-level tiers that may manage the room (see
  * {@link canManageRoom}). Creator is the room's owner (its `CreatorAccountId`) —
  * the max byte.
+ *
+ * `None` is a real value on the wire, not a placeholder: it is the `Role` on an entry that
+ * holds only a pending `InvitedRole` (invited, nothing granted yet), the `InvitedRole` on an
+ * entry with nothing pending, and what the invited player posts back to DECLINE an invite.
  */
 export enum Role {
+	None = 0,
 	Host = 10,
 	Moderator = 20,
 	CoOwner = 30,

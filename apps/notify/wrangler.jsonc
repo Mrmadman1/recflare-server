@@ -8,6 +8,21 @@
 		"bindings": [{ "name": "RECFLARE_NOTIFICATIONS_HUB", "class_name": "NotificationsHub" }]
 	},
 	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["NotificationsHub"] }],
+	// The shared `recflare` D1 database, for the message store behind
+	// `GET /api/messages/v2/get`: a coach message to ONE player is a durable message and is
+	// written here before it is pushed. No `migrations_dir` — the `api` worker owns this
+	// schema (apps/api/migrations/0019_message.sql); notify only writes rows.
+	//
+	// The coach BROADCAST is deliberately not stored: it reaches everyone online at once, so
+	// persisting it would write a row per player — thousands per maintenance notice, for
+	// something nobody needs to re-read.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "recflare",
+			"database_id": "local"
+		}
+	],
 	// Shared Secrets Store holding the HS256 JWT signing key. Every worker binds the
 	// same store as JWT_SECRET so tokens signed by `auth` verify here. The "local"
 	// store_id placeholder is replaced with RECFLARE_SECRETS_STORE at deploy time.

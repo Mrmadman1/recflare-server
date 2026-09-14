@@ -1,10 +1,16 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
+import { createNotification } from '@repo/domain'
 import { logger, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
-import { NotificationsHub, OWNER_HEADER } from './notifications-hub'
+import {
+	COACH_MESSAGE_TYPE,
+	COACH_PLAYER_ID,
+	NotificationsHub,
+	OWNER_HEADER,
+} from './notifications-hub'
 
 import type { Context, MiddlewareHandler } from 'hono'
 import type { App } from './context'
@@ -228,9 +234,13 @@ const app = new Hono<App>()
 		return c.json({ success: true, ...result })
 	})
 
-	// The targeted form of the broadcast above: one coach message to ONE player. Queued
-	// by the hub when they're offline (unlike coach-message-all, which reaches only
-	// whoever is connected), so this arrives either way.
+	// The targeted form of the broadcast above: one coach message to ONE player.
+	//
+	// Unlike the broadcast, this one is a real message: it is STORED first, so the player
+	// reads it from `GET /api/messages/v2/get` whether or not the hub reached them, and the
+	// frame carries the stored row's id. The broadcast stays unstored — it reaches everyone
+	// online at once, so a row per player would be thousands of writes per maintenance
+	// notice, for something nobody needs to re-read.
 	.post('/internal/coach-message', async (c) => {
 		const body = await c.req
 			.json<{ playerId?: number; messageContent?: string }>()
@@ -240,9 +250,15 @@ const app = new Hono<App>()
 			return c.json({ error: 'playerId is required' }, 400)
 		}
 		if (content === '') return c.json({ error: 'messageContent is required' }, 400)
-		const { playerId } = body
-		const result = await hubCall(c, (hub) => hub.coachMessage(playerId, content))
-		return c.json({ success: true, ...result })
+
+		const notification = await createNotification(c.env.DB, {
+			FromPlayerId: COACH_PLAYER_ID,
+			ToPlayerId: body.playerId,
+			Type: COACH_MESSAGE_TYPE,
+			Data: content,
+		})
+		const result = await hubCall(c, (hub) => hub.coachMessage(notification))
+		return c.json({ success: true, notificationId: notification.Id, ...result })
 	})
 
 	// Read-only view of the hub's routing state, for working out why a notification

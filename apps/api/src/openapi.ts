@@ -235,6 +235,23 @@ export const DeleteMessagesRequest = z.object({
 })
 
 /**
+ * One stored message, as `GET /api/messages/v2/get` serves it — the client's Message model,
+ * which is also what the `MessageReceived` frame carries (see the `notify` worker's
+ * `MessageReceivedPayload`). Same shape in the inbox and on the wire, deliberately: they are
+ * one message, and `Id` is the same id in both so the client can match them up.
+ */
+export const MessageDto = z.object({
+	Id: z.int().describe('The message’s id — also the `Id` on the frame that delivered it'),
+	FromPlayerId: z.int(),
+	ToPlayerId: z.int(),
+	SentTime: z.string().describe('ISO-8601 UTC'),
+	Type: z.int().describe('The Message-model type (a different enum from `NotificationType`)'),
+	Data: z.string().nullable().describe('Null on the types carrying no payload of their own'),
+	RoomId: z.int().nullable(),
+	PlayerEventId: z.int().nullable(),
+})
+
+/**
  * `POST /api/messages/v1/friendOnlineStatus` — how many of the caller's friends are
  * online, wrapped in the client's `{ success, value }` envelope.
  */

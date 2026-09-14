@@ -401,6 +401,15 @@ export const MissingLookupParam = z
 	.describe("`\"Either 'id' or 'name' query parameter is required\"`")
 
 /**
+ * A bare `{ success: true }` — the acknowledgement a write answers with when the client
+ * has nothing to re-render from it. NOT the `{ success, error, value }` room envelope: no
+ * `error` key and no `value`, so don't reach for this where the client redraws the room.
+ */
+export const SuccessEnvelope = z.object({
+	success: z.literal(true),
+})
+
+/**
  * `GET /Room_server/rooms/{roomId}/bans/{playerId}/isBanned` — the ban check's envelope.
  *
  * NOT the `{ success, error, value }` the room mutations answer with: this one carries an
@@ -571,9 +580,20 @@ export const ImageRequest = z.object({
 	imageName: z.string().describe('A key from the storage upload, stored un-prefixed'),
 })
 
-/** `PUT /rooms/{roomId}/roles/{accountId}`. */
+/** `PUT /rooms/{roomId}/roles/{accountId}` — a grant, or the invited player's answer. */
 export const RoleRequest = z.object({
-	role: z.string().describe('The role tier: 10 Host, 20 Moderator, 30 CoOwner, 255 Creator'),
+	role: z
+		.string()
+		.describe(
+			'The role tier: 10 Host, 20 Moderator. 30 CoOwner and 255 Creator are refused on a ' +
+				'grant — co-ownership is invited. Answering your own invite, it must equal the ' +
+				'standing `InvitedRole`, or be `0` to decline'
+		),
+})
+
+/** `PUT /rooms/{roomId}/roles/{accountId}/invite`. */
+export const InviteRoleRequest = z.object({
+	role: z.string().describe('The role tier offered: 10 Host, 20 Moderator, 30 CoOwner'),
 })
 
 /** `POST /rooms/{roomId}/bans` — the player to ban from the room. */

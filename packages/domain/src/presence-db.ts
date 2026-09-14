@@ -205,6 +205,33 @@ export async function getPlayerIdsInInstance(
 }
 
 /**
+ * Everyone standing in a ROOM right now, across all of its instances — the fan-out set for
+ * something that changes the room itself rather than one session of it, such as a role
+ * being accepted: every client in the room re-renders it, whichever instance they are in.
+ *
+ * The room-wide counterpart to {@link getPlayerIdsInInstance}, which is the narrower set
+ * for something that happens in front of one session (a cheer). Reads only unexpired
+ * presence, so it is LIVE occupancy — a player who crashed out drops off it when their row
+ * lapses — and excludes lobby (null-instance) presence. Ordered by account id, and DISTINCT:
+ * a stale row in another instance of the same room must not earn a second push.
+ */
+export async function getPlayerIdsInRoom(
+	db: D1Database,
+	roomId: number,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT account_id AS accountId FROM presence
+			 WHERE room_id = ?1 AND expires_at > ?2 AND room_instance_id IS NOT NULL
+			 ORDER BY account_id`
+		)
+		.bind(roomId, now)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
  * How many players are online right now, anywhere — one row per account, so this is
  * the player count a status page means. Counts unexpired presence only: rows outlive
  * the player by up to the TTL until the sweep purges them, and reads elsewhere ignore

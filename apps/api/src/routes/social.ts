@@ -5,8 +5,11 @@ import {
 	acceptFriendRequest,
 	addFriend,
 	countOnlineFriends,
+	createNotification,
+	deleteNotifications,
 	getAccountsByIds,
 	getMutualFriendIds,
+	getNotificationsForPlayer,
 	getRelationshipsForPlayer,
 	MUTUAL_FRIENDS_LIMIT,
 	removeFriend,
@@ -30,6 +33,7 @@ import {
 	json,
 	JsonArray,
 	jsonBody,
+	MessageDto,
 	MutualFriendDto,
 	RelationshipDto,
 	SendMessageRequest,
@@ -43,6 +47,7 @@ import type {
 	RelationshipChange,
 	RelationshipFlag,
 	RelationshipResponse,
+	StoredNotification,
 } from '@repo/domain'
 import type { App } from '../context'
 
@@ -50,31 +55,26 @@ import type { App } from '../context'
 const HUB_INSTANCE = 'global'
 
 /**
- * The Message a `MessageReceived` frame carries. A type alias rather than an interface:
- * `notifyPlayer` takes an index-signature record, which only aliases satisfy implicitly.
+ * Push the `MessageReceived` frame for an ALREADY-STORED message, resolving false when the
+ * hub could not be reached.
+ *
+ * Takes the stored record rather than building one, so the frame carries the row's `Id` and
+ * `SentTime` — the client matches the message it is pushed to the one it later reads from
+ * `GET /api/messages/v2/get` by that id, and the delete endpoint has an id to match.
+ * Spread into a plain record because `notifyPlayer` takes an index-signature type, which an
+ * interface doesn't satisfy implicitly.
  */
-type Message = {
-	FromPlayerId: number
-	ToPlayerId: number
-	Type: number
-	Data: string
-}
-
-/**
- * Push one `MessageReceived` frame, resolving false when the hub could not be reached.
- * Unlike the relationship pushes, a failure here is NOT swallowed by the caller: there
- * is no message store behind this, so the notification is the whole delivery.
- */
-async function pushMessage(c: Context<App>, message: Message): Promise<boolean> {
+async function pushMessage(c: Context<App>, message: StoredNotification): Promise<boolean> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			message.ToPlayerId,
 			NotificationType.MessageReceived,
-			message
+			{ ...message }
 		)
 		return true
 	} catch (err) {
 		logger.error('failed to push MessageReceived notification', {
+			notificationId: message.Id,
 			toPlayerId: message.ToPlayerId,
 			error: err instanceof Error ? err.message : String(err),
 		})
@@ -296,8 +296,8 @@ export const socialRoutes = new Hono<App>({ strict: false })
 	)
 
 	// A message from one player to another — the "invite me!" style prompts the client
-	// sends. Nothing is stored: the message IS the notification, pushed to the
-	// recipient's hub connection (and queued by the hub if they're offline).
+	// sends. STORED as a notification, then pushed to the recipient's hub connection from
+	// the stored record, so it survives a push they never hear.
 	.post(
 		'/api/messages/v2/send',
 		describeRoute({
@@ -309,15 +309,16 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				'`coachMessageAll`), except `FromPlayerId` is the caller rather than the Coach ' +
 				'account and it goes to one player. The hub queues it when the recipient is ' +
 				'offline, so it arrives on their next connect.\n\n' +
-				'Nothing is persisted here — there is no message store, the notification is the ' +
-				'whole delivery. The sender is the caller (from the bearer token), NOT a body ' +
-				'field. `Type` is a Message-model type (a different enum from `NotificationType`) ' +
-				'passed through unmapped, defaulting to 0; `Data` is the payload and is commonly ' +
-				'empty.\n\n' +
+				'Persisted first, then pushed from the stored record, so the frame carries the ' +
+				'stored id and the recipient reads the same message back from ' +
+				'`GET /api/messages/v2/get` whether or not the push reached them. The sender is ' +
+				'the caller (from the bearer token), NOT a body field. `Type` is a Message-model ' +
+				'type (a different enum from `NotificationType`) passed through unmapped, ' +
+				'defaulting to 0; `Data` is the payload and is commonly empty.\n\n' +
 				'Answers the same `{ success, error }` envelope as the report / warning writes, ' +
-				'`error` an empty string on success. A hub failure is reported honestly as a 500 ' +
-				'with `success: false` — with no store behind it, a swallowed error would be a ' +
-				'silently dropped message.',
+				'`error` an empty string on success. A hub failure is still reported honestly as ' +
+				'a 500 with `success: false` — the message is in their inbox, but the caller ' +
+				'asked to send one and nothing was delivered.',
 			security: AUTHED,
 			requestBody: form(SendMessageRequest, 'The message'),
 			responses: {
@@ -338,15 +339,20 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				return c.json({ success: false, error: 'ToPlayerId is required' }, 400)
 			}
 
-			// The Message the notification carries. Mirrors the coach message's shape with
-			// a real sender and recipient; `Data` stays a string, empty included (the hub
-			// drops only null/undefined from the frame).
-			const delivered = await pushMessage(c, {
+			// Stored FIRST, then pushed from the stored record: the row is the durable copy
+			// and its id is what goes on the frame. A hub failure after this point leaves
+			// the message in the recipient's inbox, which is the point of the store — they
+			// read it on next login instead of losing it.
+			const message = await createNotification(c.env.DB, {
 				FromPlayerId: fromPlayerId,
 				ToPlayerId: toPlayerId,
 				Type: Number.parseInt(str(body.Type) ?? '', 10) || 0,
+				// `Data` stays a string, empty included — distinct from the null the types
+				// carrying no payload of their own send.
 				Data: str(body.Data) ?? '',
 			})
+
+			const delivered = await pushMessage(c, message)
 			if (!delivered) {
 				return c.json({ success: false, error: 'Failed to deliver message' }, 500)
 			}
@@ -367,15 +373,16 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				'The bulk form of `POST /api/messages/v2/send`: pushes the same ' +
 				'`MessageReceived` frame to every id in `ToPlayerIds`, each addressed to its own ' +
 				'recipient (`ToPlayerId` differs per frame — the payload is not shared). Same ' +
-				'sender rule: the caller’s bearer token, never a body field. Same non-store: the ' +
-				'notification is the whole delivery, queued by the hub for whoever is offline.\n\n' +
+				'sender rule: the caller’s bearer token, never a body field. Stored the same way ' +
+				'too — one notification per recipient, each with its own id.\n\n' +
 				'The body is JSON rather than the single send’s form encoding, so `Type` is a ' +
 				'number (still an unmapped Message-model type, defaulting to 0) and `Data` a ' +
 				'string, commonly empty. Repeated ids are delivered once.\n\n' +
 				'Answers the same `{ success, error }` envelope. Delivery is attempted for every ' +
 				'recipient even after one fails, but a hub failure for ANY of them is reported ' +
-				'honestly as a 500 — the envelope has no room to say which, and with no store ' +
-				'behind it a swallowed error would be a silently dropped message.',
+				'honestly as a 500 — the envelope has no room to say which. Each recipient gets ' +
+				'a stored notification of their own, with its own id, so an undelivered one is ' +
+				'still waiting in that player’s inbox.',
 			security: AUTHED,
 			requestBody: jsonBody(SendMultipleMessagesRequest, 'The message and its recipients'),
 			responses: {
@@ -410,15 +417,19 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			const data = typeof body.Data === 'string' ? body.Data : ''
 
 			// Every recipient is attempted even if an earlier one fails — the reachable
-			// players get their message either way.
+			// players get their message either way. One STORED message each, so every
+			// recipient's copy has its own id to be read and deleted by.
 			const results = await Promise.all(
-				toPlayerIds.map((toPlayerId) =>
-					pushMessage(c, {
-						FromPlayerId: fromPlayerId,
-						ToPlayerId: toPlayerId,
-						Type: type,
-						Data: data,
-					})
+				toPlayerIds.map(async (toPlayerId) =>
+					pushMessage(
+						c,
+						await createNotification(c.env.DB, {
+							FromPlayerId: fromPlayerId,
+							ToPlayerId: toPlayerId,
+							Type: type,
+							Data: data,
+						})
+					)
 				)
 			)
 			if (results.includes(false)) {
@@ -620,10 +631,30 @@ export const socialRoutes = new Hono<App>({ strict: false })
 		describeRoute({
 			tags: ['Social'],
 			summary: 'Direct messages',
-			description: 'There is no message store yet, so this is always an empty list.',
-			responses: { 200: json(JsonArray, 'An empty list') },
+			description:
+				'The caller’s inbox — everything sent to them that they haven’t deleted, newest ' +
+				'first. The client reads this on login, which is what makes it the DURABLE half of ' +
+				'a message: the `MessageReceived` frame the hub pushes is best-effort (dropped ' +
+				'once sent rather than acked, bounded per player, and skipped whenever the hub ' +
+				'believes it delivered), so a message that only ever existed as a frame could be ' +
+				'lost with nothing left to show for it.\n\n' +
+				'Each entry is the same Message the frame carries, `Id` included and equal — one ' +
+				'message, delivered twice, which is how the client recognises the two as the ' +
+				'same.\n\n' +
+				'Auth-gated, unlike the empty list this used to answer: an inbox is the caller’s ' +
+				'own. Capped at the newest `MAX_NOTIFICATIONS_PER_PLAYER`, which is also what the store ' +
+				'keeps — the client shows an inbox, not an archive.',
+			security: AUTHED,
+			responses: {
+				200: json(MessageDto.array(), 'The caller’s messages, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
 		}),
-		(c) => c.json([])
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json(await getNotificationsForPlayer(c.env.DB, id))
+		}
 	)
 	// The inbox's delete button. A POST rather than a DELETE because the ids arrive as
 	// a JSON array body — the client batches a multi-select into one call, and its HTTP
@@ -634,18 +665,43 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			tags: ['Social'],
 			summary: 'Delete messages',
 			description:
-				'Drops the given messages from the caller’s inbox. Nothing happens: there is no ' +
-				'message store behind `GET /api/messages/v2/get` (the `MessageReceived` ' +
-				'notification is the whole delivery — see `POST /api/messages/v2/send`), so ' +
-				'there are no ids to match and nothing to remove.\n\n' +
-				'Accepted unconditionally and answered 200 with an empty body, which is what the ' +
-				'client wants: it removes the rows locally and re-reads the empty list either ' +
-				'way. Not auth-gated, for the same reason `GET /api/messages/v2/get` isn’t — ' +
-				'the call reaches no state to protect.',
+				'Drops the given messages from the caller’s inbox — the ids being the `Id` on ' +
+				'each message `GET /api/messages/v2/get` served.\n\n' +
+				'Scoped to the CALLER’s inbox, not just to the ids: an id names a message ' +
+				'globally, so matching on id alone would let anyone holding one clear somebody ' +
+				'else’s inbox. An id that isn’t theirs, or is already gone, matches nothing — ' +
+				'not an error, since the client removes its rows locally and re-reads the list ' +
+				'either way.\n\n' +
+				'Auth-gated now that there is a store behind it. The ids arrive either as a bare ' +
+				'JSON array or under `MessageIds`; both are read. Answered 200 with an empty ' +
+				'body, which is what the client wants.',
+			security: AUTHED,
 			requestBody: jsonBody(DeleteMessagesRequest, 'The messages to delete'),
-			responses: { 200: { description: 'Accepted (empty body)' } },
+			responses: {
+				200: { description: 'Accepted (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
 		}),
-		(c) => c.body(null, 200)
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			// The client batches a multi-select into one call. It posts a bare array; the
+			// documented `{ MessageIds }` object is accepted too rather than guessing which
+			// of the two a given build sends.
+			const body = await c.req.json<unknown>().catch(() => null)
+			const raw = Array.isArray(body)
+				? body
+				: Array.isArray((body as { MessageIds?: unknown } | null)?.MessageIds)
+					? (body as { MessageIds: unknown[] }).MessageIds
+					: []
+			const ids = raw
+				.map((v) => (typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : Number.NaN))
+				.filter((v) => Number.isInteger(v))
+
+			await deleteNotifications(c.env.DB, id, ids)
+			return c.body(null, 200)
+		}
 	)
 	// How many of the caller's friends are online — the friends panel's header count.
 	// Answered from the friend graph joined to live presence, so it agrees with the
