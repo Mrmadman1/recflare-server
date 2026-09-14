@@ -1905,6 +1905,133 @@ describe('rooms endpoints', () => {
 		expect(await (await SELF.fetch(`${ORIGIN}/rooms/30602/roles`)).json()).toEqual([])
 	})
 
+	it('PUT /rooms/:id/creator hands the room over, and only the owner may', async () => {
+		type Role = { AccountId: number; Role: number; LastChangedByAccountId: number | null }
+		const roomOf = async (roomId: number) =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/${roomId}`)).json()) as {
+				CreatorAccountId: number
+				Roles: Role[]
+			}
+
+		// A room of account 1's to give away, and two accounts to try it with.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 30701,
+			Name: 'HandMeDown',
+			CreatorAccountId: 1,
+			Accessibility: 1,
+			SubRooms: [],
+			Roles: [{ AccountId: 1, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 }],
+		})
+		for (const accountId of [880, 881]) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(JSON.stringify({ accountId, username: `Taker${accountId}` }))
+				.run()
+		}
+
+		// No token → 401; a valid token that doesn't own the room → 403.
+		expect((await putForm('/rooms/30701/creator', { accountId: '880' })).status).toBe(401)
+		expect((await putForm('/rooms/30701/creator', { accountId: '880' }, '999')).status).toBe(403)
+		// Unknown room → failure envelope.
+		expect(
+			await envOf(await putForm('/rooms/99999/creator', { accountId: '880' }, '1'))
+		).toMatchObject({ success: false, error: 'This room does not exist!' })
+		// No account, yourself, and a player who doesn't exist are each refused — a room
+		// handed to a nonexistent account would be orphaned for good.
+		expect(await envOf(await putForm('/rooms/30701/creator', {}, '1'))).toMatchObject({
+			success: false,
+		})
+		expect(
+			await envOf(await putForm('/rooms/30701/creator', { accountId: '1' }, '1'))
+		).toMatchObject({ success: false, error: 'You already own this room!' })
+		expect(
+			await envOf(await putForm('/rooms/30701/creator', { accountId: '99998' }, '1'))
+		).toMatchObject({ success: false, error: 'That player does not exist!' })
+		expect((await roomOf(30701)).CreatorAccountId).toBe(1)
+
+		// The owner hands it to 880: they become Creator, the outgoing owner is left CoOwner,
+		// and `CreatorAccountId` moves with them.
+		const ok = await putForm('/rooms/30701/creator', { accountId: '880' }, '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({ success: true, error: '' })
+
+		const after = await roomOf(30701)
+		expect(after.CreatorAccountId).toBe(880)
+		expect(after.Roles).toContainEqual(
+			expect.objectContaining({ AccountId: 880, Role: 255, LastChangedByAccountId: 1 })
+		)
+		expect(after.Roles).toContainEqual(
+			expect.objectContaining({ AccountId: 1, Role: 30, LastChangedByAccountId: 1 })
+		)
+
+		// The old owner is a co-owner now, not the owner: they can no longer give the room
+		// away — otherwise the transfer would have left it with two owners.
+		expect((await putForm('/rooms/30701/creator', { accountId: '881' }, '1')).status).toBe(403)
+		// The new owner can, and the room only ever has one Creator entry.
+		expect((await putForm('/rooms/30701/creator', { accountId: '881' }, '880')).status).toBe(200)
+		const handedOn = await roomOf(30701)
+		expect(handedOn.CreatorAccountId).toBe(881)
+		expect(handedOn.Roles.filter((r) => r.Role === 255)).toEqual([
+			expect.objectContaining({ AccountId: 881 }),
+		])
+		expect(handedOn.Roles).toContainEqual(expect.objectContaining({ AccountId: 880, Role: 30 }))
+	})
+
+	it('PUT /rooms/:id/creator refuses a dorm, and pushes the room on a transfer', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: { RoomId: number } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+		// A dorm is found by its owner, so handing one over would give away somebody's
+		// personal room and mint them a fresh empty one on next access.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 30702,
+			Name: 'SomeonesDorm',
+			CreatorAccountId: 890,
+			IsDorm: true,
+			Accessibility: 2,
+			SubRooms: [],
+			Roles: [{ AccountId: 890, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 }],
+		})
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 891, username: 'NotYourDorm' }))
+			.run()
+
+		expect(
+			await envOf(await putForm('/rooms/30702/creator', { accountId: '891' }, '890'))
+		).toMatchObject({ success: false, error: 'A dorm cannot be given away!' })
+		const dorm = (await (await SELF.fetch(`${ORIGIN}/rooms/30702`)).json()) as {
+			CreatorAccountId: number
+		}
+		expect(dorm.CreatorAccountId).toBe(890)
+
+		// A real transfer reaches everyone in the room plus both parties, wherever they are.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 30703,
+			Name: 'WatchedHandover',
+			CreatorAccountId: 892,
+			Accessibility: 1,
+			SubRooms: [],
+			Roles: [{ AccountId: 892, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 }],
+		})
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 893, username: 'NewOwner' }))
+			.run()
+		await putInRoom(894, 30703)
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		expect((await putForm('/rooms/30703/creator', { accountId: '893' }, '892')).status).toBe(200)
+
+		const pushed = await sent()
+		expect(pushed.map((n) => n.playerId).sort((a, b) => a - b)).toEqual([892, 893, 894])
+		expect(
+			pushed.every((n) => n.notificationType === NotificationType.SubscriptionUpdateRoom)
+		).toBe(true)
+		expect(pushed.every((n) => n.data.RoomId === 30703)).toBe(true)
+
+		await clearPresence(894)
+	})
+
 	it('PUT /rooms/:id/roles/:accountId/invite records the offer and pushes the invite', async () => {
 		type Sent = {
 			playerId: number
@@ -4446,6 +4573,7 @@ describe('rooms endpoints', () => {
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save',
 			'PUT /rooms/{roomId}/accessibility',
 			'PUT /rooms/{roomId}/cloning',
+			'PUT /rooms/{roomId}/creator',
 			'PUT /rooms/{roomId}/description',
 			'PUT /rooms/{roomId}/image',
 			'PUT /rooms/{roomId}/interactionby/me/cheer',

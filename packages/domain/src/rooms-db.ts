@@ -228,6 +228,32 @@ export function canManageRoom(room: Room, accountId: number): boolean {
 }
 
 /**
+ * Whether an account may manage the room with this id — {@link canManageRoom} against a room
+ * this reads for itself. Null when there is no such room, which a caller answers differently
+ * (a 404) from a room somebody else runs (a 403).
+ *
+ * Reads the room BLOB only, with none of {@link getRoomById}'s hydration. Ownership lives in
+ * `CreatorAccountId` and `Roles`, both of which are in the blob; the subrooms, tags and stats
+ * that hydration attaches are three more tables a caller would otherwise have to have just to
+ * ask who runs a room. That matters for the workers outside `rooms` that gate on room
+ * ownership — `econ` minting a room currency does not know what a subroom is.
+ */
+export async function canManageRoomById(
+	db: D1Database,
+	roomId: number,
+	accountId: number
+): Promise<boolean | null> {
+	const room = parseOne(
+		await db
+			.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE room_id = ?1`)
+			.bind(roomId)
+			.first<RoomRow>()
+	)
+	if (!room) return null
+	return canManageRoom(room, accountId)
+}
+
+/**
  * Whether an account may MODERATE a room — its creator, or the holder of a role at
  * Moderator (20) or above. The wider gate that {@link canManageRoom} is the narrow one
  * of: a moderator polices who is in the room right now (kicking someone out of an
@@ -598,6 +624,69 @@ export async function setRoomRole(
 	}
 
 	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
+ * TRANSFER a room to a new owner: the recipient becomes {@link Role.Creator} and the
+ * outgoing owner is left as {@link Role.CoOwner}, keeping their access to a room they built
+ * without keeping the room.
+ *
+ * `CreatorAccountId` moves too, and it has to. It is the room's real owner field — every
+ * gate short-circuits on it ({@link canManageRoom}, {@link isRoomOwner}), the "rooms I made"
+ * lists select on it, and it is what the client shows. Moving only the `Roles` entries would
+ * give the room two owners: the new one by role, the old one by `CreatorAccountId`, still
+ * able to hand the room on again.
+ *
+ * Exempt from {@link roleRequiresInvite}, which otherwise means nobody is handed
+ * {@link Role.Creator} without accepting it. This is not a grant made ABOUT someone by a
+ * third party; it is the sole person who could already do anything at all to this room
+ * giving it away. The recipient gets a room, not a liability, and requiring them to accept
+ * would leave the room in a half-transferred state in the meantime.
+ *
+ * Returns null, writing nothing, for a DORM. A dorm is found by its owner
+ * ({@link getDormRoom} selects on `creator_account_id AND is_dorm`), so transferring one
+ * would hand somebody else's dorm to the recipient — who already has their own — and mint
+ * the original owner a fresh empty one on next access, their build gone.
+ *
+ * The caller supplies the already-loaded room (after its owner check) to avoid a re-read;
+ * the whole room JSON is rewritten. Pending invites on either entry are left standing.
+ */
+export async function transferRoomOwnership(
+	db: D1Database,
+	roomId: number,
+	fromAccountId: number,
+	toAccountId: number,
+	room: Room
+): Promise<Room | null> {
+	if (room.IsDorm === true) return null
+
+	const roles = roomRoles(room)
+	// Both sides get an entry whether or not they had one: the outgoing owner may never have
+	// been in `Roles` at all (the older rooms carry no entry for their creator), and the
+	// recipient is usually a stranger to the room.
+	const setRole = (accountId: number, role: number): void => {
+		const existing = roles.find((r) => r.AccountId === accountId)
+		if (existing) {
+			existing.Role = role
+			existing.LastChangedByAccountId = fromAccountId
+		} else {
+			roles.push({
+				AccountId: accountId,
+				Role: role,
+				LastChangedByAccountId: fromAccountId,
+				InvitedRole: Role.None,
+			})
+		}
+	}
+	setRole(toAccountId, Role.Creator)
+	setRole(fromAccountId, Role.CoOwner)
+
+	const updated: Room = { ...room, CreatorAccountId: toAccountId, Roles: roles }
 	await db
 		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
 		.bind(roomId, serializeRoom(updated))

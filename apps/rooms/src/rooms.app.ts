@@ -19,6 +19,7 @@ import {
 	deleteRoomLeaderboard,
 	deleteSubRoom,
 	findSubRoom,
+	getAccount,
 	getBaseRooms,
 	getContributedRooms,
 	getFavoritedRooms,
@@ -62,6 +63,7 @@ import {
 	setSubRoomPermissions,
 	toggleCheer,
 	toggleFavorite,
+	transferRoomOwnership,
 	unbanPlayerFromRoom,
 	updateRoomFields,
 } from '@repo/domain'
@@ -87,6 +89,7 @@ import {
 	CloneRoomRequest,
 	CloningRequest,
 	CreateSubRoomRequest,
+	CreatorRequest,
 	CuratedPlaylists,
 	DescriptionRequest,
 	DormRoomId,
@@ -2174,6 +2177,74 @@ const app = new Hono<App>()
 			if (!updated) return roomEnvelope(c, null, 'Co-ownership must be invited, not granted!')
 
 			await pushRoomUpdateToRoom(c, roomId, updated, [targetAccountId])
+			return roomEnvelope(c, updated)
+		}
+	)
+
+	// Hand the room to a new owner (form body `accountId`). Auth-gated (401) and gated to
+	// the room's OWNER alone (403) — giving a room away is the one thing only its owner may
+	// do. The recipient becomes Creator and the outgoing owner is left CoOwner, and
+	// `CreatorAccountId` moves with them.
+	.put(
+		'/rooms/:roomId{[0-9]+}/creator',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Transfer a room to a new owner',
+			description: [
+				'Makes `accountId` the room’s owner: their `Roles` entry becomes `Role` 255 (Creator)',
+				'and the outgoing owner’s becomes 30 (CoOwner), so whoever built the room keeps their',
+				'access to it without keeping the room. `CreatorAccountId` moves too — it is the',
+				'room’s real owner field, which every gate short-circuits on and the "rooms I made"',
+				'lists select on, so leaving it behind would give the room two owners.',
+				'',
+				'Gated to the room’s OWNER — its creator, or the holder of the Creator role. A valid',
+				'token from anyone else, a co-owner included, is a 403. This is the one place',
+				'`Role` 255 is handed over without the recipient accepting it: unlike a co-owner',
+				'invite, it is not a grant made about someone by a third party but the only person',
+				'who could already do anything to this room giving it away.',
+				'',
+				'A DORM cannot be transferred. A dorm is found by its owner, so handing one over',
+				'would give away somebody’s personal room and mint them a fresh empty one on next',
+				'access, their build gone.',
+				'',
+				'Everyone standing in the room gets the `RoomUpdate` push, and so do both parties',
+				'wherever they are — the room they are looking at just changed hands.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(CreatorRequest, 'The account taking the room over'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (!isRoomOwner(room, accountId)) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const toAccountId =
+				typeof body.accountId === 'string' ? Number.parseInt(body.accountId, 10) : Number.NaN
+			if (Number.isNaN(toAccountId)) return roomEnvelope(c, null, 'You must provide an account!')
+			if (toAccountId === accountId) return roomEnvelope(c, null, 'You already own this room!')
+			// A room handed to an account that doesn't exist is orphaned for good — nobody is
+			// left who can transfer it back.
+			if (!(await getAccount(c.env.DB, toAccountId))) {
+				return roomEnvelope(c, null, 'That player does not exist!')
+			}
+
+			const updated = await transferRoomOwnership(c.env.DB, roomId, accountId, toAccountId, room)
+			if (!updated) return roomEnvelope(c, null, 'A dorm cannot be given away!')
+
+			// Both parties hear about it wherever they are — the outgoing owner's client has to
+			// stop offering them the owner's tools, and the new owner's to start.
+			await pushRoomUpdateToRoom(c, roomId, updated, [accountId, toAccountId])
 			return roomEnvelope(c, updated)
 		}
 	)

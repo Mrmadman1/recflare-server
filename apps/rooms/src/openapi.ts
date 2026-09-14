@@ -591,6 +591,11 @@ export const RoleRequest = z.object({
 		),
 })
 
+/** `PUT /rooms/{roomId}/creator` — the account taking the room over. */
+export const CreatorRequest = z.object({
+	accountId: z.string().describe('The player who becomes the room’s owner'),
+})
+
 /** `PUT /rooms/{roomId}/roles/{accountId}/invite`. */
 export const InviteRoleRequest = z.object({
 	role: z.string().describe('The role tier offered: 10 Host, 20 Moderator, 30 CoOwner'),
