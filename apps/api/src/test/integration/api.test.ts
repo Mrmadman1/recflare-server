@@ -2185,6 +2185,158 @@ describe('public endpoints', () => {
 		expect(((await one.json()) as SavedInvention).Name).toBe('Clear Me')
 	})
 
+	// The permission picker's own call. `Permission` is the `GeneralPermission` ladder
+	// number — 40 is EditAndSave — and it decides what OTHER players may do with the
+	// invention, up to editing, re-publishing and charging for it.
+	test('POST /api/inventions/v2/update sets the permission from the body', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5170')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Permission Me', inventionDataFilename: 'perm.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+		expect(inventionId).toBeGreaterThan(0)
+
+		// The body verbatim as the client posts it.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { ...(await bearer('5170')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 40 }),
+		})
+		expect(res.status).toBe(200)
+		const result = (await res.json()) as InventionSaveV9Result
+		expect(result.Success).toBe(true)
+		// The UPDATED invention comes back in the envelope: the client re-renders the detail
+		// sheet from `Value.Invention`, so a reply that omitted it would leave the old
+		// permission on screen.
+		expect(result.Value?.Invention.GeneralPermission).toBe(40)
+
+		// And it stuck.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect(((await one.json()) as SavedInvention).GeneralPermission).toBe(40)
+	})
+
+	// THE gate. `GeneralPermission` is what lets another player edit, re-publish or charge
+	// for someone's build, so a write that took the caller's word for the id would let
+	// anyone hand themselves rights over any invention in the game. Refused in-band, the
+	// way `v2/metadata` refuses — this client cannot parse a bare error body — and, the
+	// part that matters, the stored permission must not move.
+	test('POST /api/inventions/v2/update is gated to the invention’s creator', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Not Yours Either', inventionDataFilename: 'nye.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+		const permissionNow = async () => {
+			const one = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+			)
+			return ((await one.json()) as SavedInvention).GeneralPermission
+		}
+		const before = await permissionNow()
+
+		// Another player, granting themselves Unlimited (100) over someone else's build.
+		const theirs = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 100 }),
+		})
+		expect(theirs.status).toBe(200)
+		expect(await theirs.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'Not your invention',
+			error_id: null,
+		})
+		expect(await permissionNow()).toBe(before)
+
+		// An unknown invention is the same kind of answer.
+		const missing = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: 987655, Permission: 40 }),
+		})
+		expect(missing.status).toBe(200)
+		expect((await missing.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Error: 'No such invention',
+		})
+
+		// A missing token is the one refusal that stays a transport failure — but it still
+		// answers the envelope, because an unparseable body crashes the client.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 100 }),
+		})
+		expect(anon.status).toBe(401)
+		expect((await anon.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Success: false,
+		})
+		expect(await permissionNow()).toBe(before)
+	})
+
+	// A patch, not a replace — and specifically NOT `v4/publish`'s reading of a null
+	// permission, which is UseOnly. Publishing something without naming a permission is a
+	// decision; editing it without naming one is not, and defaulting here would silently
+	// demote an invention every time the creator renamed it.
+	test('POST /api/inventions/v2/update leaves a null permission alone', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5173')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Keep My Rights', inventionDataFilename: 'keep.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		// Set it to Publish (60) first, so a fallback to UseOnly (20) would be visible.
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { ...(await bearer('5173')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 60 }),
+		})
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+			method: 'POST',
+			headers: { ...(await bearer('5173')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: null, Name: 'Renamed' }),
+		})
+		expect(res.status).toBe(200)
+		const value = ((await res.json()) as InventionSaveV9Result).Value
+		expect(value?.Invention.GeneralPermission).toBe(60)
+		expect(value?.Invention.Name).toBe('Renamed')
+	})
+
+	// The same parser `v1/update`'s query param goes through, so a build that sends the
+	// ladder by NAME lands on the same level as one sending the number.
+	test('POST /api/inventions/v2/update accepts a permission named as a string', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5174')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Named Ladder', inventionDataFilename: 'named.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		for (const [sent, expected] of [
+			['EditAndSave', 40],
+			['edit_and_save', 40],
+			['60', 60],
+		] as const) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/update`, {
+				method: 'POST',
+				headers: { ...(await bearer('5174')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ InventionId: inventionId, Permission: sent }),
+			})
+			expect(res.status).toBe(200)
+			expect(((await res.json()) as InventionSaveV9Result).Value?.Invention.GeneralPermission).toBe(
+				expected
+			)
+		}
+	})
+
 	test('PUT /api/inventions/v2/metadata refuses another creator’s invention in-band', async () => {
 		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
 			method: 'POST',
@@ -8131,6 +8283,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v2/delete',
+			'POST /api/inventions/v2/update',
 			'POST /api/inventions/v4/publish',
 			'POST /api/inventions/v6/save',
 			'POST /api/inventions/v9/save',

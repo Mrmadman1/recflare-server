@@ -669,6 +669,43 @@ export const UpdateInventionMetadataRequest = z.object({
 })
 
 /**
+ * `POST /api/inventions/v2/update` JSON body — the newer client's counterpart to
+ * `v1/update`'s query string. PascalCase, and nullable the way `v2/metadata`'s is: a null
+ * field keeps what the invention already has, so this is a patch rather than a replace.
+ *
+ * Only `InventionId` and `Permission` are confirmed from a live capture (the permission
+ * picker sends exactly those two). The rest are accepted defensively — they are the fields
+ * `v1/update` took that `v2/metadata` does not — so that a build sending one gets it
+ * applied instead of silently dropped.
+ */
+export const UpdateInventionRequest = z.object({
+	InventionId: z.int(),
+	Permission: z
+		.int()
+		.nullable()
+		.optional()
+		.describe(
+			'The `GeneralPermission` other players get, as a raw ladder number: Unassigned 0, ' +
+				'LimitedOneUseOnly 10, DisallowKeyLock 15, UseOnly 20, EditAndSave 40, Publish 60, ' +
+				'Charge 80, Unlimited 100. Unlike `v4/publish`, null LEAVES IT ALONE rather than ' +
+				'falling back to UseOnly — an edit that names no permission is not a demotion'
+		),
+	AllowTrial: z
+		.boolean()
+		.nullable()
+		.optional()
+		.describe('Whether other players may trial it; null leaves it alone'),
+	Name: z
+		.string()
+		.nullable()
+		.optional()
+		.describe('3–24 chars, letters/digits/spaces/dashes/colons; null leaves it alone'),
+	Description: z.string().nullable().optional().describe('Max 512 chars; empty clears it'),
+	LongDescription: z.string().nullable().optional().describe('Empty clears it'),
+	ImageName: z.string().nullable().optional().describe('New thumbnail; empty clears it'),
+})
+
+/**
  * `POST /api/inventions/v4/publish` JSON body — PascalCase, and nullable the way
  * `v2/metadata`'s is: a null field keeps what the invention already has.
  */

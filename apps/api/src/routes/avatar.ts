@@ -104,6 +104,7 @@ import {
 	UNAUTHORIZED_RESPONSE,
 	UpdateCustomAvatarItemRequest,
 	UpdateInventionMetadataRequest,
+	UpdateInventionRequest,
 	UpdatePriceRequest,
 } from '../openapi'
 import { createReport } from '../reports-db'
@@ -2052,6 +2053,112 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 					requested?.tagResult ?? INVENTION_TAG_RESULT.success
 				)
 			)
+		}
+	)
+
+	// Edit an invention, as the newer client sends it: the `v1/update` write with a
+	// PascalCase body instead of a query string. What the permission picker posts —
+	// `{ InventionId, Permission }` — and so the endpoint that changes what other players
+	// may DO with an invention, where `v2/metadata` beside it changes what it SAYS.
+	//
+	// Creator only, which is the whole point of the gate: `GeneralPermission` is what lets
+	// another player edit, re-publish or charge for someone's build, so a write that took
+	// the caller's word for the id would let anyone hand themselves rights over any
+	// invention in the game.
+	.post(
+		'/api/inventions/v2/update',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Edit an invention (v2)',
+			description:
+				'The newer client’s form of `v1/update`: a PascalCase JSON body in place of the ' +
+				'query string. A patch, not a replace — every field but `InventionId` is nullable ' +
+				'and a null one is left as it is, since the client sends the whole shape on every ' +
+				'edit.\n\n' +
+				'**Creator only.** `Permission` decides what other players may do with the ' +
+				'invention — up to editing, re-publishing and charging for it — so only the ' +
+				'account that created it may set it.\n\n' +
+				'`Permission` is the raw `GeneralPermission` ladder number (UseOnly 20, ' +
+				'EditAndSave 40, Publish 60 …), stored verbatim and unmapped, exactly as ' +
+				'`v1/update` stores the value its picker names. A null one LEAVES IT ALONE — ' +
+				'unlike `v4/publish`, where null means UseOnly: publishing something with no ' +
+				'permission named is a decision, but editing it without naming one is not.\n\n' +
+				'Publishing, pricing and tags are elsewhere (`v4/publish`, `v1/updateprice`, ' +
+				'`v2/metadata`), as they are for `v1/update`.\n\n' +
+				'Answers the enveloped result `v9/save` answers, carrying the UPDATED invention: ' +
+				'the client re-renders the detail sheet from `Value.Invention`, so a refusal — an ' +
+				'unknown invention and someone else’s alike — is `Success: false` with a null ' +
+				'`Value` rather than a bare error body, which that client cannot parse.',
+			security: AUTHED,
+			requestBody: jsonBody(UpdateInventionRequest, 'The fields to change'),
+			responses: {
+				200: json(
+					InventionSaveV9Result,
+					'The envelope — the updated invention under `Value`, or `Success: false` with ' +
+						'`Error` when the edit was refused'
+				),
+				401: json(InventionSaveV9Result, 'The same envelope, refused — not an empty body'),
+			},
+		}),
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (body === null) return c.json(inventionSaveV9Failure('Invalid request body'))
+
+			// The id rides in the body here, not the query string. The gate is what makes this
+			// creator-only: it loads the invention and refuses anyone but the account that
+			// created it.
+			const gate = await creatorsInventionResult(
+				c,
+				typeof body.InventionId === 'number' ? body.InventionId : Number.NaN
+			)
+			// Only a missing token is answered as a transport failure. An unknown invention or
+			// someone else's is a domain answer this client is meant to read — its own status
+			// enum has DoesNotExist and NotCreator members — so it goes in the envelope, where
+			// the message reaches a human. Same split `v2/metadata` makes.
+			if ('rejection' in gate) {
+				return gate.status === 401
+					? c.json(inventionSaveV9Failure(gate.rejection), 401)
+					: c.json(inventionSaveV9Failure(gate.rejection))
+			}
+
+			// A number is the picker's own form; a string is accepted through the same parser
+			// `v1/update`'s query param goes through, so a build sending `"EditAndSave"` or
+			// `"40"` lands on the same level. Anything else (null included) leaves it alone.
+			const permission =
+				typeof body.Permission === 'number'
+					? body.Permission
+					: typeof body.Permission === 'string'
+						? parsePermissionLevel(body.Permission)
+						: undefined
+
+			// Null is "leave it"; a string, empty or not, is an edit — `v2/metadata`'s rule,
+			// since these are the same client's bodies.
+			const edited = (key: string): string | undefined =>
+				typeof body[key] === 'string' ? body[key] : undefined
+			const name = edited('Name')?.trim()
+			const description = edited('Description')
+			const longDescription = edited('LongDescription')
+
+			for (const rejection of [
+				name === undefined ? null : inventionNameRejection(name),
+				description === undefined ? null : inventionDescriptionRejection(description),
+				longDescription === undefined ? null : inventionLongDescriptionRejection(longDescription),
+			]) {
+				if (rejection !== null) return c.json(inventionSaveV9Failure(rejection))
+			}
+
+			const updated = await updateInvention(c.env.DB, gate.invention.InventionId, {
+				generalPermission: permission,
+				allowTrial: typeof body.AllowTrial === 'boolean' ? body.AllowTrial : undefined,
+				name,
+				description,
+				longDescription,
+				imageName: edited('ImageName'),
+			})
+			if (updated === null) return c.json(inventionSaveV9Failure('No such invention'))
+			// The tags are reported as the ones the invention HAS, not as ones this call
+			// changed — it changes none. Same reading `v2/metadata` gives a null TagsRequest.
+			return c.json(toSaveResultV9(updated, updated.Tags ?? [], INVENTION_TAG_RESULT.success))
 		}
 	)
 
