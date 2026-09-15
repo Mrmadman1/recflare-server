@@ -26,6 +26,8 @@
  * don't clash with the other workers' migrations that share the database).
  */
 
+import { bindPlaceholders, chunkForBinds } from '@repo/domain'
+
 /** Schema DDL (mirror of migrations/0013_reputation.sql + 0014, folded into one CREATE). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS reputation (
@@ -186,15 +188,22 @@ export async function getCheerCredits(
 ): Promise<Map<number, number>> {
 	const credits = new Map<number, number>()
 	if (playerIds.length === 0) return credits
-	const placeholders = playerIds.map((_, i) => `?${i + 2}`).join(', ')
-	const { results } = await db
-		.prepare(
-			`SELECT player_id, cheers_left FROM player_cheer
-			 WHERE created > ?1 AND player_id IN (${placeholders})`
+	// The window cutoff is `?1`, so the ids start at `?2` and each chunk is one short of
+	// D1's bind cap — a bulk read over a friends list runs well past it.
+	const pages = await Promise.all(
+		chunkForBinds(playerIds, 1).map((chunk) =>
+			db
+				.prepare(
+					`SELECT player_id, cheers_left FROM player_cheer
+					 WHERE created > ?1 AND player_id IN (${bindPlaceholders(chunk, 1)})`
+				)
+				.bind(windowCutoff(now), ...chunk)
+				.all<{ player_id: number; cheers_left: number }>()
 		)
-		.bind(windowCutoff(now), ...playerIds)
-		.all<{ player_id: number; cheers_left: number }>()
-	for (const row of results) credits.set(row.player_id, row.cheers_left)
+	)
+	for (const row of pages.flatMap((page) => page.results)) {
+		credits.set(row.player_id, row.cheers_left)
+	}
 	return credits
 }
 
@@ -219,15 +228,20 @@ export async function getReputations(
 	now: Date = new Date()
 ): Promise<Reputation[]> {
 	if (accountIds.length === 0) return []
-	const placeholders = accountIds.map((_, i) => `?${i + 1}`).join(', ')
-	const [{ results }, credits] = await Promise.all([
-		db
-			.prepare(`SELECT * FROM reputation WHERE account_id IN (${placeholders})`)
-			.bind(...accountIds)
-			.all<ReputationRow>(),
+	const [pages, credits] = await Promise.all([
+		// Chunked: the friends list behind `/api/playerReputation/v2/bulk` runs past D1's
+		// bind cap, and an unchunked statement fails the whole lookup rather than part of it.
+		Promise.all(
+			chunkForBinds(accountIds).map((chunk) =>
+				db
+					.prepare(`SELECT * FROM reputation WHERE account_id IN (${bindPlaceholders(chunk)})`)
+					.bind(...chunk)
+					.all<ReputationRow>()
+			)
+		),
 		getCheerCredits(db, accountIds, now),
 	])
-	const stored = new Map(results.map((r) => [r.account_id, r]))
+	const stored = new Map(pages.flatMap((page) => page.results).map((r) => [r.account_id, r]))
 	return accountIds.map((id) => {
 		const credit = credits.get(id) ?? DAILY_CHEER_CREDIT
 		const row = stored.get(id)

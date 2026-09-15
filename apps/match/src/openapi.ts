@@ -161,6 +161,15 @@ export const MatchmakeResponse = z.object({
 })
 
 /**
+ * `POST /player` form body. `id` repeats once per player (the client asks about its whole
+ * friends list at once, too many ids to hang off a URL). One id per value — unlike
+ * `accounts`' bulk lookup, these are not comma-separated.
+ */
+export const BatchPlayerIdsRequest = z.object({
+	id: z.union([z.string(), z.string().array()]).describe('Repeated once per player id'),
+})
+
+/**
  * `GET /player/avoidjuniors` — a BARE JSON boolean (`true`/`false`), not an envelope and
  * not a `{ value }` wrapper. The whole body is the preference.
  */

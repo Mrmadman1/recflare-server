@@ -12,13 +12,13 @@ import {
 	deleteEmptyRoomInstances,
 	deleteExpiredPresence,
 	deletePresence,
+	deleteRoomInvite,
 	GAME_VERSION,
 	getAccount,
 	getClubSummary,
 	getExpiredPresenceInstanceIds,
 	getFriendIds,
 	getJoinableInstance,
-	deleteRoomInvite,
 	getLatestRoomInviteBetween,
 	getMostActiveClubhouses,
 	getOrCreateDormRoom,
@@ -28,8 +28,8 @@ import {
 	getRoomByName,
 	getRoomInstance,
 	getRoomInstancesByRoom,
-	getRoomInvite,
 	getRoomInstanceSummariesByRoom,
+	getRoomInvite,
 	getStoredRoomInstance,
 	InviteMode,
 	isClubMember,
@@ -64,6 +64,7 @@ import {
 	AUTHED,
 	AvoidJuniorsRequest,
 	AvoidJuniorsResponse,
+	BatchPlayerIdsRequest,
 	ConnectionInfoResponse,
 	CorrelationIdRequest,
 	EMPTY_OK,
@@ -91,6 +92,7 @@ import {
 } from './openapi'
 
 import type { Context } from 'hono'
+import type { DescribeRouteOptions } from 'hono-openapi'
 import type { Room, StoredPresence } from '@repo/domain'
 import type { App, Env } from './context'
 
@@ -992,6 +994,62 @@ async function readRequestFields(c: Context<App>): Promise<Record<string, unknow
 }
 
 /**
+ * OpenAPI spec for the two `/player` registrations, which differ only in where the ids ride.
+ */
+function batchPlayerRouteSpec(source: 'query' | 'body'): DescribeRouteOptions {
+	return {
+		tags: ['Presence'],
+		summary: 'Batch player presence lookup',
+		description: [
+			'Returns each requested player’s presence. `id` is repeated once per player',
+			'(`?id=2&id=155&id=153`, or the same fields in a form-urlencoded body) — one value',
+			'each, not comma-separated. With no ids, serves a single default (online) player.',
+		].join(' '),
+		...(source === 'query'
+			? {
+					parameters: [
+						{
+							name: 'id',
+							in: 'query',
+							required: false,
+							description: 'Repeated once per player id (`?id=2&id=155`); not comma-separated',
+							schema: { type: 'array', items: { type: 'string' } },
+						},
+					],
+				}
+			: { requestBody: form(BatchPlayerIdsRequest, 'Repeated `id` fields') }),
+		responses: { 200: json(PlayerDto.array(), 'One entry per requested player') },
+	}
+}
+
+/**
+ * Returns each requested player's presence. Ids come from repeated `id` query params AND,
+ * on the POST form, repeated `id` body fields; with none, serves the static
+ * getplayer.json default. Deduped (first occurrence wins) so a repeated id can't double
+ * an entry or waste a bound parameter.
+ */
+async function batchPlayers(c: Context<App>) {
+	// `readRequestFields` serves the v2 client's JSON too, where an id is a real number
+	// rather than a form field's string — coerce rather than filtering those away.
+	const body = c.req.method === 'POST' ? await readRequestFields(c) : {}
+	const raw = body['id'] ?? body['Id']
+	const ids = [
+		...new Set(
+			[...(c.req.queries('id') ?? []), ...(Array.isArray(raw) ? raw : [raw])]
+				.filter((v): v is string | number => typeof v === 'string' || typeof v === 'number')
+				.map((v) => Number.parseInt(String(v).trim(), 10))
+				.filter((n) => !Number.isNaN(n))
+		),
+	]
+	if (ids.length === 0) return c.json(DEFAULT_GET_PLAYER)
+
+	// One query per 99-id chunk (D1 `WHERE account_id IN (…)`), rather than a point read
+	// per id as the KV store required.
+	const presences = await getPresences<RoomInstance>(c.env.DB, ids)
+	return c.json(ids.map((playerId) => playerPayload(playerId, presences.get(playerId))))
+}
+
+/**
  * Look a field up case-insensitively — the client's casing isn't guaranteed across its
  * surfaces — taking the first value when the form encoding repeated it.
  */
@@ -1742,42 +1800,11 @@ const app = new Hono<App>()
 		async (c) => c.json(await getMostActiveClubhouses(c.env.DB))
 	)
 
-	.get(
-		'/player',
-		describeRoute({
-			tags: ['Presence'],
-			summary: 'Batch player presence lookup',
-			description: [
-				'Returns each requested player’s presence. `id` is a repeated query param',
-				'(`?id=2&id=155&id=153`) — one value each, not comma-separated. With no ids, serves',
-				'a single default (online) player.',
-			].join(' '),
-			parameters: [
-				{
-					name: 'id',
-					in: 'query',
-					required: false,
-					description: 'Repeated once per player id (`?id=2&id=155`); not comma-separated',
-					schema: { type: 'array', items: { type: 'string' } },
-				},
-			],
-			responses: { 200: json(PlayerDto.array(), 'One entry per requested player') },
-		}),
-		async (c) => {
-			// Returns each requested player's presence. Reads the repeated `id` query
-			// param(s); with none it serves the static getplayer.json default.
-			const ids = c.req
-				.queries('id')
-				?.map((s) => Number.parseInt(s.trim(), 10))
-				.filter((n) => !Number.isNaN(n))
-			if (!ids || ids.length === 0) return c.json(DEFAULT_GET_PLAYER)
-
-			// One query for the whole batch (D1 `WHERE account_id IN (…)`), rather than a
-			// point read per id as the KV store required.
-			const presences = await getPresences<RoomInstance>(c.env.DB, ids)
-			return c.json(ids.map((playerId) => playerPayload(playerId, presences.get(playerId))))
-		}
-	)
+	.get('/player', describeRoute(batchPlayerRouteSpec('query')), batchPlayers)
+	// The 2023 client asks about its whole friends list at once and posts the ids in a
+	// form-urlencoded body rather than hanging a few hundred of them off the URL. Same
+	// lookup as the GET, which stays for callers that prefer a query string.
+	.post('/player', describeRoute(batchPlayerRouteSpec('body')), batchPlayers)
 
 	.post(
 		'/player/heartbeat',

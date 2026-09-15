@@ -28,6 +28,7 @@ import {
 	BannerImageRequest,
 	BioRequest,
 	BioResponse,
+	BulkIdsRequest,
 	CreateAccountRequest,
 	CreateAccountResult,
 	DisplayNameRequest,
@@ -51,6 +52,7 @@ import {
 import { resolveWhitelistedEmoji, WHITELISTED_EMOJIS } from './whitelisted-emojis'
 
 import type { Context } from 'hono'
+import type { DescribeRouteOptions } from 'hono-openapi'
 import type { Account } from '@repo/domain'
 import type { App } from './context'
 
@@ -100,6 +102,69 @@ async function formField(c: Context<App>, name: string): Promise<string> {
 	const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
 	const value = body[name]
 	return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Read a REPEATED string field from a form-urlencoded / multipart body (`id=1&id=2`).
+ * `parseBody` keeps only the last value for a duplicated key unless it's told to collect
+ * them all, which is the whole point here.
+ */
+async function formFields(c: Context<App>, name: string): Promise<string[]> {
+	const body = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>)
+	const value = body[name]
+	const values = Array.isArray(value) ? value : [value]
+	return values.filter((v): v is string => typeof v === 'string')
+}
+
+/**
+ * OpenAPI spec for the two `/account/bulk` registrations, which differ only in where the
+ * ids ride.
+ */
+function bulkRouteSpec(source: 'query' | 'body'): DescribeRouteOptions {
+	return {
+		tags: ['Lookup'],
+		summary: 'Look up many accounts by id',
+		description: [
+			'Accepts repeated `id` values (query params and/or a form-urlencoded body) and',
+			'comma-separated lists. Every requested id appears in the response — ids with no',
+			'stored row get a synthesized default.',
+		].join(' '),
+		...(source === 'query'
+			? {
+					parameters: [
+						{
+							name: 'id',
+							in: 'query',
+							required: false,
+							description: 'Repeatable; each value may be a comma-separated list of ids',
+							schema: { type: 'array', items: { type: 'string' } },
+						},
+					],
+				}
+			: { requestBody: form(BulkIdsRequest, 'Repeated `id` fields') }),
+		responses: { 200: json(AccountDto.array(), 'One public account per requested id') },
+	}
+}
+
+/**
+ * Look up many accounts at once. Ids come from repeated `id` query params AND, on the
+ * POST form, repeated `id` body fields; either may carry a comma-separated list. Deduped
+ * (first occurrence wins) so a repeated id can't double a row or waste a bound parameter.
+ */
+async function bulkAccounts(c: Context<App>) {
+	const raw = [...(c.req.queries('id') ?? []), ...(await formFields(c, 'id'))]
+	const ids = [
+		...new Set(
+			raw
+				.flatMap((v) => v.split(','))
+				.map((v) => Number.parseInt(v.trim(), 10))
+				.filter((n) => !Number.isNaN(n))
+		),
+	]
+	// Resolve stored accounts, synthesizing a default for any id not in the DB
+	// so every requested id is present in the response.
+	const stored = new Map((await getAccountsByIds(c.env.DB, ids)).map((a) => [a.accountId, a]))
+	return c.json(ids.map((id) => toAccountDto(stored.get(id) ?? defaultAccount(id))))
 }
 
 /**
@@ -286,40 +351,12 @@ const app = new Hono<App>()
 
 	// ---- Bulk / single lookup ------------------------------------------------
 	// Register the static `bulk` path before the `/account/:id` param route.
-	.get(
-		'/account/bulk',
-		describeRoute({
-			tags: ['Lookup'],
-			summary: 'Look up many accounts by id',
-			description: [
-				'Accepts repeated `id` query params and/or comma-separated lists. Every requested',
-				'id appears in the response — ids with no stored row get a synthesized default.',
-			].join(' '),
-			parameters: [
-				{
-					name: 'id',
-					in: 'query',
-					required: false,
-					description: 'Repeatable; each value may be a comma-separated list of ids',
-					schema: { type: 'array', items: { type: 'string' } },
-				},
-			],
-			responses: { 200: json(AccountDto.array(), 'One public account per requested id') },
-		}),
-		async (c) => {
-			// Reads repeated `id` query params; also accept a comma-separated list.
-			const ids =
-				c.req
-					.queries('id')
-					?.flatMap((v) => v.split(','))
-					.map((s) => Number.parseInt(s.trim(), 10))
-					.filter((n) => !Number.isNaN(n)) ?? []
-			// Resolve stored accounts, synthesizing a default for any id not in the DB
-			// so every requested id is present in the response.
-			const stored = new Map((await getAccountsByIds(c.env.DB, ids)).map((a) => [a.accountId, a]))
-			return c.json(ids.map((id) => toAccountDto(stored.get(id) ?? defaultAccount(id))))
-		}
-	)
+	.get('/account/bulk', describeRoute(bulkRouteSpec('query')), bulkAccounts)
+	// The 2023 client asks for its friends list as a POST with the ids in a
+	// form-urlencoded body — the same `id=1&id=2&…` it would put in a query string,
+	// moved off the URL because a few hundred friends overflow it. GET is the same
+	// lookup and stays for callers (and docs) that prefer it.
+	.post('/account/bulk', describeRoute(bulkRouteSpec('body')), bulkAccounts)
 
 	.get(
 		'/account/:id/bio',

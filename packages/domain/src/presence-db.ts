@@ -21,6 +21,8 @@
  * {@link deleteExpiredPresence} purges them.
  */
 
+import { bindPlaceholders, chunkForBinds } from './d1-binds'
+
 /** Presence is kept this long (s) after the last matchmake/heartbeat refresh. */
 export const PRESENCE_TTL_SECONDS = 900
 
@@ -136,7 +138,7 @@ export async function getPresence<TRoomInstance>(
 }
 
 /**
- * Read many players' live presence in one query, keyed by account id (absent or
+ * Read many players' live presence in as few queries as D1 allows, keyed by account id (absent or
  * expired players are simply missing from the map). Replaces the N point reads the
  * batch `/player?id=…` lookup did against KV.
  */
@@ -147,15 +149,20 @@ export async function getPresences<TRoomInstance>(
 ): Promise<Map<number, StoredPresence<TRoomInstance>>> {
 	const out = new Map<number, StoredPresence<TRoomInstance>>()
 	if (accountIds.length === 0) return out
-	const placeholders = accountIds.map((_, i) => `?${i + 1}`).join(', ')
-	const { results } = await db
-		.prepare(
-			`SELECT data FROM presence
-			 WHERE account_id IN (${placeholders}) AND expires_at > ?${accountIds.length + 1}`
+	// The expiry cutoff spends one of the statement's binds, so each chunk of ids runs one
+	// short of the cap. A friends list is routinely longer than that; unchunked, it 500s.
+	const pages = await Promise.all(
+		chunkForBinds(accountIds, 1).map((chunk) =>
+			db
+				.prepare(
+					`SELECT data FROM presence
+					 WHERE account_id IN (${bindPlaceholders(chunk)}) AND expires_at > ?${chunk.length + 1}`
+				)
+				.bind(...chunk, now)
+				.all<{ data: string }>()
 		)
-		.bind(...accountIds, now)
-		.all<{ data: string }>()
-	for (const r of results) {
+	)
+	for (const r of pages.flatMap((page) => page.results)) {
 		const p = JSON.parse(r.data) as StoredPresence<TRoomInstance>
 		out.set(p.accountId, p)
 	}

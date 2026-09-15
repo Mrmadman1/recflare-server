@@ -18,6 +18,8 @@
  * the writer.
  */
 
+import { bindPlaceholders, chunkForBinds } from './d1-binds'
+
 /** Schema DDL (mirror of apps/econ/migrations/0012_progression.sql). */
 export const PROGRESSION_SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS progression (
@@ -211,12 +213,19 @@ export async function getProgressions(
 	accountIds: number[]
 ): Promise<Progression[]> {
 	if (accountIds.length === 0) return []
-	const placeholders = accountIds.map((_, i) => `?${i + 1}`).join(', ')
-	const { results } = await db
-		.prepare(`SELECT account_id, level, xp FROM progression WHERE account_id IN (${placeholders})`)
-		.bind(...accountIds)
-		.all<{ account_id: number; level: number; xp: number }>()
-	const stored = new Map(results.map((r) => [r.account_id, r]))
+	// Chunked: the friends list behind `/api/players/v2/progression/bulk` runs past the
+	// bind cap, and an unchunked statement fails the whole lookup rather than part of it.
+	const pages = await Promise.all(
+		chunkForBinds(accountIds).map((chunk) =>
+			db
+				.prepare(
+					`SELECT account_id, level, xp FROM progression WHERE account_id IN (${bindPlaceholders(chunk)})`
+				)
+				.bind(...chunk)
+				.all<{ account_id: number; level: number; xp: number }>()
+		)
+	)
+	const stored = new Map(pages.flatMap((page) => page.results).map((r) => [r.account_id, r]))
 	return accountIds.map((id) => {
 		const row = stored.get(id)
 		return row === undefined

@@ -17,6 +17,7 @@
  * database read-only and uses `getRoomById`. Each imports the subset it needs.
  */
 
+import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
 
@@ -1427,27 +1428,6 @@ const parseRow = (row: RoomRow): Room => {
 
 const parseOne = (row: RoomRow | null): Room | null => (row ? parseRow(row) : null)
 const parseAll = (rows: RoomRow[]): Room[] => rows.map(parseRow)
-
-/**
- * D1 caps a prepared statement at 100 bound parameters — binding more fails outright with
- * "variable number must be between ?1 and ?100". Every `IN (…)` list built from a caller's
- * array has to respect this, which is easy to miss: a seeded dev database has fewer than a
- * hundred rooms, so an unchunked query works right up until it meets a real one.
- */
-const MAX_BOUND_PARAMS = 100
-
-/**
- * Split values into chunks that fit {@link MAX_BOUND_PARAMS}, for the reads whose rows are
- * too heavy to fetch wholesale (subroom and save blobs) and so have to page through an
- * `IN (…)` rather than scan.
- */
-function chunkForBinds<T>(values: T[]): T[][] {
-	const chunks: T[][] = []
-	for (let i = 0; i < values.length; i += MAX_BOUND_PARAMS) {
-		chunks.push(values.slice(i, i + MAX_BOUND_PARAMS))
-	}
-	return chunks
-}
 
 /**
  * Run one `… IN (…)` query per chunk and concatenate the rows. `sql` is handed the

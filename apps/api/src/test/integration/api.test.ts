@@ -844,6 +844,28 @@ describe('public endpoints', () => {
 		expect(body[0]).toMatchObject({ Level: 1, XP: 0 })
 	})
 
+	test('the bulk profile reads answer more ids than D1 will bind at once', async () => {
+		// Both of these are asked about a whole friends list at once, which runs past D1's
+		// 100-bound-parameter cap; unchunked, the statement fails and the endpoint 500s
+		// rather than returning a short list.
+		const ids = Array.from({ length: 250 }, (_, i) => 6000 + i)
+		const query = ids.map((id) => `id=${id}`).join('&')
+
+		const progression = await exports.default.fetch(
+			`${ORIGIN}/api/players/v2/progression/bulk?${query}`
+		)
+		expect(progression.status).toBe(200)
+		const levels = (await progression.json()) as Array<{ PlayerId: number }>
+		expect(levels.map((p) => p.PlayerId)).toEqual(ids)
+
+		const reputation = await exports.default.fetch(
+			`${ORIGIN}/api/playerReputation/v2/bulk?${query}`
+		)
+		expect(reputation.status).toBe(200)
+		const reps = (await reputation.json()) as Array<{ AccountId: number }>
+		expect(reps.map((r) => r.AccountId)).toEqual(ids)
+	})
+
 	test('progression reads back the XP game rewards banked, levelled up', async () => {
 		// The two workers share this table; `econ` writes it when a game reward is claimed (5 XP
 		// at a time). Granted in one lump here to exercise a multi-level climb: 25 XP from level

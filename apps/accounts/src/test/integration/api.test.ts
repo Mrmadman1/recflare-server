@@ -97,6 +97,48 @@ describe('public endpoints', () => {
 		expect(accounts[1].username).toBe('Player2')
 	})
 
+	test('POST /account/bulk reads the ids from a form body', async () => {
+		// The 2023 client asks for its friends list as a POST — the ids are in a
+		// form-urlencoded body, not the query string. GET-only left it a 404.
+		const res = await exports.default.fetch(`${ORIGIN}/account/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'id=1&id=2&id=3',
+		})
+		expect(res.status).toBe(200)
+		const accounts = (await res.json()) as Array<{ accountId: number; username: string }>
+		expect(accounts.map((a) => a.accountId)).toEqual([1, 2, 3])
+		expect(accounts[0].username).toBe('Coach')
+	})
+
+	test('POST /account/bulk answers more ids than D1 will bind at once', async () => {
+		// D1 caps a statement at 100 bound parameters; a real friends list runs past that,
+		// and an unchunked `IN (…)` 500s. Requesting a stored id in the LAST chunk proves
+		// the later statements ran, not just the first.
+		const ids = [...Array.from({ length: 250 }, (_, i) => 1000 + i), 1]
+		const res = await exports.default.fetch(`${ORIGIN}/account/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: ids.map((id) => `id=${id}`).join('&'),
+		})
+		expect(res.status).toBe(200)
+		const accounts = (await res.json()) as Array<{ accountId: number; username: string }>
+		expect(accounts.map((a) => a.accountId)).toEqual(ids)
+		expect(accounts.at(-1)?.username).toBe('Coach')
+	})
+
+	test('POST /account/bulk returns one entry per id, deduped', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/account/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			// Negative ids are real in the client's list and synthesize like any other.
+			body: 'id=1&id=-1&id=1',
+		})
+		const accounts = (await res.json()) as Array<{ accountId: number; username: string }>
+		expect(accounts.map((a) => a.accountId)).toEqual([1, -1])
+		expect(accounts[1].username).toBe('Player-1')
+	})
+
 	test('GET /account/search prefix-matches usernames, returns public DTOs', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/account/search?name=coa`)
 		expect(res.status).toBe(200)
@@ -652,6 +694,7 @@ describe('auth-gated endpoints', () => {
 			'GET /accountprivacysettings/{id}',
 			'GET /emojiConfig/whitelistedEmojis',
 			'GET /parentalcontrol/me',
+			'POST /account/bulk',
 			'POST /account/create',
 			'POST /account/me/email',
 			'POST /account/me/phone',

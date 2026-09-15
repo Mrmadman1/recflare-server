@@ -8,6 +8,7 @@ export {
 } from './enums'
 export * from './accounts-db'
 export * from './clubs-db'
+export * from './d1-binds'
 export * from './images-db'
 export * from './password'
 export * from './rooms-db'

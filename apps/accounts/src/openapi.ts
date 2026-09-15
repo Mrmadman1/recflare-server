@@ -212,6 +212,16 @@ export const UsernameRequest = z.object({
 		),
 })
 
+/**
+ * `POST /account/bulk` form body. `id` repeats once per requested account (the client
+ * sends its whole friends list this way); each value may also be a comma-separated list.
+ */
+export const BulkIdsRequest = z.object({
+	id: z
+		.union([z.string(), z.string().array()])
+		.describe('Repeatable; each value may be a comma-separated list of ids'),
+})
+
 export const EmailRequest = z.object({
 	email: z
 		.string()

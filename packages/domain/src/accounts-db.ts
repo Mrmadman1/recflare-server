@@ -11,6 +11,8 @@
  * it from `@repo/domain` (each uses the subset it needs).
  */
 
+import { bindPlaceholders, chunkForBinds } from './d1-binds'
+
 /**
  * Schema DDL — the head schema, i.e. what the table looks like after every migration
  * (0001_accounts + 0002_avatar + 0009_account_has_plus, sans seed INSERTs; 0004 added a
@@ -349,15 +351,21 @@ export async function countAccountsBySignupIp(db: D1Database, ip: string): Promi
 	return row?.n ?? 0
 }
 
-/** Look up multiple accounts by AccountId (order not guaranteed). */
+/**
+ * Look up multiple accounts by AccountId (order not guaranteed). A list longer than
+ * {@link MAX_BOUND_PARAMS} is split across statements and the rows concatenated.
+ */
 export async function getAccountsByIds(db: D1Database, ids: number[]): Promise<Account[]> {
 	if (ids.length === 0) return []
-	const placeholders = ids.map((_, i) => `?${i + 1}`).join(',')
-	const { results } = await db
-		.prepare(`SELECT data FROM account WHERE account_id IN (${placeholders})`)
-		.bind(...ids)
-		.all<AccountRow>()
-	return parseAll(results)
+	const pages = await Promise.all(
+		chunkForBinds(ids).map((chunk) =>
+			db
+				.prepare(`SELECT data FROM account WHERE account_id IN (${bindPlaceholders(chunk)})`)
+				.bind(...chunk)
+				.all<AccountRow>()
+		)
+	)
+	return parseAll(pages.flatMap((page) => page.results))
 }
 
 /**

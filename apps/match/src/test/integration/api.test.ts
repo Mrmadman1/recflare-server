@@ -469,6 +469,41 @@ describe('public endpoints', () => {
 		expect(players.every((p) => p.isOnline === false)).toBe(true)
 	})
 
+	test('POST /player reads the ids from a form body', async () => {
+		// The 2023 client asks about its friends list as a POST — the ids are in a
+		// form-urlencoded body, not the query string. GET-only left it a 404.
+		const res = await exports.default.fetch(`${ORIGIN}/player`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'id=1070&id=1380&id=1070',
+		})
+		expect(res.status).toBe(200)
+		const players = (await res.json()) as Array<{ playerId: number; isOnline: boolean }>
+		// One entry per id, deduped, in request order.
+		expect(players.map((p) => p.playerId)).toEqual([1070, 1380])
+	})
+
+	test('POST /player answers more ids than D1 will bind at once', async () => {
+		// D1 caps a statement at 100 bound parameters and the expiry check takes one of
+		// them, so a real friends list overruns an unchunked `IN (…)` and 500s.
+		const ids = Array.from({ length: 250 }, (_, i) => 4000 + i)
+		const res = await exports.default.fetch(`${ORIGIN}/player`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: ids.map((id) => `id=${id}`).join('&'),
+		})
+		expect(res.status).toBe(200)
+		const players = (await res.json()) as Array<{ playerId: number }>
+		expect(players.map((p) => p.playerId)).toEqual(ids)
+	})
+
+	test('POST /player without an id returns the default payload', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/player`, { method: 'POST' })
+		expect(res.status).toBe(200)
+		const players = (await res.json()) as Array<{ playerId: number; isOnline: boolean }>
+		expect(players[0]).toMatchObject({ playerId: 1, isOnline: true, appVersion: GAME_VERSION })
+	})
+
 	test('GET /player without an id returns the default payload', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player`)
 		expect(res.status).toBe(200)
@@ -3280,6 +3315,7 @@ describe('auth-gated endpoints', () => {
 			'POST /matchmake/v2/player/{playerId}',
 			'POST /matchmake/v2/room/{roomId}',
 			'POST /matchmake/v2/room/{roomId}/{subRoomId}',
+			'POST /player',
 			'POST /player/exclusivelogin',
 			'POST /player/heartbeat',
 			'POST /player/login',
