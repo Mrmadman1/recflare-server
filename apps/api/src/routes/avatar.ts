@@ -160,9 +160,7 @@ async function bulkCustomAvatarItemIds(c: Context<App>): Promise<string[]> {
 async function creatorsInventionResult(
 	c: Context<App>,
 	inventionId: number
-): Promise<
-	{ invention: SavedInvention } | { rejection: string; status: 400 | 401 | 403 | 404 }
-> {
+): Promise<{ invention: SavedInvention } | { rejection: string; status: 400 | 401 | 403 | 404 }> {
 	const playerId = await authedId(c)
 	if (playerId === null) return { rejection: 'Unauthorized', status: 401 }
 	if (Number.isNaN(inventionId)) return { rejection: 'inventionId is required', status: 400 }
@@ -218,7 +216,10 @@ function requestedTags(request: unknown): { tags: InventionTag[]; tagResult: num
 	})
 	return rejected
 		? { tags: [], tagResult: INVENTION_TAG_RESULT.rejected }
-		: { tags: normalizeInventionTags(autoTags, customTags), tagResult: INVENTION_TAG_RESULT.success }
+		: {
+				tags: normalizeInventionTags(autoTags, customTags),
+				tagResult: INVENTION_TAG_RESULT.success,
+			}
 }
 
 /**
@@ -228,8 +229,7 @@ function requestedTags(request: unknown): { tags: InventionTag[]; tagResult: num
  * two versions disagree about the shape of a reply, not about what a save is.
  */
 type InventionSaveOutcome =
-	| { rejection: string }
-	| { invention: SavedInvention; tags: InventionTag[]; tagResult: number }
+	{ rejection: string } | { invention: SavedInvention; tags: InventionTag[]; tagResult: number }
 
 /**
  * The invention save both `v6/save` and `v9/save` run through. v9 sends everything v6 does
@@ -450,7 +450,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'Multipart: a `metadata` JSON text field plus two file parts, `thumbnailImage` ' +
 				'(PNG) and `design` (the design blob). Inserts a `custom_avatar_item` row owned ' +
 				'by the caller and answers with it in the PascalCase `{ Value, Success, Error, ' +
-				'error_id }` envelope.\n\n' +
+				'error_id }` envelope. The item is filed under `OutfitType` 105, the custom shirt, ' +
+				'which is what the store’s user-generated-content tab searches for.\n\n' +
 				'The two files go to the shared image bucket (`recflare-img`) under ' +
 				'`avatar-item/<date>/<id>-thumb.png` and `avatar-item/<date>/<id>-design.png`; those ' +
 				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row.',
@@ -682,10 +683,17 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'rather than no results, since the client sends every type it can render.',
 				'`minPrice`/`maxPrice` bound the price, inclusive.',
 				'`skip`/`take` page the results, `take` capped at 200.',
-				'`includeCoachItems=false` leaves out this server’s stock content.',
-				'`itemTypes`, `ordering`, `unityAssetTarget` and `unityAssetVersion` are accepted and',
-				'NOT yet acted on — nothing records purchase or wear counts to rank by, no per-target',
-				'asset variants are stored, and custom avatar items are the only item type there is.',
+				'`includeCoachItems` picks a SIDE of the catalog: `true` serves only the Coach’s',
+				'stock content (account 1), `false` only player-made items, and leaving it out serves',
+				'both. The client’s storefront tab sends `True` and its user-generated-content tab',
+				'`False`, so the two never overlap.',
+				'`outfitTypes` values are `RecRoom.Avatars.OutfitType` ordinals; the user-generated-',
+				'content tab sends 105 (`CustomShirt`) alone, the storefront tab a dozen slots.',
+				'`itemTypes` (a separate enum: All -1, None 0, Shirt 1 — not the outfit type),',
+				'`ordering` (0 is `SearchScoreDescending`), `unityAssetTarget` and `unityAssetVersion`',
+				'are accepted and NOT yet acted on — nothing records purchase or wear counts to rank',
+				'by, no per-target asset variants are stored, and custom shirts are the only item type',
+				'there is.',
 				'`includePurchaseInfos` likewise: `PurchaseInfo` is null on every item for now,',
 				'whatever it says.',
 			].join(' '),
@@ -736,7 +744,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 					name: 'includeCoachItems',
 					in: 'query',
 					required: false,
-					description: 'Include the Coach’s stock items (default true)',
+					description:
+						'true: only the Coach’s stock items; false: only player-made items; absent: both',
 					schema: { type: 'boolean' },
 				},
 			],
@@ -751,9 +760,11 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				?.map((v) => Number.parseInt(v, 10))
 				.filter((n) => Number.isInteger(n))
 
+			// Three-way: `True` is the Coach's side of the store, `False` the players', absent both.
 			// The client capitalises its booleans (`includeCoachItems=True`), so this is folded
-			// before comparing; anything that isn't recognisably false leaves the default alone.
-			const includeCoachItems = c.req.query('includeCoachItems')?.toLowerCase() !== 'false'
+			// before comparing; anything that isn't recognisably true or false is treated as absent.
+			const coach = c.req.query('includeCoachItems')?.toLowerCase()
+			const includeCoachItems = coach === 'true' ? true : coach === 'false' ? false : undefined
 
 			const int = (name: string): number | undefined => {
 				const raw = c.req.query(name)
@@ -2027,9 +2038,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			for (const rejection of [
 				name === undefined ? null : inventionNameRejection(name),
 				description === undefined ? null : inventionDescriptionRejection(description),
-				longDescription === undefined
-					? null
-					: inventionLongDescriptionRejection(longDescription),
+				longDescription === undefined ? null : inventionLongDescriptionRejection(longDescription),
 			]) {
 				if (rejection !== null) return c.json(inventionSaveV9Failure(rejection))
 			}

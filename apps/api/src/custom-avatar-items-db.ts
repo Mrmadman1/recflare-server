@@ -60,6 +60,25 @@ export interface CustomAvatarItem {
 	PurchaseInfo: null
 }
 
+/**
+ * `RecRoom.Avatars.OutfitType.CustomShirt` — the slot of a custom shirt, the one kind of custom
+ * avatar item the client can make. The enum (unobfuscated in the client) is banded by body
+ * region: head None -1, Hat 0, Hair 2, Ear 3, Eye 10, Beard 20; torso Shoulder 100, Shirt 101,
+ * Waist 102, Neck 103, TeamJersey 104, CustomShirt 105; arms Wrist 200, TeamWrist 203; legs
+ * Legs 300, Feet 301; Roomie_Hat 500, Roomie_Waist 501, Roomie_Eye 502. It reaches the search
+ * as a bare `IEnumerable<int>` — nothing on the wire ties 105 to the name.
+ *
+ * This is what the store's user-generated-content tab searches for, ALONE
+ * (`GET /api/customAvatarItems/v1/search?outfitTypes=105&includeCoachItems=False`), so it is
+ * what every created item must be filed under: the table's default of 0 (Hat) matched nothing,
+ * and the tab sat empty over a full catalog.
+ *
+ * Not to be confused with the search's `itemTypes`, a different 3-member enum (All -1, None 0,
+ * Shirt 1) whose Shirt is 1, not 101 or 105. The client sends `itemTypes=-1` (All) alongside
+ * `outfitTypes=105`; the outfit type is the filter, and the two are never cross-mapped.
+ */
+export const OUTFIT_TYPE_CUSTOM_SHIRT = 105
+
 /** What `POST /api/customAvatarItems/v1` needs to create an item. */
 export interface CreateCustomAvatarItemInput {
 	/** The item's id. Chosen by the caller because the upload keys are derived from it. */
@@ -73,6 +92,8 @@ export interface CreateCustomAvatarItemInput {
 	accessibility: number
 	designFilename: string
 	thumbnailImageFilename: string
+	/** The slot the item is worn in; {@link OUTFIT_TYPE_CUSTOM_SHIRT} when left out. */
+	outfitType?: number
 }
 
 interface Row {
@@ -132,8 +153,8 @@ export async function createCustomAvatarItem(
 			`INSERT INTO custom_avatar_item (
 				custom_avatar_item_id, creator_account_id, name, description, price, accessibility,
 				base_avatar_item_id, base_avatar_item_color, design_filename, thumbnail_image_filename,
-				created_at, modified_at
-			) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+				created_at, modified_at, outfit_type
+			) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
 			RETURNING *`
 		)
 		.bind(
@@ -147,7 +168,8 @@ export async function createCustomAvatarItem(
 			input.baseAvatarItemColor,
 			input.designFilename,
 			input.thumbnailImageFilename,
-			ts
+			ts,
+			input.outfitType ?? OUTFIT_TYPE_CUSTOM_SHIRT
 		)
 		.first<Row>()
 	if (!row) throw new Error('custom_avatar_item insert returned no row')
@@ -264,7 +286,13 @@ export interface CustomAvatarItemSearch {
 	 * the full set of types it can render, so an absent parameter is "everything", not "nothing".
 	 */
 	outfitTypes?: number[]
-	/** Whether items authored by the Coach — this server's stock content — are included. */
+	/**
+	 * WHICH SIDE of the catalog to serve, not whether to add one to the other: `true` is the
+	 * Coach's stock content ONLY, `false` is player-made content ONLY, and undefined is both.
+	 * The client browses the store's two tabs with this — its storefront call says `True`
+	 * and its user-generated-content call says `False` — so "include" reads as a toggle
+	 * between them, never as a superset.
+	 */
 	includeCoachItems?: boolean
 	/** Lowest price to include, inclusive. */
 	minPrice?: number
@@ -294,6 +322,11 @@ export const SEARCH_MAX_TAKE = 200
  * `outfitTypes` is a WHITELIST when non-empty and no filter when empty, which is the opposite of
  * how an empty IN () clause reads in SQL: the client sends every type it can render, so treating
  * an absent parameter as "match nothing" would empty the store.
+ *
+ * `includeCoachItems` SPLITS the catalog by author rather than widening it: `true` is the Coach's
+ * items alone, `false` everyone else's alone, absent both. The client's storefront tab sends
+ * `True` and its user-generated-content tab sends `False`, and the two must not overlap — read
+ * as "stock plus players'", the storefront would show every player's item too.
  *
  * Ordered by recency because there is nothing else to order by — no purchase counts, no wear
  * counts, no ratings are recorded — which is the same stand-in the `hot` feed makes. The
@@ -327,7 +360,9 @@ export async function searchCustomAvatarItems(
 	if (outfitTypes.length > 0) {
 		where.push(`outfit_type IN (${outfitTypes.map((t) => bind(t)).join(', ')})`)
 	}
-	if (search.includeCoachItems === false) {
+	if (search.includeCoachItems === true) {
+		where.push(`creator_account_id = ${bind(COACH_ACCOUNT_ID)}`)
+	} else if (search.includeCoachItems === false) {
 		where.push(`creator_account_id != ${bind(COACH_ACCOUNT_ID)}`)
 	}
 	if (search.minPrice !== undefined) where.push(`price >= ${bind(search.minPrice)}`)

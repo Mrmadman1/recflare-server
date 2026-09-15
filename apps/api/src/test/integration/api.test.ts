@@ -1149,7 +1149,9 @@ describe('public endpoints', () => {
 				new Date(Date.UTC(2026, 7, 1 + i))
 			)
 			made[name] = created.CustomAvatarItemId
-			// Nothing sets outfit_type on creation yet, so set it straight in the table.
+			// Every created item is a custom shirt (OutfitType 105); this test wants a spread of
+			// slots to filter across, so set them straight in the table.
+			expect(created.OutfitType).toBe(105)
 			await env.DB.prepare(
 				'UPDATE custom_avatar_item SET outfit_type = ?2 WHERE custom_avatar_item_id = ?1'
 			)
@@ -1199,20 +1201,32 @@ describe('public endpoints', () => {
 		expect(await search('?skip=99&take=10')).toEqual([])
 		expect(await search('?take=0')).toEqual([])
 
-		// The client capitalises its booleans (`includeCoachItems=True`), so the comparison folds
-		// case; only a recognisable "false" turns the stock content off.
-		expect((await search('?includeCoachItems=True')).map((i) => i.Name)).toContain('Coach Hat')
-		expect((await search('?includeCoachItems=false')).map((i) => i.Name)).not.toContain('Coach Hat')
+		// `includeCoachItems` picks a SIDE of the catalog rather than widening it: `True` is the
+		// Coach's stock content alone (the storefront tab), `False` the players' alone (the
+		// user-generated-content tab), and the two never overlap. Absent is both. The client
+		// capitalises its booleans, so the comparison folds case.
+		expect((await search('?includeCoachItems=True')).map((i) => i.Name)).toEqual(['Coach Hat'])
+		expect((await search('?includeCoachItems=false')).map((i) => i.Name)).toEqual([
+			'Trousers A',
+			'Shirt B',
+			'Shirt A',
+			'Hat A',
+		])
+		expect((await search('?includeCoachItems=False')).map((i) => i.Name)).not.toContain('Coach Hat')
+		expect((await search('?includeCoachItems=maybe')).map((i) => i.Name)).toEqual(
+			all.map((i) => i.Name)
+		)
 
-		// The whole query the client actually sends, unchanged — the parameters that aren't acted
-		// on yet must be accepted rather than 400 or throw.
+		// The whole storefront query the client actually sends, unchanged — the parameters that
+		// aren't acted on yet must be accepted rather than 400 or throw, and `includeCoachItems=True`
+		// narrows it to the stock content.
 		const real = await search(
 			'?outfitTypes=0&outfitTypes=2&outfitTypes=3&outfitTypes=10&outfitTypes=20&outfitTypes=100' +
 				'&outfitTypes=101&outfitTypes=102&outfitTypes=103&outfitTypes=200&outfitTypes=300' +
 				'&outfitTypes=301&includePurchaseInfos=True&includeCoachItems=True&ordering=0&skip=0' +
 				'&take=100&unityAssetTarget=0&unityAssetVersion=3'
 		)
-		expect(real.map((i) => i.Name)).toEqual(all.map((i) => i.Name))
+		expect(real.map((i) => i.Name)).toEqual(['Coach Hat'])
 		// `includePurchaseInfos=True` notwithstanding: nothing prices a custom item here yet, so
 		// the field is null on every item and the parameter changes nothing.
 		expect(real.every((i) => i.PurchaseInfo === null)).toBe(true)
@@ -1285,17 +1299,18 @@ describe('public endpoints', () => {
 		// Combined with the text search, since the client sends both together.
 		expect(await search('?searchQuery=room&maxPrice=500')).toEqual(['Cosy Beanie', 'Room Hat'])
 
-		// The whole query the client actually sends. `itemTypes` and the unity asset parameters are
-		// accepted and not acted on; `outfitTypes=105` matches nothing, so this is empty — which is
-		// the filter working, not the search failing.
+		// The whole query the client's user-generated-content tab actually sends. `itemTypes=-1`
+		// ("every item type") and the unity asset parameters are accepted and not acted on;
+		// `outfitTypes=105` is the custom shirt, which is what every created item is filed under,
+		// so the tab finds them. (It once found nothing: creation left `outfit_type` at 0.)
 		expect(
 			await search(
 				'?searchQuery=room&itemTypes=-1&outfitTypes=105&minPrice=0&maxPrice=10000' +
 					'&includePurchaseInfos=True&includeCoachItems=False&ordering=0&skip=0&take=1000' +
 					'&unityAssetTarget=0&unityAssetVersion=3'
 			)
-		).toEqual([])
-		// Same query with the outfit-type filter dropped: the rest of it does match.
+		).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+		// Same query with the outfit-type filter dropped matches the same, as it must.
 		expect(
 			await search(
 				'?searchQuery=room&itemTypes=-1&minPrice=0&maxPrice=10000&includePurchaseInfos=True' +
