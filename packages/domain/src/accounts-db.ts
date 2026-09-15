@@ -67,10 +67,23 @@ export interface Account {
 	/** ISO-8601 time of the account's most recent successful login. */
 	lastLoginTime?: string
 	/**
-	 * The client's `device_id` from its most recent login (a stable per-install hash
-	 * the client sends on every /connect/token). Not a credential — the client picks
-	 * it and nothing verifies it — so never authorize on it alone. Kept so accounts
-	 * sharing a device can be found later, e.g. for account linkup.
+	 * The client's `device_id` from its most recent login — a stable per-install hash the
+	 * client sends on every /connect/token, on the account-creating grant and on both
+	 * login grants (but NOT on a refresh, which re-attests nothing).
+	 *
+	 * Not a credential. The client picks it and nothing verifies it, so never authorize on
+	 * it alone; it is a SIGNAL, recorded and read later.
+	 *
+	 * Kept for ban EVASION: an account logging in from the same install as a banned one is
+	 * the sharpest of the linked arms after a proven platform identity, and much narrower
+	 * than the IP arm (a household shares an address, not an install). Nothing consumes it
+	 * yet — see `getAccountsByDeviceId`, and the arms in the api worker's bans-db, which
+	 * this is not one of yet.
+	 *
+	 * ONE value, overwritten each login: this is the account's LAST-SEEN device, not a
+	 * history of every device it has used. So evasion matching on it will catch a player
+	 * who evades from the install they were last banned on, and miss one who has since
+	 * logged the banned account in somewhere else.
 	 */
 	deviceId?: string
 	/** DeviceClass int (2 = PC/standalone) that `deviceId` was last seen on. */

@@ -864,6 +864,74 @@ describe('auth worker routes', () => {
 		expect(row!.data).not.toContain('2.0')
 	})
 
+	// The grant the live client actually logs in with, and the one path whose device
+	// recording had no test — `create_account` and the password grant were both pinned,
+	// cached_login only happened to work. The body is the shape the 2025 client posts (see
+	// the capture the device id below comes from): device_id alongside the platform
+	// attestation, on every sign-in.
+	//
+	// Nothing verifies a device id — the client picks it — so it is recorded and never
+	// authorized on. It is stored for ban EVASION to read later: an account logging in from
+	// the same install as a banned one. See `getAccountsByDeviceId`.
+	test('POST /connect/token cached_login stores the login device on the account', async () => {
+		const metaId = '27061366730201234'
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 5151,
+					username: 'CachedDevicePlayer',
+					platform: 1,
+					platformId: metaId,
+				})
+			)
+			.run()
+		await linkPlatformIdentity(env.DB, 5151, 1, metaId)
+
+		const deviceId = '69640e6ae1b54ae5b0ca8eeb4a8872ec6cf8fd88'
+		const res = await metaLogin(
+			`grant_type=cached_login&account_id=5151&platform=1&platform_id=${metaId}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}` +
+				`&device_id=${deviceId}&device_class=2&isInitialLogin=true&locale=en`,
+			true
+		)
+		expect(res.status).toBe(200)
+
+		const row = await env.DB.prepare('SELECT data FROM account WHERE account_id = ?1')
+			.bind(5151)
+			.first<{ data: string }>()
+		const account = JSON.parse(row!.data) as { deviceId: string; deviceClass: number }
+		expect(account.deviceId).toBe(deviceId)
+		expect(account.deviceClass).toBe(2)
+		// And findable by it, which is the whole reason it is kept.
+		expect((await getAccountsByDeviceId(env.DB, deviceId)).map((a) => a.accountId)).toContain(5151)
+	})
+
+	// A refresh is NOT a login: the client redeems a stored token and re-attests nothing,
+	// so there is no device to believe and the grant records none. Pinned because the
+	// alternative is worse than it looks — trusting a device_id posted alongside a refresh
+	// would let a client move an account's recorded device without ever proving anything,
+	// which is exactly the signal ban evasion is meant to read.
+	test('POST /connect/token refresh_token leaves the recorded device alone', async () => {
+		const first = await postToken(
+			`grant_type=password&username=Player77&password=${LOGIN_PASSWORD}` +
+				'&device_id=dev-77-real&device_class=2'
+		)
+		expect(first.status).toBe(200)
+
+		const refreshed = await postToken(
+			`grant_type=refresh_token&refresh_token=${first.json.refresh_token as string}` +
+				'&device_id=dev-77-spoofed&device_class=9'
+		)
+		expect(refreshed.status).toBe(200)
+
+		const row = await env.DB.prepare('SELECT data FROM account WHERE account_id = ?1')
+			.bind(77)
+			.first<{ data: string }>()
+		const account = JSON.parse(row!.data) as { deviceId: string; deviceClass: number }
+		expect(account.deviceId).toBe('dev-77-real')
+		expect(account.deviceClass).toBe(2)
+	})
+
 	test('POST /connect/token refreshes the stored device on a credential login', async () => {
 		// Account 42 was seeded with no device; a later login records the one it came from.
 		const res = await postToken(
