@@ -262,10 +262,19 @@ const NOT_BLOCKED = {
  * The block details for a ban in force — the `report` row a moderator set `banned` on.
  *
  * `Duration` and `TimeoutStartedAt` are a PAIR in the client: the block runs from the
- * start for the duration. The start is the report's `created_at` — nothing records when
- * the ban itself was handed down, and the report is the record the ban rests on — and the
- * duration is the seconds from there to `ban_expires`, so the two sum to the expiry; or
- * `PERMANENT_BAN_DURATION` when there is none. The category is the one the report was
+ * start for the duration. The start is `banned_at`, the instant the ban was handed down
+ * (see 0020_report_ban_audit.sql), and the duration is the seconds from there to
+ * `ban_expires`, so the two sum to the expiry; or `PERMANENT_BAN_DURATION` when there is
+ * none.
+ *
+ * It falls back to the report's `created_at` for a row banned before that column existed.
+ * The two can be months apart, and using `created_at` as the start — which is what this
+ * did before there was anything else to use — misreports both halves of the pair: a 7-day
+ * ban applied to a 30-day-old report told the player their block began a month ago and
+ * ended three weeks ago. Every pre-migration row still reads exactly as it used to, which
+ * is the point of the fallback rather than a coalesce to now.
+ *
+ * The category is the one the report was
  * filed under, so the client's ban screen names the reason. `Message` is a fixed "Rule
  * violation" rather than the report's `details` — those are the REPORTER's words, and the
  * banned player isn't shown them, for the same reason `PlayerIdReporter` stays null: the
@@ -274,7 +283,8 @@ const NOT_BLOCKED = {
  * screen dressings, none of which this server hands out.
  */
 function banBlockDetails(ban: ReportRow) {
-	const startedAt = Date.parse(ban.created_at)
+	const startedAtIso = ban.banned_at ?? ban.created_at
+	const startedAt = Date.parse(startedAtIso)
 	const duration =
 		ban.ban_expires === null
 			? PERMANENT_BAN_DURATION
@@ -285,7 +295,7 @@ function banBlockDetails(ban: ReportRow) {
 		Duration: duration,
 		IsBan: true,
 		Message: 'Rule violation',
-		TimeoutStartedAt: ban.created_at,
+		TimeoutStartedAt: startedAtIso,
 	}
 }
 
@@ -321,7 +331,9 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				'screen) — so a caller with one in force gets ' +
 				'`IsBan: true`, the `ReportCategory` the report was filed under, the fixed ' +
 				'`Message` “Rule violation”, and the block’s span as the pair the client reads ' +
-				'them as: `TimeoutStartedAt` is the report’s `created_at` and `Duration` the ' +
+				'them as: `TimeoutStartedAt` is when the ban was handed down (`banned_at`, ' +
+				'falling back to the report’s `created_at` for a ban set before that column ' +
+				'existed) and `Duration` the ' +
 				'seconds from there to `ban_expires` (2147483647, the int32 max, for a permanent ' +
 				'ban). ' +
 				'`PlayerIdReporter` stays null: it names a kicking host, and the reporter is not ' +

@@ -7,9 +7,16 @@
  * what a player submitted: the table is a log of exactly what was reported.
  *
  * The `api` worker owns this schema/migration (migrations/0004_report.sql,
- * 0009_report_ban.sql, 0011_report_event.sql, 0016_report_invention.sql and
- * 0017_report_custom_avatar_item.sql, applied under its own `migrations_table` so it
- * doesn't clash with the other workers' migrations that share the database).
+ * 0009_report_ban.sql, 0011_report_event.sql, 0016_report_invention.sql,
+ * 0017_report_custom_avatar_item.sql and 0020_report_ban_audit.sql, applied under its own
+ * `migrations_table` so it doesn't clash with the other workers' migrations that share the
+ * database).
+ *
+ * The moderation-side READS here — `searchReports`, `getTopReported`, `getBansInForce` —
+ * are not called by any endpoint on this worker. They back the staff panel served by
+ * `www` (`/api/staff/*`), which imports them: the endpoints are a recflare addition with
+ * no counterpart in the real service, and those live on `www` rather than on the workers
+ * that reimplement the game's own API. The SQL stays here, with the table that owns it.
  *
  * A reported player EVENT, INVENTION or CUSTOM AVATAR ITEM lands here too, rather than in a
  * table of its own: same fields, same moderation life. Such a row carries `event_id`,
@@ -32,7 +39,8 @@
 
 /**
  * Schema DDL (mirror of migrations/0004_report.sql + 0009_report_ban.sql +
- * 0011_report_event.sql + 0016_report_invention.sql + 0017_report_custom_avatar_item.sql).
+ * 0011_report_event.sql + 0016_report_invention.sql + 0017_report_custom_avatar_item.sql +
+ * 0020_report_ban_audit.sql).
  *
  * None of `event_id`, `invention_id` or `custom_avatar_item_id` is indexed: each is written
  * on every report of its kind and read by nothing — no query here filters on any of them,
@@ -56,7 +64,9 @@ export const SCHEMA_DDL: string[] = [
 		ban_expires TEXT,
 		event_id INTEGER,
 		invention_id INTEGER,
-		custom_avatar_item_id TEXT
+		custom_avatar_item_id TEXT,
+		banned_by_player_id INTEGER,
+		banned_at TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reported ON report (reported_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reporter ON report (reporter_player_id)`,
@@ -103,6 +113,18 @@ export interface ReportRow {
 	 * it does not know who made it.
 	 */
 	custom_avatar_item_id: string | null
+	/**
+	 * The moderator who set `banned` on this row, or NULL when nobody has (and cleared
+	 * again when a ban is lifted). Read per-row by the staff panel; nothing filters on it.
+	 */
+	banned_by_player_id: number | null
+	/**
+	 * ISO-8601 UTC instant the ban was HANDED DOWN — distinct from `created_at`, which is
+	 * when the report was filed, and the two can be months apart. This is what the client's
+	 * block screen counts the ban from (see `banBlockDetails`); rows written before
+	 * 0020_report_ban_audit.sql carry NULL and fall back to `created_at`.
+	 */
+	banned_at: string | null
 }
 
 /**
@@ -159,7 +181,11 @@ export async function createReport(db: D1Database, input: NewReport): Promise<Re
 	return row!
 }
 
-/** Every report filed against a player, newest first. Backs a future moderation view. */
+/**
+ * Every report filed against a player, newest first — unpaged, because it is the whole
+ * history a moderator reads on one account (`www`: `GET /api/staff/players/:id`), not a
+ * feed. `searchReports` is the paged, filtered form for looking across accounts.
+ */
 export async function getReportsAgainst(db: D1Database, playerId: number): Promise<ReportRow[]> {
 	const { results } = await db
 		.prepare('SELECT * FROM report WHERE reported_player_id = ?1 ORDER BY id DESC')
@@ -217,6 +243,12 @@ export async function isPlayerBanned(
  * permanent ban. Passing `banned: false` lifts the ban and clears the expiry, leaving the
  * report itself intact.
  *
+ * `bannedBy` is the acting moderator, and is recorded alongside `banned_at` — the instant
+ * the ban was handed down, which is NOT the report's `created_at` and is what the client's
+ * block screen counts from. A lift clears all four columns together: an unbanned row must
+ * not keep an audit trail saying a ban runs from somewhere, and `banned = 0` with a
+ * `banned_at` still set would read as a ban to anything checking the timestamp.
+ *
  * Returns the updated row, or null when there is no report with that id — so the caller
  * can tell "banned" from "banned nobody" (wrangler's `d1 execute --json` reports no
  * changes count, hence RETURNING).
@@ -224,11 +256,203 @@ export async function isPlayerBanned(
 export async function banFromReport(
 	db: D1Database,
 	reportId: number,
-	options: { banned?: boolean; banExpires?: string | null } = {}
+	options: { banned?: boolean; banExpires?: string | null; bannedBy?: number | null } = {}
 ): Promise<ReportRow | null> {
 	const banned = options.banned ?? true
 	return db
-		.prepare('UPDATE report SET banned = ?2, ban_expires = ?3 WHERE id = ?1 RETURNING *')
-		.bind(reportId, banned ? 1 : 0, banned ? (options.banExpires ?? null) : null)
+		.prepare(
+			`UPDATE report
+			 SET banned = ?2, ban_expires = ?3, banned_by_player_id = ?4, banned_at = ?5
+			 WHERE id = ?1
+			 RETURNING *`
+		)
+		.bind(
+			reportId,
+			banned ? 1 : 0,
+			banned ? (options.banExpires ?? null) : null,
+			banned ? (options.bannedBy ?? null) : null,
+			banned ? new Date().toISOString() : null
+		)
 		.first<ReportRow>()
+}
+
+/**
+ * A page of reports matching a moderator's filters — the staff panel's search
+ * (`www`: `GET /api/staff/reports`).
+ *
+ * Every filter is optional and ANDed; an empty filter set is the whole table, newest
+ * first. `ORDER BY id DESC` rather than by `created_at`: the id is AUTOINCREMENT, so it is
+ * already chronological, and it is the primary key — ordering by the timestamp column,
+ * which is unindexed, would sort the whole result set. The date window is applied to
+ * `created_at` (an ISO-8601 string, so a lexical comparison IS a chronological one) and
+ * `to` is EXCLUSIVE, which is what makes a day-boundary window composable.
+ *
+ * `banned` filters on the FLAG, not on whether a ban is in force: a moderator reviewing
+ * what has been actioned wants the expired ones too (`getBansInForce` is the other
+ * question). The count is a second statement rather than a window function, so the caller
+ * can page without re-deriving the total — it counts the same predicate, unpaged.
+ */
+export interface ReportSearch {
+	reportedPlayerId?: number | null
+	reporterPlayerId?: number | null
+	reportCategory?: number | null
+	/** true = banned rows only, false = unbanned only, null/undefined = both. */
+	banned?: boolean | null
+	/** ISO-8601; inclusive lower bound on `created_at`. */
+	from?: string | null
+	/** ISO-8601; EXCLUSIVE upper bound on `created_at`. */
+	to?: string | null
+}
+
+/** A page of search results, plus how many rows the filters match in total. */
+export interface ReportPage {
+	reports: ReportRow[]
+	total: number
+}
+
+export async function searchReports(
+	db: D1Database,
+	filters: ReportSearch = {},
+	page: { skip?: number; take?: number } = {}
+): Promise<ReportPage> {
+	// Built as a parallel list of clauses and binds so a filter is added in one place and
+	// can't drift between the page query and the count query, which share both.
+	const clauses: string[] = []
+	const binds: Array<number | string> = []
+	const where = (sql: string, value: number | string) => {
+		binds.push(value)
+		clauses.push(sql.replace('?', `?${binds.length}`))
+	}
+
+	if (filters.reportedPlayerId != null) where('reported_player_id = ?', filters.reportedPlayerId)
+	if (filters.reporterPlayerId != null) where('reporter_player_id = ?', filters.reporterPlayerId)
+	if (filters.reportCategory != null) where('report_category = ?', filters.reportCategory)
+	if (filters.banned != null) where('banned = ?', filters.banned ? 1 : 0)
+	if (filters.from) where('created_at >= ?', filters.from)
+	if (filters.to) where('created_at < ?', filters.to)
+
+	const predicate = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
+	// Clamped rather than trusted: `take` reaches this from a query string, and an
+	// unbounded one would hand a moderator's browser the entire table.
+	const take = Math.min(Math.max(page.take ?? 50, 1), 200)
+	const skip = Math.max(page.skip ?? 0, 0)
+
+	const [rows, count] = await db.batch<ReportRow | { total: number }>([
+		db
+			.prepare(
+				`SELECT * FROM report${predicate} ORDER BY id DESC LIMIT ?${binds.length + 1} OFFSET ?${binds.length + 2}`
+			)
+			.bind(...binds, take, skip),
+		db.prepare(`SELECT COUNT(*) AS total FROM report${predicate}`).bind(...binds),
+	])
+
+	return {
+		reports: rows.results as ReportRow[],
+		total: (count.results as Array<{ total: number }>)[0]?.total ?? 0,
+	}
+}
+
+/** One report by id, or null. The detail behind a search row. */
+export async function getReportById(db: D1Database, reportId: number): Promise<ReportRow | null> {
+	return db.prepare('SELECT * FROM report WHERE id = ?1').bind(reportId).first<ReportRow>()
+}
+
+/** A player who has collected reports, as the staff panel's triage list shows them. */
+export interface ReportedPlayerTally {
+	playerId: number
+	/** Reports filed against them inside the window. */
+	reports: number
+	/**
+	 * How many DIFFERENT accounts filed those reports. The number that actually means
+	 * something: one player filing forty reports against someone they are feuding with
+	 * should not outrank four unconnected players filing one each.
+	 */
+	distinctReporters: number
+	/** `created_at` of the most recent report in the window. */
+	lastReportAt: string
+	/** Whether a ban is in force against them right now — so the list can skip the done ones. */
+	bannedNow: boolean
+}
+
+/**
+ * The players with the most reports against them — the staff panel's triage list
+ * (`www`: `GET /api/staff/reports/top-reported`).
+ *
+ * WINDOWED by default (30 days), because the unwindowed version ossifies: an account that
+ * collected reports a year ago and stopped would sit at the top forever, above whoever is
+ * a problem this week. Pass `sinceDays: null` for all time.
+ *
+ * Ranked by distinct reporters FIRST and raw count second, for the reason
+ * `distinctReporters` exists at all. `minReports` keeps the long tail of single reports
+ * out — almost every report is a one-off, and a list of them is not a triage list.
+ *
+ * `GROUP BY reported_player_id` rides `idx_report_reported`. The in-force ban is decided
+ * in the same statement (a correlated EXISTS over the partial `idx_report_banned`) rather
+ * than with a round trip per player.
+ */
+export async function getTopReported(
+	db: D1Database,
+	options: { sinceDays?: number | null; minReports?: number; take?: number; now?: Date } = {}
+): Promise<ReportedPlayerTally[]> {
+	const now = options.now ?? new Date()
+	const sinceDays = options.sinceDays === undefined ? 30 : options.sinceDays
+	// An all-time window is expressed as a floor no timestamp can precede, so the SQL keeps
+	// one shape rather than growing a second predicate.
+	const since =
+		sinceDays === null
+			? '0000-01-01T00:00:00.000Z'
+			: new Date(now.getTime() - sinceDays * 86_400_000).toISOString()
+	const minReports = Math.max(options.minReports ?? 3, 1)
+	const take = Math.min(Math.max(options.take ?? 50, 1), 200)
+
+	const { results } = await db
+		.prepare(
+			`SELECT
+				r.reported_player_id AS playerId,
+				COUNT(*) AS reports,
+				COUNT(DISTINCT r.reporter_player_id) AS distinctReporters,
+				MAX(r.created_at) AS lastReportAt,
+				EXISTS (
+					SELECT 1 FROM report b
+					WHERE b.reported_player_id = r.reported_player_id AND b.banned = 1
+						AND (b.ban_expires IS NULL OR b.ban_expires > ?2)
+				) AS bannedNow
+			 FROM report r
+			 WHERE r.created_at >= ?1
+			 GROUP BY r.reported_player_id
+			 HAVING COUNT(*) >= ?3
+			 ORDER BY distinctReporters DESC, reports DESC, lastReportAt DESC
+			 LIMIT ?4`
+		)
+		.bind(since, now.toISOString(), minReports, take)
+		.all<Omit<ReportedPlayerTally, 'bannedNow'> & { bannedNow: number }>()
+
+	return results.map((row) => ({ ...row, bannedNow: row.bannedNow === 1 }))
+}
+
+/**
+ * Every ban in force right now, longest-lasting first — the staff panel's standing-bans
+ * list (`www`: `GET /api/staff/bans`).
+ *
+ * "In force" is `getActiveBan`'s test applied to the whole table rather than to one
+ * player: a row whose `ban_expires` has passed has served its time and is not listed,
+ * though it stays as the record that it happened. A player with several in force appears
+ * once per ban — each is a separate report, and which report justified which ban is the
+ * point of the list.
+ */
+export async function getBansInForce(
+	db: D1Database,
+	now: Date = new Date(),
+	take = 200
+): Promise<ReportRow[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT * FROM report
+			 WHERE banned = 1 AND (ban_expires IS NULL OR ban_expires > ?1)
+			 ORDER BY ban_expires IS NOT NULL, ban_expires DESC, id DESC
+			 LIMIT ?2`
+		)
+		.bind(now.toISOString(), Math.min(Math.max(take, 1), 500))
+		.all<ReportRow>()
+	return results
 }

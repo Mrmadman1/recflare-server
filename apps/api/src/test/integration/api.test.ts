@@ -47,9 +47,13 @@ import {
 	banFromReport,
 	createReport,
 	getActiveBan,
+	getBansInForce,
+	getReportById,
 	getReportsAgainst,
+	getTopReported,
 	isPlayerBanned,
 	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
+	searchReports,
 } from '../../reports-db'
 import {
 	CheerCategory,
@@ -4677,6 +4681,183 @@ describe('player reports', () => {
 		expect(await banFromReport(env.DB, 999_999)).toBeNull()
 	})
 
+	// The audit trail 0020 added: who handed the ban down, and when. `banned_at` is not
+	// bookkeeping — it is what the client's block screen counts the ban from (see
+	// `banBlockDetails`), which is why a lift has to clear it along with the flag.
+	test('banFromReport records the acting moderator and the instant it landed', async () => {
+		await submit({ PlayerIdReported: '216' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 216)
+		// An unactioned report carries neither.
+		expect(row).toMatchObject({ banned_by_player_id: null, banned_at: null })
+
+		const before = Date.now()
+		const banned = await banFromReport(env.DB, row!.id, { bannedBy: 9001 })
+		expect(banned!.banned_by_player_id).toBe(9001)
+		expect(Date.parse(banned!.banned_at!)).toBeGreaterThanOrEqual(before)
+		// Stamped by the write, so it is the ban's own time rather than the report's.
+		expect(banned!.banned_at).not.toBe(row!.created_at)
+
+		// A lift clears all four together. Leaving `banned_at` behind on an unbanned row
+		// would read as a ban to anything checking the timestamp.
+		const lifted = await banFromReport(env.DB, row!.id, { banned: false })
+		expect(lifted).toMatchObject({
+			banned: 0,
+			ban_expires: null,
+			banned_by_player_id: null,
+			banned_at: null,
+		})
+	})
+
+	// The moderation READS — searchReports / getTopReported / getBansInForce. No endpoint
+	// on this worker calls them: they back the staff panel `www` serves (`/api/staff/*`),
+	// which imports them, because the panel is a recflare addition with no counterpart in
+	// the real service while the SQL belongs with the table. Tested here, where the table
+	// and its migrations live.
+	describe('moderation reads', () => {
+		test('searchReports filters, orders newest-first and counts the full match', async () => {
+			const target = 3300
+			await createReport(env.DB, {
+				reporterPlayerId: 3301,
+				reportedPlayerId: target,
+				reportCategory: 101,
+				details: 'one',
+			})
+			await createReport(env.DB, {
+				reporterPlayerId: 3302,
+				reportedPlayerId: target,
+				reportCategory: 102,
+				details: 'two',
+			})
+			await createReport(env.DB, { reporterPlayerId: 3301, reportedPlayerId: 3399 })
+
+			const byPlayer = await searchReports(env.DB, { reportedPlayerId: target })
+			expect(byPlayer.total).toBe(2)
+			// `ORDER BY id DESC` — the id is AUTOINCREMENT, so it is already chronological
+			// and is the primary key, where `created_at` is unindexed.
+			expect(byPlayer.reports.map((r) => r.details)).toEqual(['two', 'one'])
+
+			expect((await searchReports(env.DB, { reporterPlayerId: 3302 })).total).toBe(1)
+			expect(
+				(await searchReports(env.DB, { reportedPlayerId: target, reportCategory: 101 })).total
+			).toBe(1)
+
+			// `take` pages the ROWS; `total` stays the unpaged count of the same predicate, so
+			// a pager can say "3–4 of 9" without asking twice.
+			const page = await searchReports(env.DB, { reportedPlayerId: target }, { take: 1 })
+			expect(page.reports).toHaveLength(1)
+			expect(page.total).toBe(2)
+		})
+
+		test('searchReports filters on the ban FLAG, expired bans included', async () => {
+			const report = await createReport(env.DB, {
+				reporterPlayerId: 3311,
+				reportedPlayerId: 3310,
+			})
+			// Banned, and the ban has since run out — so it is not in force, but it IS a
+			// report that was actioned, which is what a moderator reviewing their own work
+			// is looking for.
+			await banFromReport(env.DB, report.id, { banExpires: '2020-01-01T00:00:00.000Z' })
+
+			expect((await searchReports(env.DB, { reportedPlayerId: 3310, banned: true })).total).toBe(1)
+			expect((await searchReports(env.DB, { reportedPlayerId: 3310, banned: false })).total).toBe(0)
+			// An omitted filter is BOTH, not false.
+			expect((await searchReports(env.DB, { reportedPlayerId: 3310 })).total).toBe(1)
+		})
+
+		test('searchReports windows on created_at, with an exclusive upper bound', async () => {
+			const report = await createReport(env.DB, {
+				reporterPlayerId: 3321,
+				reportedPlayerId: 3320,
+			})
+			const filed = '2024-06-15T12:00:00.000Z'
+			await env.DB.prepare('UPDATE report SET created_at = ?2 WHERE id = ?1')
+				.bind(report.id, filed)
+				.run()
+
+			const inWindow = await searchReports(env.DB, {
+				reportedPlayerId: 3320,
+				from: '2024-06-01T00:00:00.000Z',
+				to: '2024-07-01T00:00:00.000Z',
+			})
+			expect(inWindow.total).toBe(1)
+
+			// `from` is inclusive, `to` exclusive — which is what makes day-boundary windows
+			// composable rather than double-counting the row on the seam.
+			expect((await searchReports(env.DB, { reportedPlayerId: 3320, from: filed })).total).toBe(1)
+			expect((await searchReports(env.DB, { reportedPlayerId: 3320, to: filed })).total).toBe(0)
+		})
+
+		test('getTopReported ranks distinct reporters ahead of raw count', async () => {
+			// Four reports from one person, against one player…
+			for (let i = 0; i < 4; i++) {
+				await createReport(env.DB, { reporterPlayerId: 3331, reportedPlayerId: 3330 })
+			}
+			// …and three reports from three different people, against another.
+			for (const reporter of [3341, 3342, 3343]) {
+				await createReport(env.DB, { reporterPlayerId: reporter, reportedPlayerId: 3340 })
+			}
+
+			const rows = await getTopReported(env.DB, { minReports: 3 })
+			const feud = rows.find((r) => r.playerId === 3330)
+			const real = rows.find((r) => r.playerId === 3340)
+			expect(feud).toMatchObject({ reports: 4, distinctReporters: 1 })
+			expect(real).toMatchObject({ reports: 3, distinctReporters: 3 })
+			// Fewer reports, but from more people — so ahead. One player filing twenty
+			// reports about someone they are feuding with must not top the queue.
+			expect(rows.indexOf(real!)).toBeLessThan(rows.indexOf(feud!))
+		})
+
+		test('getTopReported windows, thresholds, and flags a ban in force', async () => {
+			for (const reporter of [3351, 3352, 3353]) {
+				await createReport(env.DB, { reporterPlayerId: reporter, reportedPlayerId: 3350 })
+			}
+			// Backdate them all a year, so only an all-time read sees them. The default
+			// window is 30 days precisely so the queue is who is a problem NOW — an account
+			// that collected reports last year and stopped would otherwise sit at the top
+			// forever.
+			await env.DB.prepare('UPDATE report SET created_at = ?1 WHERE reported_player_id = 3350')
+				.bind(new Date(Date.now() - 365 * 86_400_000).toISOString())
+				.run()
+
+			expect(
+				(await getTopReported(env.DB, { minReports: 1 })).map((r) => r.playerId)
+			).not.toContain(3350)
+			const allTime = await getTopReported(env.DB, { sinceDays: null, minReports: 1 })
+			expect(allTime.map((r) => r.playerId)).toContain(3350)
+			expect(allTime.find((r) => r.playerId === 3350)?.bannedNow).toBe(false)
+
+			// A ban in force is decided in the same statement, so the queue can skip the
+			// ones already dealt with.
+			const [row] = await getReportsAgainst(env.DB, 3350)
+			await banFromReport(env.DB, row!.id)
+			const banned = await getTopReported(env.DB, { sinceDays: null, minReports: 1 })
+			expect(banned.find((r) => r.playerId === 3350)?.bannedNow).toBe(true)
+		})
+
+		test('getBansInForce lists in-force bans only, and getReportById reads one row', async () => {
+			const permanent = await createReport(env.DB, {
+				reporterPlayerId: 3361,
+				reportedPlayerId: 3360,
+			})
+			const expired = await createReport(env.DB, {
+				reporterPlayerId: 3363,
+				reportedPlayerId: 3362,
+			})
+			await banFromReport(env.DB, permanent.id, { bannedBy: 9002 })
+			await banFromReport(env.DB, expired.id, { banExpires: '2020-01-01T00:00:00.000Z' })
+
+			const ids = (await getBansInForce(env.DB)).map((b) => b.id)
+			expect(ids).toContain(permanent.id)
+			// A ban that has served its time is not in force, though the row stays as the
+			// record that it happened — the same rule `getActiveBan` applies.
+			expect(ids).not.toContain(expired.id)
+
+			const one = await getReportById(env.DB, permanent.id)
+			expect(one).toMatchObject({ id: permanent.id, banned: 1, banned_by_player_id: 9002 })
+			expect(await getReportById(env.DB, 999_999)).toBeNull()
+		})
+	})
+
 	// What the banned player is TOLD. The block screen reads this; it's the same row
 	// matchmake and login refuse on, described rather than merely enforced.
 	describe('moderationBlockDetails', () => {
@@ -4729,16 +4910,16 @@ describe('player reports', () => {
 		})
 
 		// Duration and TimeoutStartedAt are a pair in the client — the block runs from the
-		// start for the duration. The start is the report's created_at (nothing records when
-		// the ban itself landed), and a permanent ban runs for the largest span the int
-		// holds.
+		// start for the duration. The start is `banned_at`, the instant the ban was handed
+		// down (see 0020_report_ban_audit.sql), NOT the report's created_at: the two can be
+		// months apart. A permanent ban runs for the largest span the int holds.
 		test('describes a permanent ban', async () => {
 			await submit(
 				{ PlayerIdReported: '221', ReportCategory: '102', Details: 'slurs' },
 				await bearer()
 			)
 			const [row] = await getReportsAgainst(env.DB, 221)
-			await banFromReport(env.DB, row!.id)
+			const banned = await banFromReport(env.DB, row!.id)
 
 			expect(await details('POST', '221')).toEqual({
 				...NOT_BLOCKED,
@@ -4749,21 +4930,79 @@ describe('player reports', () => {
 				// the reporter is not shown to the player they reported (PlayerIdReporter
 				// stays null).
 				Message: 'Rule violation',
-				TimeoutStartedAt: row!.created_at,
+				TimeoutStartedAt: banned!.banned_at,
 			})
 		})
 
 		// A timed ban's Duration is the seconds from the start to the expiry, so the pair
 		// sums to `ban_expires` — not the seconds left as of the request.
-		test('describes a timed ban as its report’s created_at plus the span to expiry', async () => {
+		test('describes a timed ban as its banned_at plus the span to expiry', async () => {
 			await submit({ PlayerIdReported: '222', ReportCategory: '103' }, await bearer())
 			const [row] = await getReportsAgainst(env.DB, 222)
-			const banExpires = new Date(Date.parse(row!.created_at) + 3600 * 1000)
-			await banFromReport(env.DB, row!.id, { banExpires: banExpires.toISOString() })
+			// The expiry is set relative to NOW, which is what a moderator handing down a
+			// one-hour ban means — and now is `banned_at`, not the report's created_at.
+			const banExpires = new Date(Date.now() + 3600 * 1000)
+			const banned = await banFromReport(env.DB, row!.id, {
+				banExpires: banExpires.toISOString(),
+			})
 
-			expect(await details('GET', '222')).toEqual({
-				...NOT_BLOCKED,
+			// `Duration` is asserted as a range below, so it is left out of the object match
+			// — NOT_BLOCKED carries a 0 for it, which would win over the real value.
+			const { Duration: _duration, ...unblocked } = NOT_BLOCKED
+			const body = (await details('GET', '222')) as Record<string, unknown>
+			expect(body).toMatchObject({
+				...unblocked,
 				ReportCategory: 103,
+				IsBan: true,
+				Message: 'Rule violation',
+				TimeoutStartedAt: banned!.banned_at,
+			})
+			// Within a second of the hour: `banned_at` is stamped by the write, so the span
+			// is the hour minus however long the write took.
+			expect(body.Duration).toBeGreaterThan(3595)
+			expect(body.Duration).toBeLessThanOrEqual(3600)
+		})
+
+		// The whole point of `banned_at`: a ban applied to an OLD report used to be
+		// described as having started when the report was filed, so a 7-day ban on a
+		// month-old report told the player their block began a month ago — and the duration,
+		// measured from there, came out as already served. Both halves of the pair now
+		// start from the ban.
+		test('counts a ban from when it was handed down, not from when the report was filed', async () => {
+			await submit({ PlayerIdReported: '224', ReportCategory: '102' }, await bearer())
+			const [row] = await getReportsAgainst(env.DB, 224)
+			// Backdate the report a month, as if it had sat in the queue.
+			const filed = new Date(Date.now() - 30 * 86_400_000).toISOString()
+			await env.DB.prepare('UPDATE report SET created_at = ?2 WHERE id = ?1')
+				.bind(row!.id, filed)
+				.run()
+
+			const banned = await banFromReport(env.DB, row!.id, {
+				banExpires: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+			})
+			const body = (await details('GET', '224')) as Record<string, unknown>
+			expect(body.TimeoutStartedAt).toBe(banned!.banned_at)
+			expect(body.TimeoutStartedAt).not.toBe(filed)
+			// Seven days, not the negative-then-clamped span the report's date would give.
+			expect(body.Duration).toBeGreaterThan(7 * 86_400 - 5)
+			expect(body.Duration).toBeLessThanOrEqual(7 * 86_400)
+		})
+
+		// A row banned BEFORE 0020 added the column carries no `banned_at`, and must keep
+		// reading exactly as it used to rather than falling back to "now" — which would
+		// silently restart every standing ban the moment this shipped.
+		test('falls back to created_at for a ban with no recorded banned_at', async () => {
+			await submit({ PlayerIdReported: '225', ReportCategory: '101' }, await bearer())
+			const [row] = await getReportsAgainst(env.DB, 225)
+			await env.DB.prepare(
+				`UPDATE report SET banned = 1, ban_expires = ?2, banned_at = NULL WHERE id = ?1`
+			)
+				.bind(row!.id, new Date(Date.parse(row!.created_at) + 3600 * 1000).toISOString())
+				.run()
+
+			expect(await details('GET', '225')).toEqual({
+				...NOT_BLOCKED,
+				ReportCategory: 101,
 				Duration: 3600,
 				IsBan: true,
 				Message: 'Rule violation',

@@ -3,9 +3,20 @@ import { beforeAll, expect, it } from 'vitest'
 
 import { SCHEMA_DDL as ACCOUNT_SCHEMA_DDL, updateAccount } from '@repo/domain/src/accounts-db'
 import { PlatformType } from '@repo/domain/src/enums'
-import { PRESENCE_SCHEMA_DDL, PRESENCE_TTL_SECONDS } from '@repo/domain/src/presence-db'
+import {
+	PRESENCE_SCHEMA_DDL,
+	PRESENCE_TTL_SECONDS,
+	setPresence,
+} from '@repo/domain/src/presence-db'
+import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 import { generateToken } from '@repo/jwt'
 
+import {
+	createReport,
+	getReportById,
+	SCHEMA_DDL as REPORT_SCHEMA_DDL,
+} from '../../../../api/src/reports-db'
+import { createWarning, SCHEMA_DDL as WARNING_SCHEMA_DDL } from '../../../../api/src/warnings-db'
 import {
 	CACHED_LOGIN_PLATFORMS,
 	countAccountsForPlatformIdentity,
@@ -38,8 +49,15 @@ const TEST_SECRET_KEY = '1x0000000000000000000000000000000AA'
 const TEST_JWT_SECRET = 'test-jwt-secret'
 
 /** A bearer token for `accountId`, signed the way `auth` signs one. */
-const tokenFor = (accountId: number): Promise<string> =>
-	generateToken(String(accountId), '', 4, TEST_JWT_SECRET)
+const tokenFor = (accountId: number, roles: string[] = []): Promise<string> =>
+	generateToken(String(accountId), '', 4, TEST_JWT_SECRET, roles)
+
+/**
+ * A STAFF token — one carrying the `moderator` role, as `auth` stamps it from an
+ * account's isModerator flag. The whole moderation surface is gated on this and nothing
+ * else, so a test that forgets it is testing the 403.
+ */
+const staffToken = (accountId: number): Promise<string> => tokenFor(accountId, ['moderator'])
 
 // A Discord app that is HALF configured: credentials seeded below, but wrangler.jsonc
 // leaves DISCORD_GUILD_ID / DISCORD_BENEFITS_ROLE_IDS empty. This is deliberately the most
@@ -63,6 +81,12 @@ beforeAll(async () => {
 	for (const stmt of ACCOUNT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// And `platform_account`, where a claimed Discord identity is linked.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// `report` and `warning` are owned (and migrated) by `api`; www serves the staff panel
+	// over them, so the tables have to exist here too. `room_instance` comes with them
+	// because a ban ejects the banned player from the instance they're standing in.
+	for (const stmt of REPORT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of WARNING_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -562,4 +586,444 @@ it('serves the privacy policy as real server-rendered HTML', async () => {
 	expect(html).toContain(DISCORD_INVITE)
 	expect(html).toContain(ISSUES_URL)
 	if (PRIVACY_EMAIL) expect(html).toContain(`mailto:${PRIVACY_EMAIL}`)
+})
+
+// ---- Staff moderation panel -------------------------------------------------
+//
+// The `/api/staff/*` endpoints behind the `/moderation` page (see src/staff.ts). These
+// are recflare's own surface — no Rec Room client calls them — which is why they live on
+// `www` rather than on the workers that reimplement the game's API.
+//
+// The gate is the whole security model here: every route reads and writes moderation
+// state for any account, so the tests below pin BOTH refusals (no token, and a valid
+// token without a staff role) as carefully as they pin the happy paths.
+
+/** GET a staff endpoint as `accountId`, with or without the staff role. */
+async function staffGet(path: string, accountId: number, roles: string[] = ['moderator']) {
+	return SELF.fetch(`https://example.com${path}`, {
+		headers: { authorization: `Bearer ${await tokenFor(accountId, roles)}` },
+	})
+}
+
+/** POST a JSON body to a staff endpoint as a moderator. */
+async function staffPost(path: string, accountId: number, body: unknown) {
+	return SELF.fetch(`https://example.com${path}`, {
+		method: 'POST',
+		headers: {
+			authorization: `Bearer ${await staffToken(accountId)}`,
+			'content-type': 'application/json',
+		},
+		body: JSON.stringify(body),
+	})
+}
+
+// Two refusals, not one. A 401 is an expired session — the SPA drops the token and sends
+// the player to sign in — while a 403 is a signed-in player who simply isn't staff, and
+// looping THEM through a sign-in would change nothing. Every route is checked, because
+// the gate is middleware and a route registered outside it would be wide open.
+it('refuses every staff endpoint without a token, and without a staff role', async () => {
+	const paths = [
+		'/api/staff/reports',
+		'/api/staff/reports/top-reported',
+		'/api/staff/reports/1',
+		'/api/staff/bans',
+		'/api/staff/players/1',
+		'/api/staff/players/1/linked',
+	]
+
+	for (const path of paths) {
+		expect((await SELF.fetch(`https://example.com${path}`)).status).toBe(401)
+		// A valid token whose `role` claim is a plain player's.
+		expect((await staffGet(path, 8101, ['gameClient'])).status).toBe(403)
+	}
+
+	// The writes too, on the same terms.
+	const unauthed = await SELF.fetch('https://example.com/api/staff/reports', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ reportedPlayerId: 8102 }),
+	})
+	expect(unauthed.status).toBe(401)
+
+	const player = await SELF.fetch('https://example.com/api/staff/reports/1/ban', {
+		method: 'POST',
+		headers: {
+			authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}`,
+			'content-type': 'application/json',
+		},
+		body: JSON.stringify({ banned: true, days: 1 }),
+	})
+	expect(player.status).toBe(403)
+})
+
+// The reporter is the CALLER, never a body field — that is the record of who raised a
+// hand-written report, and it is why nothing marks these rows as staff-created.
+it('files a minimal report as the acting moderator', async () => {
+	const res = await staffPost('/api/staff/reports', 8110, {
+		reportedPlayerId: 8111,
+		reportCategory: 102,
+		details: 'Seen in a log',
+		roomId: 991,
+	})
+	expect(res.status).toBe(200)
+	const report = (await res.json()) as Record<string, unknown>
+	expect(report.reporter_player_id).toBe(8110)
+	expect(report.reported_player_id).toBe(8111)
+	expect(report.report_category).toBe(102)
+	expect(report.details).toBe('Seen in a log')
+	expect(report.room_id).toBe(991)
+	// Filed unbanned: a report is not a ban, and the ban is a separate decision.
+	expect(report.banned).toBe(0)
+	expect(report.banned_at).toBeNull()
+	expect(report.banned_by_player_id).toBeNull()
+})
+
+it('refuses a report with no player, and one a moderator files against themselves', async () => {
+	expect((await staffPost('/api/staff/reports', 8110, {})).status).toBe(400)
+	// The self-report is a mistake every time, and the ban it would justify locks the
+	// panel's own operator out of the game.
+	expect((await staffPost('/api/staff/reports', 8110, { reportedPlayerId: 8110 })).status).toBe(400)
+})
+
+// The search is the panel's way into the log, so each filter is pinned separately: a
+// filter that quietly doesn't apply looks like "no reports of that kind" rather than an
+// error, which is the failure a moderator would act on.
+it('searches reports by player, by reporter and by ban state', async () => {
+	const target = 8120
+	await createReport(env.DB, {
+		reporterPlayerId: 8121,
+		reportedPlayerId: target,
+		reportCategory: 101,
+		details: 'first',
+	})
+	await createReport(env.DB, {
+		reporterPlayerId: 8122,
+		reportedPlayerId: target,
+		reportCategory: 102,
+		details: 'second',
+	})
+	await createReport(env.DB, { reporterPlayerId: 8121, reportedPlayerId: 8123, details: 'other' })
+
+	const byPlayer = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}`, 8110)
+	).json()) as { reports: Array<{ details: string }>; total: number }
+	// Newest first, and only the two against this player.
+	expect(byPlayer.total).toBe(2)
+	expect(byPlayer.reports.map((r) => r.details)).toEqual(['second', 'first'])
+
+	const byReporter = (await (
+		await staffGet('/api/staff/reports?reporterPlayerId=8122', 8110)
+	).json()) as { total: number }
+	expect(byReporter.total).toBe(1)
+
+	const byCategory = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}&reportCategory=101`, 8110)
+	).json()) as { reports: Array<{ details: string }> }
+	expect(byCategory.reports.map((r) => r.details)).toEqual(['first'])
+
+	// An ABSENT `banned` param must not read as `false` — that would hide every actioned
+	// report from an unfiltered search, which is most of what a moderator looks for.
+	const unfiltered = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}`, 8110)
+	).json()) as { total: number }
+	expect(unfiltered.total).toBe(2)
+	const unbanned = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}&banned=false`, 8110)
+	).json()) as { total: number }
+	expect(unbanned.total).toBe(2)
+	const banned = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}&banned=true`, 8110)
+	).json()) as { total: number }
+	expect(banned.total).toBe(0)
+})
+
+// `total` is the unpaged count of the same predicate, so the pager can say "26–50 of 120"
+// without re-deriving it — and a page smaller than the count is not the end of the list.
+it('pages the search, reporting the full match count alongside the page', async () => {
+	const target = 8130
+	for (let i = 0; i < 5; i++) {
+		await createReport(env.DB, {
+			reporterPlayerId: 8131,
+			reportedPlayerId: target,
+			details: `r${i}`,
+		})
+	}
+
+	const first = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}&take=2`, 8110)
+	).json()) as { reports: Array<{ details: string }>; total: number }
+	expect(first.total).toBe(5)
+	expect(first.reports.map((r) => r.details)).toEqual(['r4', 'r3'])
+
+	const second = (await (
+		await staffGet(`/api/staff/reports?reportedPlayerId=${target}&take=2&skip=2`, 8110)
+	).json()) as { reports: Array<{ details: string }>; total: number }
+	expect(second.total).toBe(5)
+	expect(second.reports.map((r) => r.details)).toEqual(['r2', 'r1'])
+})
+
+// Ranked by DISTINCT reporters ahead of raw count. One player filing twenty reports
+// against someone they're feuding with is a different thing from twenty players filing
+// one each, and a queue that can't tell them apart puts the feud at the top.
+it('ranks the report queue by distinct reporters, not by raw count', async () => {
+	const feud = 8140
+	const real = 8141
+	// Four reports, all from the same person.
+	for (let i = 0; i < 4; i++) {
+		await createReport(env.DB, { reporterPlayerId: 8142, reportedPlayerId: feud })
+	}
+	// Three reports, three different people.
+	for (const reporter of [8143, 8144, 8145]) {
+		await createReport(env.DB, { reporterPlayerId: reporter, reportedPlayerId: real })
+	}
+
+	const rows = (await (
+		await staffGet('/api/staff/reports/top-reported?minReports=3', 8110)
+	).json()) as Array<{ playerId: number; reports: number; distinctReporters: number }>
+
+	const feudRow = rows.find((r) => r.playerId === feud)
+	const realRow = rows.find((r) => r.playerId === real)
+	expect(feudRow).toMatchObject({ reports: 4, distinctReporters: 1 })
+	expect(realRow).toMatchObject({ reports: 3, distinctReporters: 3 })
+	// Fewer reports, more reporters — and so ahead of the feud in the list.
+	expect(rows.indexOf(realRow!)).toBeLessThan(rows.indexOf(feudRow!))
+})
+
+it('keeps the long tail of single reports out of the queue', async () => {
+	await createReport(env.DB, { reporterPlayerId: 8151, reportedPlayerId: 8150 })
+	const rows = (await (
+		await staffGet('/api/staff/reports/top-reported?minReports=3', 8110)
+	).json()) as Array<{ playerId: number }>
+	expect(rows.map((r) => r.playerId)).not.toContain(8150)
+
+	// …but it is a threshold, not a rule: a moderator can lower it.
+	const all = (await (
+		await staffGet('/api/staff/reports/top-reported?minReports=1', 8110)
+	).json()) as Array<{ playerId: number }>
+	expect(all.map((r) => r.playerId)).toContain(8150)
+})
+
+// The ban: a duration in, an expiry stored, and the audit trail that 0020 added. The
+// duration matters because `banned_at` is what the client's block screen counts the ban
+// from — see `banBlockDetails`.
+it('bans from a report, recording who did it and when', async () => {
+	const report = await createReport(env.DB, {
+		reporterPlayerId: 8161,
+		reportedPlayerId: 8160,
+		reportCategory: 102,
+	})
+	const before = Date.now()
+
+	const res = await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, {
+		banned: true,
+		days: 7,
+	})
+	expect(res.status).toBe(200)
+	const banned = (await res.json()) as Record<string, unknown>
+
+	expect(banned.banned).toBe(1)
+	expect(banned.banned_by_player_id).toBe(8110)
+	expect(Date.parse(banned.banned_at as string)).toBeGreaterThanOrEqual(before)
+	// Seven days out, give or take the test's own runtime.
+	const expires = Date.parse(banned.ban_expires as string)
+	expect(expires - Date.parse(banned.banned_at as string)).toBeCloseTo(7 * 86_400_000, -4)
+
+	// And it shows up as a ban in force, which is a different question from `banned = 1`.
+	const bans = (await (await staffGet('/api/staff/bans', 8110)).json()) as Array<{ id: number }>
+	expect(bans.map((b) => b.id)).toContain(report.id)
+})
+
+it('bans permanently when asked, and refuses a duration in the past', async () => {
+	const report = await createReport(env.DB, { reporterPlayerId: 8171, reportedPlayerId: 8170 })
+
+	const permanent = await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, {
+		banned: true,
+		permanent: true,
+	})
+	expect(permanent.status).toBe(200)
+	// NULL is what records "never lifts" — not a far-future date.
+	expect(((await permanent.json()) as Record<string, unknown>).ban_expires).toBeNull()
+
+	// An expiry that was ASKED for but can't be honoured is refused rather than quietly
+	// becoming a permanent ban — the one mistake here that waiting cannot undo.
+	const past = await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, {
+		banned: true,
+		expires: '2001-01-01T00:00:00.000Z',
+	})
+	expect(past.status).toBe(400)
+	const nonsense = await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, {
+		banned: true,
+		expires: 'next tuesday',
+	})
+	expect(nonsense.status).toBe(400)
+})
+
+// A lift has to leave the row distinguishable from an EXPIRED ban (banned = 0 versus a
+// past ban_expires), and must not leave an audit trail saying a ban runs from somewhere.
+it('lifts a ban, clearing the expiry and the audit columns but keeping the report', async () => {
+	const report = await createReport(env.DB, {
+		reporterPlayerId: 8181,
+		reportedPlayerId: 8180,
+		details: 'still on file',
+	})
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+
+	const lifted = await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { banned: false })
+	expect(lifted.status).toBe(200)
+	const row = (await lifted.json()) as Record<string, unknown>
+	expect(row.banned).toBe(0)
+	expect(row.ban_expires).toBeNull()
+	expect(row.banned_at).toBeNull()
+	expect(row.banned_by_player_id).toBeNull()
+	// The report itself survives — it is the record of what was reported, not of the ban.
+	expect(row.details).toBe('still on file')
+
+	const bans = (await (await staffGet('/api/staff/bans', 8110)).json()) as Array<{ id: number }>
+	expect(bans.map((b) => b.id)).not.toContain(report.id)
+})
+
+it('answers a ban on a report that does not exist with a 404', async () => {
+	expect((await staffPost('/api/staff/reports/99999/ban', 8110, { days: 1 })).status).toBe(404)
+	expect((await staffGet('/api/staff/reports/99999', 8110)).status).toBe(404)
+})
+
+// Without this a ban only bites on the player's NEXT matchmake: `match` refuses a banned
+// player, but nothing revisits a session already in progress, so someone banned
+// mid-session keeps playing until they leave on their own.
+it('throws a banned player out of the instance they are standing in', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+
+	await setPresence(env.DB, {
+		accountId: 8190,
+		roomInstance: { roomInstanceId: 77001 },
+		statusVisibility: 0,
+		deviceClass: 0,
+		vrMovementMode: 0,
+		platform: 4,
+		appVersion: 'test',
+	})
+	const report = await createReport(env.DB, { reporterPlayerId: 8191, reportedPlayerId: 8190 })
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 3 })).status).toBe(
+		200
+	)
+
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerIds?: number[]
+		ephemeral?: boolean
+		notificationType: number | string
+		data: Record<string, unknown>
+	}>
+	expect(frames).toHaveLength(1)
+	expect(frames[0].playerIds).toEqual([8190])
+	// EPHEMERAL: a kick is true of the moment it happened. Queued and delivered on a later
+	// connect it would eject them from an unrelated session.
+	expect(frames[0].ephemeral).toBe(true)
+	// `IsBan` is what makes the client's screen name this a ban rather than a kick.
+	expect(frames[0].data.IsBan).toBe(true)
+	expect(frames[0].data.GameSessionId).toBe(77001)
+
+	// And their presence row is gone, so they read offline at once and the instance frees
+	// a slot.
+	const presence = await env.DB.prepare(
+		"SELECT COUNT(*) AS n FROM presence WHERE json_extract(data, '$.accountId') = 8190"
+	).first<{ n: number }>()
+	expect(presence?.n).toBe(0)
+})
+
+// The ban row is committed before the kick is attempted, so a player who is offline (or
+// a hub that can't be reached) must not fail a ban that has been handed down.
+it('bans an offline player without a kick to push', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+
+	const report = await createReport(env.DB, { reporterPlayerId: 8201, reportedPlayerId: 8200 })
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+	await expect(getReportById(env.DB, report.id)).resolves.toMatchObject({ banned: 1 })
+
+	const frames = (await (await hub().fetch('http://do/all')).json()) as unknown[]
+	expect(frames).toHaveLength(0)
+})
+
+// One screen, one call: a moderator deciding what to do about an account reads the
+// reports, the warnings and the ban together, and three round trips would let the page
+// render a decision out of a half-loaded history.
+it('serves a player’s reports, warnings and active ban together', async () => {
+	const player = 8210
+	await createReport(env.DB, {
+		reporterPlayerId: 8211,
+		reportedPlayerId: player,
+		details: 'reported',
+	})
+	const actioned = await createReport(env.DB, {
+		reporterPlayerId: 8212,
+		reportedPlayerId: player,
+		reportCategory: 101,
+	})
+	await createWarning(env.DB, {
+		moderatorPlayerId: 8110,
+		warnedPlayerId: player,
+		reportCategory: 101,
+		displayReason: 'Told once',
+		moderatorNote: 'internal',
+	})
+	expect((await staffPost(`/api/staff/reports/${actioned.id}/ban`, 8110, { days: 2 })).status).toBe(
+		200
+	)
+
+	const history = (await (await staffGet(`/api/staff/players/${player}`, 8110)).json()) as {
+		playerId: number
+		reports: Array<{ id: number }>
+		warnings: Array<{ display_reason: string; moderator_note: string }>
+		activeBan: { id: number } | null
+	}
+	expect(history.playerId).toBe(player)
+	expect(history.reports).toHaveLength(2)
+	// The ban in force is the one the panel headlines, and it names the report behind it.
+	expect(history.activeBan?.id).toBe(actioned.id)
+	expect(history.warnings).toHaveLength(1)
+	// Both halves of a warning are here: the panel is the internal view, so the note a
+	// player never sees is shown to staff.
+	expect(history.warnings[0]).toMatchObject({
+		display_reason: 'Told once',
+		moderator_note: 'internal',
+	})
+})
+
+// The evasion preview. The IP arm is coarse by design — households and shared networks
+// look identical to it — so the panel shows the blast radius BEFORE a ban lands, and
+// echoes which arms the operator has enabled so an empty list can be read correctly.
+it('previews which other accounts a ban would reach', async () => {
+	// `account_id` is GENERATED from the blob, so only `data` is written — the same way
+	// `auth` writes an account row.
+	const seedAccount = (data: Record<string, unknown>) =>
+		env.DB.prepare('INSERT OR REPLACE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify(data))
+			.run()
+	await seedAccount({ accountId: 8220, username: 'Evader', lastLoginIp: '203.0.113.9' })
+	await seedAccount({ accountId: 8221, username: 'Housemate', signupIp: '203.0.113.9' })
+	await linkPlatformIdentity(env.DB, 8220, PlatformType.Steam, 'steam-8220')
+	await linkPlatformIdentity(env.DB, 8222, PlatformType.Steam, 'steam-8220')
+
+	const preview = (await (await staffGet('/api/staff/players/8220/linked', 8110)).json()) as {
+		arms: { ip: boolean; platform: boolean }
+		linked: Array<{ accountId: number; username: string | null; via: string }>
+	}
+	// BAN_EVASION_MATCH is unset in the test config, so both arms are live — the default
+	// an operator who sets nothing gets.
+	expect(preview.arms).toEqual({ ip: true, platform: true })
+
+	// The platform match is the sharp one (a proven identity) and sorts first; the IP one
+	// is the coarse arm that would catch the housemate.
+	expect(preview.linked.find((l) => l.accountId === 8222)?.via).toBe('platform')
+	expect(preview.linked.find((l) => l.accountId === 8221)).toMatchObject({
+		via: 'ip',
+		username: 'Housemate',
+	})
+	// Never the account asked about: the question is who ELSE.
+	expect(preview.linked.map((l) => l.accountId)).not.toContain(8220)
 })

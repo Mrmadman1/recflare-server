@@ -206,3 +206,94 @@ export async function isPlayerBlocked(
 ): Promise<boolean> {
 	return (await resolveBan(db, accountId, options)) !== null
 }
+
+/**
+ * An account a ban on someone else would also reach, and what links the two.
+ *
+ * `via` is never `'account'` here: this is the answer to "who ELSE", so the account asked
+ * about is excluded by the query rather than returned as a match on itself.
+ */
+export interface LinkedAccount {
+	accountId: number
+	username: string | null
+	via: Exclude<BanVia, 'account'>
+	/**
+	 * What matched — the shared platform id, or the shared IP address. Shown to the
+	 * moderator so an IP match can be judged on its face: an address that reads as a
+	 * carrier or campus range is a different proposition from a residential one.
+	 */
+	value: string
+}
+
+/**
+ * Which OTHER accounts a ban on `accountId` would also block — the preview a moderator
+ * sees before handing one down (`www`: `GET /api/staff/players/:id/linked`).
+ *
+ * This is `resolveBan` read backwards. That function asks "does any ban reach this
+ * caller", driving from the few banned reports inward, because it runs on every matchmake
+ * and every token grant. This one asks "who would this ban reach", driving from one
+ * account's identities outward — a question with no hot path, asked once when a moderator
+ * is about to act, and the only way to see the IP arm's blast radius BEFORE it lands
+ * rather than from a support ticket afterwards.
+ *
+ * Honours the same `arms`, so a preview on a server running `BAN_EVASION_MATCH=platform`
+ * doesn't list households that would not in fact be blocked. A disabled arm contributes
+ * nothing rather than being listed-but-flagged: the question is who gets blocked, and the
+ * answer under that setting is that they don't.
+ *
+ * The username comes off the account blob, which is `auth`'s — read here for the same
+ * reason the resolution query reads it: the moderator needs to know WHO, and an id alone
+ * makes the preview unreadable. A missing blob yields null rather than dropping the row;
+ * the block would still reach that account.
+ *
+ * An account matched by BOTH arms appears twice, once per arm. Deliberate: the arms are
+ * separate evidence, and "shares a Steam identity AND an address" is worth seeing as two
+ * lines. Platform rows sort first, being the arm that proves more.
+ */
+export async function linkedAccounts(
+	db: D1Database,
+	accountId: number,
+	arms: BanMatchArms = DEFAULT_BAN_MATCH_ARMS
+): Promise<LinkedAccount[]> {
+	if (!arms.ip && !arms.platform) return []
+
+	const { results } = await db
+		.prepare(
+			`WITH me AS (
+				SELECT
+					NULLIF(json_extract(data, '$.signupIp'), '') AS signup_ip,
+					NULLIF(json_extract(data, '$.lastLoginIp'), '') AS last_login_ip
+				FROM account WHERE account_id = ?1
+			),
+			ips AS (
+				SELECT signup_ip AS ip FROM me WHERE signup_ip IS NOT NULL
+				UNION SELECT last_login_ip FROM me WHERE last_login_ip IS NOT NULL
+			),
+			ids AS (
+				SELECT platform, platform_id FROM platform_account WHERE account_id = ?1
+			)
+			SELECT p.account_id AS accountId,
+				json_extract(a.data, '$.username') AS username,
+				'platform' AS via,
+				p.platform_id AS value
+			FROM platform_account p
+			JOIN ids ON ids.platform = p.platform AND ids.platform_id = p.platform_id
+			LEFT JOIN account a ON a.account_id = p.account_id
+			WHERE ?2 = 1 AND p.account_id <> ?1
+			UNION
+			SELECT a.account_id AS accountId,
+				json_extract(a.data, '$.username') AS username,
+				'ip' AS via,
+				ips.ip AS value
+			FROM account a, ips
+			WHERE ?3 = 1 AND a.account_id <> ?1
+				AND ips.ip IN (
+					json_extract(a.data, '$.signupIp'),
+					json_extract(a.data, '$.lastLoginIp')
+				)
+			ORDER BY via DESC, accountId`
+		)
+		.bind(accountId, arms.platform ? 1 : 0, arms.ip ? 1 : 0)
+		.all<LinkedAccount>()
+	return results
+}

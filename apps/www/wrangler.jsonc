@@ -5,11 +5,13 @@
 	"compatibility_date": "2026-06-16",
 	"compatibility_flags": ["nodejs_compat"],
 	"routes": [],
-	// The shared `recflare` D1 — read-only here, and only for the public
-	// `/server-status` head-count (see src/www.app.ts). The schema is owned by the
-	// workers that write it (presence lives in apps/rooms/migrations), so no
-	// migrations_dir: www never migrates. The "local" placeholder is spliced with
-	// RECFLARE_D1 at deploy time, as it is for every other worker.
+	// The shared `recflare` D1. Read for the public `/server-status` head-count and the
+	// benefits claim; WRITTEN by the claim (`hasPlus`) and by the staff moderation panel,
+	// which files reports and hands down bans on the `report` table (see src/staff.ts).
+	// The schema is owned by the workers that write it (presence lives in
+	// apps/rooms/migrations, `report` in apps/api/migrations), so no migrations_dir: www
+	// never migrates. The "local" placeholder is spliced with RECFLARE_D1 at deploy time,
+	// as it is for every other worker.
 	"d1_databases": [
 		{
 			"binding": "DB",
@@ -113,6 +115,20 @@
 	// auth/accounts/api/notify (as rec.net's own site did), where the edge sets the real
 	// client IP for free.
 	"services": [{ "binding": "AUTH", "service": "auth" }],
+	// The notifications hub, owned by the `notify` worker. Bound for ONE action: a ban
+	// handed down from the staff panel ejects the player from the instance they are
+	// standing in, which needs a `ModerationKick` frame pushed to their client (see
+	// src/staff.ts). Without it a ban would not bite until their next matchmake, so
+	// someone banned mid-session keeps playing.
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "RECFLARE_NOTIFICATIONS_HUB",
+				"class_name": "NotificationsHub",
+				"script_name": "notify"
+			}
+		]
+	},
 	"upload_source_maps": true,
 	"observability": {
 		"logs": {

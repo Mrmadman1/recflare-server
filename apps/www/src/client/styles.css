@@ -959,6 +959,7 @@ label {
 }
 
 input,
+select,
 textarea {
 	display: block;
 	width: 100%;
@@ -999,6 +1000,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
 	outline: 2px solid var(--accent);
 	outline-offset: 0;
@@ -1148,5 +1150,153 @@ button[type='submit']:disabled {
 		animation-duration: 0.01ms !important;
 		animation-iteration-count: 1 !important;
 		transition-duration: 0.01ms !important;
+	}
+}
+
+/* ---- Moderation panel --------------------------------------------------- */
+/*
+ * The staff surface at /moderation (see Moderation.tsx). Deliberately plainer than the
+ * rest of the site: this is a working tool read for minutes at a time, so it trades the
+ * poster's generous spacing for density, and spends no orange except on the actions it
+ * shares with every other form. Nothing here is warmer than the tables it holds.
+ */
+
+/* The panel needs the width — six or seven columns don't fit the 880px the account
+   dashboard is sized for, and a moderator is at a desk. */
+.shell.mod {
+	max-width: 1180px;
+}
+
+/* A row of filter controls that wraps instead of stacking: each one is short, and
+   stacked they push the results below the fold. */
+.mod-filters {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px 16px;
+	align-items: flex-end;
+	margin-bottom: 18px;
+	padding-bottom: 18px;
+	border-bottom: 1px solid var(--line);
+}
+
+.mod-filters label {
+	margin-bottom: 0;
+	min-width: 150px;
+	flex: 1 1 150px;
+}
+
+.mod-filter-actions {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+
+.mod-filter-actions button {
+	margin: 0;
+	width: auto;
+}
+
+/* Tables are the one thing allowed to be wider than the page — a report row has more in
+   it than a phone is wide, and wrapping the cells would make it unscannable. */
+.mod-scroll {
+	overflow-x: auto;
+	margin: 0 -22px;
+	padding: 0 22px;
+}
+
+.mod-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.875rem;
+	white-space: nowrap;
+}
+
+.mod-table th {
+	text-align: left;
+	font-size: 0.75rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--muted);
+	padding: 0 12px 8px 0;
+	border-bottom: 1px solid var(--line);
+}
+
+.mod-table td {
+	padding: 10px 12px 10px 0;
+	border-bottom: 1px solid var(--line);
+	vertical-align: top;
+}
+
+.mod-table tr:last-child td {
+	border-bottom: none;
+}
+
+.mod-table button.linkish {
+	font-size: 0.875rem;
+}
+
+/* A name and the id under it. The id is always shown: rows carry ids, names are a
+   lookup on top, and a moderator acting on the wrong account is the failure to avoid. */
+.mod-player {
+	white-space: nowrap;
+}
+
+/* The reporter's own words — the one cell allowed to wrap, clamped to a sensible width
+   so a long description doesn't push the actions off the table. Full text in the title. */
+.mod-details {
+	white-space: normal;
+	max-width: 320px;
+	min-width: 180px;
+	color: var(--muted);
+}
+
+/* Red, unlike every other badge: a ban is the one state on these tables that someone
+   needs to notice without reading. */
+.badge.mod-banned {
+	color: var(--error);
+	border-color: color-mix(in srgb, var(--error) 45%, transparent);
+	margin-left: 8px;
+}
+
+.mod-pager {
+	display: flex;
+	align-items: center;
+	gap: 16px;
+	margin-top: 16px;
+}
+
+.mod-pager button {
+	margin: 0;
+	width: auto;
+}
+
+/* The evasion preview. A list rather than a table: each line is one account and one
+   reason, and it is read to decide whether to go ahead, not compared column by column. */
+.mod-linked {
+	list-style: none;
+	margin: 0 0 12px;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	font-size: 0.9rem;
+}
+
+/* The ban form, pinned under the tables rather than floating over them: it carries the
+   evasion preview, which can run to several lines, and a modal that scrolls is worse
+   than a panel that is simply below. The accent border is what marks it as the thing
+   waiting on you. */
+.mod-dialog {
+	border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+
+.mod-dialog .card {
+	background: var(--surface-hi);
+}
+
+@media (max-width: 760px) {
+	.mod-filters label {
+		flex-basis: 100%;
 	}
 }

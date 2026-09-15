@@ -29,6 +29,49 @@ export default defineConfig({
 					// src/test/integration/api.test.ts). A plain binding of the same name would
 					// shadow the store binding with a string.
 				},
+				// The worker's RECFLARE_NOTIFICATIONS_HUB binding points at the `notify`
+				// worker's DO (script_name: "notify"), which isn't part of this isolated test —
+				// without an override the runtime refuses to start, exactly as it does for the
+				// AUTH service binding above. The same stub the `api` worker's tests use: it
+				// records each send so a test can assert the ModerationKick frame a ban pushed,
+				// and answers a fetch with it (DELETE resets).
+				workers: [
+					{
+						name: 'notify',
+						modules: true,
+						compatibilityDate: '2026-06-16',
+						compatibilityFlags: ['nodejs_compat'],
+						durableObjects: { RECFLARE_NOTIFICATIONS_HUB: 'NotificationsHub' },
+						script: `
+							import { DurableObject } from 'cloudflare:workers'
+							export class NotificationsHub extends DurableObject {
+								sent = []
+								async notifyPlayer(playerId, notificationType, data) {
+									this.sent.push({ playerId, notificationType, data })
+									return { delivered: 0, queued: true }
+								}
+								async notifyPlayerEphemeral(playerId, notificationType, data) {
+									this.sent.push({ playerId, ephemeral: true, notificationType, data })
+									return { delivered: 0 }
+								}
+								async notifyPlayersEphemeral(playerIds, notificationType, data) {
+									this.sent.push({ playerIds, ephemeral: true, notificationType, data })
+									return { delivered: 0 }
+								}
+								async broadcast() { return { delivered: 0 } }
+								async fetch(request) {
+									if (request.method === 'DELETE') {
+										this.sent = []
+										return new Response(null, { status: 204 })
+									}
+									if (new URL(request.url).pathname === '/all') return Response.json(this.sent)
+									return Response.json(this.sent.at(-1) ?? null)
+								}
+							}
+							export default { fetch() { return new Response('ok') } }
+						`,
+					},
+				],
 			},
 		}),
 	],

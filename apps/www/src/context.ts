@@ -1,5 +1,6 @@
 import type { HonoApp } from '@repo/hono-helpers'
 import type { SharedHonoEnv, SharedHonoVariables } from '@repo/hono-helpers/src/types'
+import type { NotificationsHub } from '../../notify/src/notifications-hub'
 
 export type Env = SharedHonoEnv & {
 	/** Base domain the auth/accounts hosts are derived from (see wrangler.jsonc). */
@@ -7,13 +8,34 @@ export type Env = SharedHonoEnv & {
 	/** Static-asset fetcher for the built React SPA (see wrangler.jsonc `assets`). */
 	ASSETS: Fetcher
 	/**
-	 * The shared `recflare` D1. www asks it two things: the live presence head-count
-	 * behind `/server-status`, and the caller's `account` row on the benefits claim —
-	 * which is also the one place www WRITES (the `hasPlus`/`discordUserId` pair, through
-	 * `@repo/domain`'s `updateAccount`, so the blob's shape stays in one module). Every
-	 * table it can see is owned (and migrated) by another worker; www never migrates.
+	 * The shared `recflare` D1. www asks it three things: the live presence head-count
+	 * behind `/server-status`, the caller's `account` row on the benefits claim — which
+	 * WRITES the `hasPlus`/`discordUserId` pair, through `@repo/domain`'s `updateAccount`,
+	 * so the blob's shape stays in one module — and the `report`/`warning` tables behind
+	 * the staff moderation panel (`/api/staff/*`), which writes reports and bans through
+	 * `api`'s reports-db for the same reason. Every table it can see is owned (and
+	 * migrated) by another worker; www never migrates.
 	 */
 	DB: D1Database
+	/**
+	 * SignalR notifications hub (DO owned by the `notify` worker). Bound for ONE thing: a
+	 * ban handed down from the staff panel ejects the player from the instance they are
+	 * standing in, which needs a `ModerationKick` frame pushed to them (see src/staff.ts).
+	 * Without it a ban would only bite on their next matchmake.
+	 */
+	RECFLARE_NOTIFICATIONS_HUB: DurableObjectNamespace<NotificationsHub>
+	/**
+	 * Which ban-EVASION arms the operator enforces — the same knob `match` and `auth`
+	 * read, parsed by the same `banEvasionMatch` (in `api`'s bans-db, which owns the
+	 * policy). www reads it so the staff panel's "who else would this ban reach" preview
+	 * shows what would ACTUALLY happen rather than every possible match.
+	 *
+	 * It must carry the same value as those workers'. An operator who narrows it on
+	 * `match` but not here gets a preview that overstates the blast radius — alarming
+	 * rather than dangerous, but wrong. Unset means both arms, as it does everywhere else.
+	 * Undeclared in wrangler.jsonc, as it is there: an operator who wants it sets it.
+	 */
+	BAN_EVASION_MATCH?: string
 	/**
 	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
 	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).
@@ -86,7 +108,14 @@ export type Env = SharedHonoEnv & {
 }
 
 /** Variables can be extended */
-export type Variables = SharedHonoVariables
+export type Variables = SharedHonoVariables & {
+	/**
+	 * The acting moderator's account id on a `/api/staff/*` request, set by `requireStaff`
+	 * once it has validated the token. Stashed so a handler reads it without verifying the
+	 * same token a second time — and so a handler can only get at it behind that gate.
+	 */
+	staffId: number
+}
 
 export interface App extends HonoApp {
 	Bindings: Env

@@ -12,31 +12,22 @@ import {
 	QUEST_DOWNLOAD_URL,
 	SOURCE_REPO,
 } from '../links'
+// The session token, the worker hostnames and the `call` every request goes through —
+// see api.ts for why they're a module of their own rather than defined here.
+import {
+	accountIdForUsername,
+	call,
+	hasToken,
+	isAdmin,
+	setHosts,
+	setToken,
+	useAction,
+	where,
+} from './api'
+import { ModerationPage } from './Moderation'
 
 import type { ReactNode } from 'react'
-
-/**
- * The SPA calls the SAME endpoints the game does — `auth` for tokens and the password
- * change, `accounts` for the profile, `api` for the photo feed, `notify` for the admin
- * broadcasts — rather than proxying each one through `www`, exactly as rec.net's own
- * site did. Those workers answer CORS for it (see their `withDefaultCors()`), and the
- * access token lives here in the browser.
- *
- * `www` serves only two things of its own (see www.app.ts): the config below, and
- * signup, which is Turnstile-gated and so cannot leave the server.
- */
-
-/** Where each worker lives. From `/api/config`, never baked into this build. */
-interface Hosts {
-	auth: string
-	accounts: string
-	api: string
-	img: string
-	notify: string
-	rooms: string
-	cdn: string
-	storage: string
-}
+import type { Hosts } from './api'
 
 /**
  * Site config from `www`. `signupEnabled` is false when the operator has no Turnstile
@@ -166,144 +157,6 @@ const ACCESSIBILITY_LABEL: Record<number, string> = {
  * account path.
  */
 const WEB_PLATFORM = '4'
-
-/**
- * The session's access token, in localStorage so a reload stays signed in.
- *
- * Readable by page JS, which the httpOnly cookie this replaced was not — that is the
- * tradeoff that comes with the browser calling the workers itself, and it's the same
- * posture the game client has. Nothing third-party runs on this origin except the
- * Turnstile widget, which is Cloudflare's own.
- */
-const TOKEN_KEY = 'rf_token'
-let token: string | null = localStorage.getItem(TOKEN_KEY)
-
-function setToken(next: string | null) {
-	token = next
-	if (next === null) localStorage.removeItem(TOKEN_KEY)
-	else localStorage.setItem(TOKEN_KEY, next)
-}
-
-/**
- * Filled in once `/api/config` lands, before any worker call is made — a module value
- * rather than a prop threaded through every form, since the components that call a
- * worker only render after the config resolves.
- */
-let hosts: Hosts | null = null
-
-/** The hostnames, once known. Throws rather than guessing a domain. */
-function where(): Hosts {
-	if (hosts === null) throw new Error('Still starting up — please reload the page.')
-	return hosts
-}
-
-/**
- * Roles that unlock the admin controls. Mirrors the notify worker's `ADMIN_ROLES` gate —
- * this only decides whether to SHOW them; notify verifies the token on every call.
- */
-const ADMIN_ROLES = new Set(['developer', 'moderator'])
-
-/**
- * Whether the session token carries an admin role. Decodes the `role` claim WITHOUT
- * verifying it — a page holds no signing key, and faking one here only reveals buttons
- * whose endpoints reject the same token. A malformed token reads as "not admin".
- */
-function isAdmin(): boolean {
-	const payload = token?.split('.')[1]
-	if (!payload) return false
-	try {
-		const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
-		const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')
-		const claims = JSON.parse(atob(padded)) as { role?: unknown }
-		return Array.isArray(claims.role) && claims.role.some((r) => ADMIN_ROLES.has(r as string))
-	} catch {
-		return false
-	}
-}
-
-/**
- * An OAuth machine code (`invalid_grant`, `server_error`) rather than a sentence — a
- * lower_snake_case word with no spaces. A worker that speaks OAuth puts one of these in
- * `error`, where the readable reason is in `error_description`.
- */
-const isErrorCode = (s: string) => /^[a-z][a-z\d]*(_[a-z\d]+)+$/.test(s)
-
-/**
- * The message worth showing for a refusal. `error` wins, since that's where a worker
- * puts a sentence it wrote for the player — but NOT when it's a bare OAuth code, which
- * tells nobody anything. Some refusals carry no body at all (accounts answers a
- * malformed email with an empty 400), hence the last-resort line.
- */
-function errorMessage(data: Record<string, unknown>, status: number): string {
-	const error = typeof data.error === 'string' ? data.error : ''
-	const description = typeof data.error_description === 'string' ? data.error_description : ''
-	return (
-		(error && !(isErrorCode(error) && description) && error) ||
-		description ||
-		error ||
-		`Request failed (${status})`
-	)
-}
-
-interface CallOptions {
-	method?: 'GET' | 'POST' | 'PUT'
-	/** Form fields — auth and accounts read their input with Hono's `parseBody()`. */
-	form?: Record<string, string>
-	/** A JSON body — what notify's internal endpoints take instead. */
-	json?: unknown
-	/**
-	 * A multipart body — what `storage`'s `/upload` takes, since it carries a file. Passed
-	 * to `fetch` as-is: the browser writes the `content-type` itself, because only it
-	 * knows the boundary it generated.
-	 */
-	multipart?: FormData
-	/** Send the session token. */
-	authed?: boolean
-	/**
-	 * What to say when the worker refuses with a 400 and NO body. Several accounts routes
-	 * do exactly that (email, display name, bio), so without this the player reads
-	 * "Request failed (400)" — the status, not the reason.
-	 */
-	refusal?: string
-}
-
-/** Call a worker. Returns the parsed body, or throws with something worth showing. */
-async function call<T = Record<string, unknown>>(url: string, opts: CallOptions = {}): Promise<T> {
-	const headers: Record<string, string> = {}
-	if (opts.authed && token) headers.authorization = `Bearer ${token}`
-	let body: string | FormData | undefined
-	if (opts.form) {
-		headers['content-type'] = 'application/x-www-form-urlencoded'
-		body = new URLSearchParams(opts.form).toString()
-	} else if (opts.json !== undefined) {
-		headers['content-type'] = 'application/json'
-		body = JSON.stringify(opts.json)
-	} else if (opts.multipart) {
-		// Deliberately no content-type: setting one would omit the boundary.
-		body = opts.multipart
-	}
-
-	const res = await fetch(url, {
-		method: opts.method ?? (body === undefined ? 'GET' : 'POST'),
-		headers,
-		body,
-	})
-	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
-
-	if (!res.ok) {
-		// Expired or revoked. Cleared here so no caller has to remember to.
-		if (res.status === 401 && opts.authed) {
-			setToken(null)
-			throw new Error('Your session has expired. Please sign in again.')
-		}
-		// Only when the body really is empty — a worker that did send a reason keeps it.
-		if (opts.refusal !== undefined && res.status === 400 && Object.keys(data).length === 0) {
-			throw new Error(opts.refusal)
-		}
-		throw new Error(errorMessage(data, res.status))
-	}
-	return data as T
-}
 
 /** The signed-in account, straight from `accounts`. */
 const fetchMe = (): Promise<SelfAccount> =>
@@ -586,28 +439,6 @@ const coachMessage = (
 		authed: true,
 	})
 
-/**
- * Resolve an `@username` to the account id the workers address a player by.
- *
- * `accounts` serves no exact-name lookup, so this goes through the PREFIX search and
- * keeps only an exact (case-insensitive) hit: a prefix match is a different player, and
- * sending a message to whoever happened to sort first would be worse than refusing. The
- * exact name always sorts first among its own prefixes, so it's inside the search limit
- * whenever it exists.
- */
-async function accountIdForUsername(input: string): Promise<number> {
-	const name = input.trim().replace(/^@/, '')
-	if (name === '') throw new Error('Enter a username to send to.')
-	const matches = await call<Array<{ accountId?: number; username?: string }>>(
-		`${where().accounts}/account/search?name=${encodeURIComponent(name)}`
-	)
-	const found = Array.isArray(matches)
-		? matches.find((m) => m.username?.toLowerCase() === name.toLowerCase())
-		: undefined
-	if (typeof found?.accountId !== 'number') throw new Error(`There's no player called @${name}.`)
-	return found.accountId
-}
-
 /** Minimal history-based router: current pathname + a navigate() that pushes state. */
 function useRouter() {
 	const [path, setPath] = useState(() => window.location.pathname)
@@ -887,9 +718,9 @@ export function App() {
 		// closed rather than guessing where the workers are.
 		call<SiteConfig & { hosts: Hosts }>('/api/config')
 			.then(async ({ hosts: resolved, ...site }) => {
-				hosts = resolved
+				setHosts(resolved)
 				setConfig(site)
-				if (token === null) return setAccount(null)
+				if (!hasToken()) return setAccount(null)
 				// A stored token that `accounts` rejects is stale — `call` has already dropped
 				// it, so this just falls back to signed-out rather than surfacing an error.
 				await fetchMe()
@@ -937,6 +768,12 @@ export function App() {
 				// Its own page rather than a dashboard tab: this path is Discord's registered
 				// redirect URI, so it has to be one stable URL a cold load can land on.
 				<ClaimPage account={account} config={config} navigate={navigate} />
+			) : path === '/moderation' ? (
+				// A whole surface rather than another dashboard tab, and its own URL so a
+				// moderator can keep it open. The path is deliberately NOT in wrangler.jsonc's
+				// `run_worker_first`, so a cold load falls through to the SPA shell; the page
+				// then gates itself on the token's role, and every endpoint behind it re-checks.
+				<ModerationPage account={account} navigate={navigate} />
 			) : roomId !== null ? (
 				<RoomPage account={account} roomId={roomId} navigate={navigate} />
 			) : (
@@ -995,6 +832,18 @@ function NavBar({
 				</a>
 				{account === undefined ? null : account ? (
 					<>
+						{/* Staff only, and cosmetic: the link is hidden for everyone else, but
+						    `/moderation` is a real URL anyone can type — the page and every
+						    endpoint behind it check the token's role themselves. */}
+						{isAdmin() && (
+							<Link
+								to="/moderation"
+								navigate={navigate}
+								className={path === '/moderation' ? 'active' : ''}
+							>
+								Moderation
+							</Link>
+						)}
 						<Link to="/account" navigate={navigate} className={path === '/account' ? 'active' : ''}>
 							My account
 						</Link>
@@ -1830,29 +1679,6 @@ function VisibilityBadge({ accessibility }: { accessibility: number }) {
 		</span>
 	)
 }
-
-/** Small hook wrapping a submit handler with pending/error/success state. */
-function useAction() {
-	const [pending, setPending] = useState(false)
-	const [error, setError] = useState('')
-	const [done, setDone] = useState('')
-
-	const run = useCallback(async (fn: () => Promise<string>) => {
-		setPending(true)
-		setError('')
-		setDone('')
-		try {
-			setDone(await fn())
-		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err))
-		} finally {
-			setPending(false)
-		}
-	}, [])
-
-	return { pending, error, done, run }
-}
-
 /**
  * Turnstile's browser API, as much of it as the signup widget uses. Loaded from
  * Cloudflare at runtime (see loadTurnstile) rather than bundled, so it isn't in

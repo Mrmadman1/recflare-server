@@ -32,6 +32,17 @@ import {
 } from './discord'
 import { docsPage, fetchSpec } from './docs'
 import { privacyPage } from './privacy'
+import {
+	banReportHandler,
+	bansInForceHandler,
+	createReportHandler,
+	getReportHandler,
+	linkedAccountsHandler,
+	playerHistoryHandler,
+	requireStaff,
+	searchReportsHandler,
+	topReportedHandler,
+} from './staff'
 import { turnstileKeys, verifyTurnstile } from './turnstile'
 import {
 	accountsBase,
@@ -373,6 +384,30 @@ const app = new Hono<App>()
 		// Discord member who has since renamed themselves is not a problem to solve here.
 		return c.json({ hasPlus: true, discordUsername: membership.username })
 	})
+
+	// ---- Staff moderation panel ---------------------------------------------
+	// The endpoints behind `/moderation` in the SPA. They live here rather than on `api`
+	// (which owns the `report` table) because they are a recflare addition with no
+	// counterpart in the real service, and the game-facing workers only reimplement what
+	// the client actually calls — see src/staff.ts. The SQL stays with the table.
+	//
+	// Ordered before the ASSETS catch-all like everything else, and covered by the
+	// existing `/api/*` entry in wrangler.jsonc's `run_worker_first`, so no routing change
+	// was needed. `/moderation` itself is deliberately NOT in that allowlist: it is a
+	// client-side route, so it must fall through to the SPA shell.
+	.use('/api/staff/*', requireStaff)
+
+	// Registered before `/api/staff/reports/:id` so the literal path isn't captured as an
+	// id — `top-reported` is not a number, but the param route would still match it and
+	// answer a 400 instead of the list.
+	.get('/api/staff/reports/top-reported', topReportedHandler)
+	.get('/api/staff/reports', searchReportsHandler)
+	.post('/api/staff/reports', createReportHandler)
+	.get('/api/staff/reports/:id', getReportHandler)
+	.post('/api/staff/reports/:id/ban', banReportHandler)
+	.get('/api/staff/bans', bansInForceHandler)
+	.get('/api/staff/players/:id', playerHistoryHandler)
+	.get('/api/staff/players/:id/linked', linkedAccountsHandler)
 
 	// ---- Privacy policy -----------------------------------------------------
 	// Server-rendered rather than a SPA route so the page has real text without
