@@ -441,20 +441,40 @@ const coachMessage = (
 
 /** Minimal history-based router: current pathname + a navigate() that pushes state. */
 function useRouter() {
-	const [path, setPath] = useState(() => window.location.pathname)
+	// Pathname and query string are tracked SEPARATELY rather than as one string, because
+	// the pages match on the pathname alone and one of them is reached with a query on it:
+	// `/claim?code=…` is Discord's redirect, so a `path` that carried the search would stop
+	// matching `/claim` the moment it mattered. `search` is here for the pages whose own
+	// state belongs in the URL — the moderation panel's filters and paging — so that the
+	// back button walks back through them instead of leaving the page.
+	const [location, setLocation] = useState(() => ({
+		path: window.location.pathname,
+		search: window.location.search,
+	}))
 	useEffect(() => {
-		const onPop = () => setPath(window.location.pathname)
+		const onPop = () =>
+			setLocation({ path: window.location.pathname, search: window.location.search })
 		window.addEventListener('popstate', onPop)
 		return () => window.removeEventListener('popstate', onPop)
 	}, [])
 	const navigate = useCallback((to: string) => {
-		if (to !== window.location.pathname) {
+		// `to` may carry a query string, so the "did anything change" test is against the
+		// whole of what's on screen — otherwise a filter change (same path, new query) would
+		// never push, and the back button would have nothing to walk back through.
+		const [path, search = ''] = to.split('?')
+		// Read before pushing: afterwards `window.location` IS the destination, and every
+		// "did the page change" test would answer no.
+		const samePage = path === window.location.pathname
+		if (to !== window.location.pathname + window.location.search) {
 			window.history.pushState(null, '', to)
-			window.scrollTo(0, 0)
+			// Staying on the same page with a different query is a re-filtered list, where
+			// jumping to the top would throw away the reader's place. A real page change
+			// still scrolls up.
+			if (!samePage) window.scrollTo(0, 0)
 		}
-		setPath(to)
+		setLocation({ path: path ?? '/', search: search === '' ? '' : `?${search}` })
 	}, [])
-	return { path, navigate }
+	return { ...location, navigate }
 }
 
 type Navigate = (to: string) => void
@@ -709,7 +729,7 @@ export function App() {
 	// undefined until the config lands. Signup is treated as closed until told otherwise,
 	// so a slow (or failed) config fetch can't flash a form the server would refuse.
 	const [config, setConfig] = useState<SiteConfig | undefined>(undefined)
-	const { path, navigate } = useRouter()
+	const { path, search, navigate } = useRouter()
 	const roomId = roomIdFromPath(path)
 
 	useEffect(() => {
@@ -768,12 +788,17 @@ export function App() {
 				// Its own page rather than a dashboard tab: this path is Discord's registered
 				// redirect URI, so it has to be one stable URL a cold load can land on.
 				<ClaimPage account={account} config={config} navigate={navigate} />
-			) : path === '/moderation' ? (
-				// A whole surface rather than another dashboard tab, and its own URL so a
-				// moderator can keep it open. The path is deliberately NOT in wrangler.jsonc's
-				// `run_worker_first`, so a cold load falls through to the SPA shell; the page
-				// then gates itself on the token's role, and every endpoint behind it re-checks.
-				<ModerationPage account={account} navigate={navigate} />
+			) : path === '/moderation' || path.startsWith('/moderation/') ? (
+				// A whole surface rather than another dashboard tab, and its own URLS: the
+				// panel routes UNDER this prefix (`/moderation/players/123`, and its filters in
+				// the query string), so the back button walks back through a moderator's
+				// session instead of dropping them on the homepage. Matched by prefix here for
+				// that reason; the panel picks the view apart itself.
+				//
+				// None of these paths is in wrangler.jsonc's `run_worker_first`, so a cold load
+				// on any of them falls through to the SPA shell; the page then gates itself on
+				// the token's role, and every endpoint behind it re-checks.
+				<ModerationPage account={account} path={path} search={search} navigate={navigate} />
 			) : roomId !== null ? (
 				<RoomPage account={account} roomId={roomId} navigate={navigate} />
 			) : (
@@ -839,7 +864,9 @@ function NavBar({
 							<Link
 								to="/moderation"
 								navigate={navigate}
-								className={path === '/moderation' ? 'active' : ''}
+								className={
+									path === '/moderation' || path.startsWith('/moderation/') ? 'active' : ''
+								}
 							>
 								Moderation
 							</Link>

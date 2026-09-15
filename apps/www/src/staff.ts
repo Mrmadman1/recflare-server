@@ -252,10 +252,13 @@ export async function getReportHandler(c: Context<App>) {
  * The reporter is the moderator, from the token, never the body: that IS the record of who
  * raised it, and it is why nothing marks these rows as staff-created.
  *
- * Deliberately minimal. The heights the game measures, the instance type and the
- * event/invention/item ids all describe a client-side moment that did not happen here, so
- * they are not accepted — a hand-written report carries only who, what kind, why, and
- * optionally where.
+ * WHO, WHAT KIND and WHY, and nothing else. Everything else on a report describes a
+ * client-side moment that did not happen here: the heights the game measured, the instance
+ * type, the event/invention/item ids — and `room_id`, which a player's report gets from
+ * the client that filed it. A moderator does not know a room's numeric id and would have
+ * to go and look it up, so the room goes in `details` along with the rest of the account
+ * of what happened. A `roomId` in the body is therefore not read; player reports still
+ * carry the column, and it is theirs alone.
  */
 export async function createReportHandler(c: Context<App>) {
 	const moderatorId = staffId(c)
@@ -263,7 +266,6 @@ export async function createReportHandler(c: Context<App>) {
 		reportedPlayerId?: unknown
 		reportCategory?: unknown
 		details?: unknown
-		roomId?: unknown
 	} | null
 	if (body === null) return c.json({ error: 'Invalid request body' }, 400)
 
@@ -277,13 +279,11 @@ export async function createReportHandler(c: Context<App>) {
 		return c.json({ error: 'You cannot file a report against yourself' }, 400)
 	}
 
-	const roomId = Number(body.roomId ?? 0)
 	const report = await createReport(c.env.DB, {
 		reporterPlayerId: moderatorId,
 		reportedPlayerId,
 		reportCategory: Number.isInteger(Number(body.reportCategory)) ? Number(body.reportCategory) : 0,
 		details: typeof body.details === 'string' && body.details !== '' ? body.details : null,
-		roomId: Number.isInteger(roomId) && roomId > 0 ? roomId : null,
 	})
 	logger.info('a moderator filed a report by hand', {
 		reportId: report.id,

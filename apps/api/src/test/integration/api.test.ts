@@ -4834,6 +4834,58 @@ describe('player reports', () => {
 			expect(banned.find((r) => r.playerId === 3350)?.bannedNow).toBe(true)
 		})
 
+		// The standing-bans list exists to catch MISTAKES, so it is ordered by when the ban
+		// landed: the one most likely to be wrong is the one just handed down. Ordering by
+		// severity instead would bury a fresh one-day ban under every permanent ban ever
+		// issued.
+		test('getBansInForce puts the most recently handed-down ban first', async () => {
+			const first = await createReport(env.DB, { reporterPlayerId: 3371, reportedPlayerId: 3370 })
+			const second = await createReport(env.DB, { reporterPlayerId: 3373, reportedPlayerId: 3372 })
+			const third = await createReport(env.DB, { reporterPlayerId: 3375, reportedPlayerId: 3374 })
+
+			// Handed down oldest-first, and deliberately mixed in severity: the permanent one
+			// is banned FIRST, so an order by "longest lasting" would float it to the top.
+			await banFromReport(env.DB, first.id)
+			await env.DB.prepare('UPDATE report SET banned_at = ?2 WHERE id = ?1')
+				.bind(first.id, '2024-01-01T00:00:00.000Z')
+				.run()
+			await banFromReport(env.DB, second.id, { banExpires: '2999-01-01T00:00:00.000Z' })
+			await env.DB.prepare('UPDATE report SET banned_at = ?2 WHERE id = ?1')
+				.bind(second.id, '2024-06-01T00:00:00.000Z')
+				.run()
+			await banFromReport(env.DB, third.id, { banExpires: '2999-01-01T00:00:00.000Z' })
+			await env.DB.prepare('UPDATE report SET banned_at = ?2 WHERE id = ?1')
+				.bind(third.id, '2025-01-01T00:00:00.000Z')
+				.run()
+
+			const ordered = (await getBansInForce(env.DB))
+				.map((b) => b.id)
+				.filter((id) => [first.id, second.id, third.id].includes(id))
+			expect(ordered).toEqual([third.id, second.id, first.id])
+		})
+
+		// A ban set before 0020 added `banned_at` has only its report's date to sort by —
+		// the same fallback the block screen uses. Without the coalesce every such row would
+		// sort as NULL: all at one end, in no order at all.
+		test('getBansInForce falls back to created_at for a ban with no banned_at', async () => {
+			const old = await createReport(env.DB, { reporterPlayerId: 3381, reportedPlayerId: 3380 })
+			const recent = await createReport(env.DB, { reporterPlayerId: 3383, reportedPlayerId: 3382 })
+			// The pre-migration shape: banned, with no record of when.
+			await env.DB.prepare(
+				'UPDATE report SET banned = 1, banned_at = NULL, created_at = ?2 WHERE id = ?1'
+			)
+				.bind(old.id, '2023-01-01T00:00:00.000Z')
+				.run()
+			await banFromReport(env.DB, recent.id)
+
+			const ordered = (await getBansInForce(env.DB))
+				.map((b) => b.id)
+				.filter((id) => [old.id, recent.id].includes(id))
+			// The undated one sorts by its report's date, so it lands behind today's ban
+			// rather than at an arbitrary end of the list.
+			expect(ordered).toEqual([recent.id, old.id])
+		})
+
 		test('getBansInForce lists in-force bans only, and getReportById reads one row', async () => {
 			const permanent = await createReport(env.DB, {
 				reporterPlayerId: 3361,

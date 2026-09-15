@@ -662,20 +662,32 @@ it('files a minimal report as the acting moderator', async () => {
 	const res = await staffPost('/api/staff/reports', 8110, {
 		reportedPlayerId: 8111,
 		reportCategory: 102,
-		details: 'Seen in a log',
-		roomId: 991,
+		details: 'Seen in a log, in the Rec Center',
 	})
 	expect(res.status).toBe(200)
 	const report = (await res.json()) as Record<string, unknown>
 	expect(report.reporter_player_id).toBe(8110)
 	expect(report.reported_player_id).toBe(8111)
 	expect(report.report_category).toBe(102)
-	expect(report.details).toBe('Seen in a log')
-	expect(report.room_id).toBe(991)
+	expect(report.details).toBe('Seen in a log, in the Rec Center')
 	// Filed unbanned: a report is not a ban, and the ban is a separate decision.
 	expect(report.banned).toBe(0)
 	expect(report.banned_at).toBeNull()
 	expect(report.banned_by_player_id).toBeNull()
+})
+
+// Who, what kind and why — and nothing else. A moderator does not know a room's numeric
+// id and would have to go and look it up, so WHERE goes in `details` with the rest of the
+// account of what happened. `room_id` is a player report's column: the client that filed
+// one knows the id it was standing in, and a hand-written row must not pretend to.
+it('ignores a room id on a hand-written report', async () => {
+	const res = await staffPost('/api/staff/reports', 8110, {
+		reportedPlayerId: 8112,
+		details: 'In someone’s dorm',
+		roomId: 991,
+	})
+	expect(res.status).toBe(200)
+	expect(((await res.json()) as Record<string, unknown>).room_id).toBeNull()
 })
 
 it('refuses a report with no player, and one a moderator files against themselves', async () => {
@@ -1026,4 +1038,51 @@ it('previews which other accounts a ban would reach', async () => {
 	})
 	// Never the account asked about: the question is who ELSE.
 	expect(preview.linked.map((l) => l.accountId)).not.toContain(8220)
+})
+
+// The panel's own URLs must reach the SPA, not the worker's API surface. `requireStaff`
+// is mounted on `/api/staff/*`, and `run_worker_first` lists `/api/*` — so every
+// `/moderation/…` path falls through assets-first to the SPA shell, which is what lets a
+// moderator reload on a player's history or paste a link to one.
+//
+// What is asserted is the NEGATIVE: not a 401 or 403. A test run has no ASSETS binding
+// (there is no client build behind it), so the catch-all answers 404 here and every other
+// SPA route — `/account`, `/login`, `/` — does too. A 401 would mean the staff middleware
+// had grown to cover these paths, and a cold load of the panel would start refusing
+// instead of rendering.
+it('leaves the panel’s own routes to the SPA rather than the staff endpoints', async () => {
+	for (const path of [
+		'/moderation',
+		'/moderation/search',
+		'/moderation/bans',
+		'/moderation/players/5',
+		'/moderation/reports/5/ban',
+	]) {
+		const res = await SELF.fetch(`https://example.com${path}`)
+		expect(res.status).not.toBe(401)
+		expect(res.status).not.toBe(403)
+		// Same answer the other SPA routes give in a test run, for the same reason.
+		expect(res.status).toBe((await SELF.fetch('https://example.com/account')).status)
+	}
+})
+
+// Ordered by when the ban LANDED, newest first: the list's job is catching mistakes, and
+// the ban most likely to be wrong is the one just handed down. See `getBansInForce`.
+it('serves standing bans most recently handed down first', async () => {
+	const older = await createReport(env.DB, { reporterPlayerId: 8231, reportedPlayerId: 8230 })
+	const newer = await createReport(env.DB, { reporterPlayerId: 8233, reportedPlayerId: 8232 })
+	// The older ban is the PERMANENT one, so an order by severity would float it to the top.
+	expect(
+		(await staffPost(`/api/staff/reports/${older.id}/ban`, 8110, { permanent: true })).status
+	).toBe(200)
+	await env.DB.prepare('UPDATE report SET banned_at = ?2 WHERE id = ?1')
+		.bind(older.id, '2024-01-01T00:00:00.000Z')
+		.run()
+	expect((await staffPost(`/api/staff/reports/${newer.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+
+	const bans = (await (await staffGet('/api/staff/bans', 8110)).json()) as Array<{ id: number }>
+	const ordered = bans.map((b) => b.id).filter((id) => [older.id, newer.id].includes(id))
+	expect(ordered).toEqual([newer.id, older.id])
 })

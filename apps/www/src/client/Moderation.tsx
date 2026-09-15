@@ -35,6 +35,43 @@ const TABS: Array<{ id: Tab; label: string }> = [
 	{ id: 'new', label: 'File a report' },
 ]
 
+const TAB_IDS = new Set<string>(TABS.map((t) => t.id))
+
+/**
+ * Which view a `/moderation/…` path names.
+ *
+ * Every one of these is a REAL URL rather than a piece of component state, so the back
+ * button walks back out of a drill-down instead of leaving the panel — which is what it
+ * did when the tab and the open player were held in `useState`: a moderator two clicks
+ * deep pressed Back and landed on the homepage, losing the whole session. Along the way it
+ * makes each view linkable, which is how one moderator hands another a player to look at.
+ *
+ * `/moderation` alone is the queue, so the nav link needs no tab in it and a bookmark of
+ * the bare path still opens on something.
+ */
+type View =
+	| { kind: 'tab'; tab: Tab }
+	| { kind: 'player'; playerId: number }
+	| { kind: 'ban'; reportId: number }
+
+function viewForPath(path: string): View {
+	const rest = path.replace(/^\/moderation\/?/, '').replace(/\/$/, '')
+	if (rest === '') return { kind: 'tab', tab: 'queue' }
+
+	const player = /^players\/(\d+)$/.exec(rest)
+	if (player) return { kind: 'player', playerId: Number.parseInt(player[1]!, 10) }
+
+	const ban = /^reports\/(\d+)\/ban$/.exec(rest)
+	if (ban) return { kind: 'ban', reportId: Number.parseInt(ban[1]!, 10) }
+
+	// An unknown segment falls back to the queue rather than rendering nothing: these paths
+	// are typed and pasted, and a typo should land somewhere usable.
+	return { kind: 'tab', tab: TAB_IDS.has(rest) ? (rest as Tab) : 'queue' }
+}
+
+/** Where a tab lives. The queue is the bare path, not `/moderation/queue`. */
+const tabPath = (tab: Tab): string => (tab === 'queue' ? '/moderation' : `/moderation/${tab}`)
+
 /**
  * A stored report, as `www` serves the row — snake_case, because it IS the row. Not every
  * column is rendered; the ones that are not (the measured heights, the instance type) are
@@ -240,22 +277,31 @@ function useNames(ids: number[]) {
 
 export function ModerationPage({
 	account,
+	path,
+	search,
 	navigate,
 }: {
 	account: { accountId: number; username: string } | null | undefined
+	/** The full pathname — the panel routes under `/moderation`; see {@link viewForPath}. */
+	path: string
+	/** The query string, where the search tab keeps its filters and its page. */
+	search: string
 	navigate: (to: string) => void
 }) {
-	const [tab, setTab] = useState<Tab>('queue')
-	// The player whose history is open, or null for the tab's own view. Local state rather
-	// than a route: it's a drill-down inside the panel, and a moderator walks in and out of
-	// several in a sitting without wanting each one in their back button.
-	const [openPlayer, setOpenPlayer] = useState<number | null>(null)
-	// The report a ban is being composed against. Held here so the dialog can be opened
-	// from any of the tables.
-	const [banning, setBanning] = useState<ReportRow | null>(null)
-	// Bumped after any write, to re-read whichever tables are on screen.
+	const view = viewForPath(path)
+	// Bumped after a write that leaves you where you are — lifting a ban from a table. A
+	// write that NAVIGATES (banning, filing a report) needs no bump: the view it lands on
+	// mounts fresh and reads for itself.
 	const [revision, setRevision] = useState(0)
 	const changed = useCallback(() => setRevision((n) => n + 1), [])
+	const openPlayer = useCallback(
+		(playerId: number) => navigate(`/moderation/players/${playerId}`),
+		[navigate]
+	)
+	const openBan = useCallback(
+		(report: ReportRow) => navigate(`/moderation/reports/${report.id}/ban`),
+		[navigate]
+	)
 
 	if (account === undefined) {
 		return (
@@ -306,61 +352,80 @@ export function ModerationPage({
 				</div>
 			</section>
 
-			{openPlayer !== null ? (
+			{view.kind === 'player' ? (
 				<PlayerHistory
-					playerId={openPlayer}
+					playerId={view.playerId}
 					revision={revision}
-					onBan={setBanning}
-					onClose={() => setOpenPlayer(null)}
+					navigate={navigate}
+					onBan={openBan}
 				/>
+			) : view.kind === 'ban' ? (
+				<BanDialog reportId={view.reportId} navigate={navigate} />
 			) : (
 				<div className="workspace">
 					<nav className="vtabs">
 						{TABS.map((t) => (
 							<button
 								key={t.id}
-								className={t.id === tab ? 'active' : ''}
-								onClick={() => setTab(t.id)}
+								className={t.id === view.tab ? 'active' : ''}
+								onClick={() => navigate(tabPath(t.id))}
 							>
 								{t.label}
 							</button>
 						))}
 					</nav>
 					<div className="panel">
-						{tab === 'queue' ? (
-							<ReportQueue revision={revision} onOpenPlayer={setOpenPlayer} />
-						) : tab === 'search' ? (
-							<ReportSearch
+						{view.tab === 'queue' ? (
+							<ReportQueue
+								search={search}
 								revision={revision}
-								onOpenPlayer={setOpenPlayer}
-								onBan={setBanning}
+								navigate={navigate}
+								onOpenPlayer={openPlayer}
+							/>
+						) : view.tab === 'search' ? (
+							<ReportSearch
+								search={search}
+								revision={revision}
+								navigate={navigate}
+								onOpenPlayer={openPlayer}
+								onBan={openBan}
 								onChanged={changed}
 							/>
-						) : tab === 'bans' ? (
-							<StandingBans revision={revision} onOpenPlayer={setOpenPlayer} onChanged={changed} />
+						) : view.tab === 'bans' ? (
+							<StandingBans revision={revision} onOpenPlayer={openPlayer} onChanged={changed} />
 						) : (
-							<FileReport
-								onFiled={(report) => {
-									changed()
-									setBanning(report)
-								}}
-							/>
+							// Filing a report navigates straight to the ban dialog for it — filing one
+							// is almost always the first half of banning somebody, and the new report's
+							// id is then in the URL, so the ban is a real page rather than a modal that
+							// a reload would lose.
+							<FileReport onFiled={openBan} />
 						)}
 					</div>
 				</div>
 			)}
-
-			{banning !== null && (
-				<BanDialog
-					report={banning}
-					onClose={() => setBanning(null)}
-					onDone={() => {
-						setBanning(null)
-						changed()
-					}}
-				/>
-			)}
 		</main>
+	)
+}
+
+/**
+ * Back out of a drill-down — the in-page counterpart of the browser's own back button,
+ * and deliberately the SAME action, so the two can't disagree about where "back" is.
+ *
+ * Falls forward to the panel's front page when there is no history to pop: a moderator who
+ * arrived on a pasted link has nothing behind them, and a button that did nothing would
+ * read as broken.
+ */
+function BackLink({ navigate, label }: { navigate: (to: string) => void; label: string }) {
+	return (
+		<button
+			className="linkish"
+			onClick={() => {
+				if (window.history.length > 1) window.history.back()
+				else navigate('/moderation')
+			}}
+		>
+			← {label}
+		</button>
 	)
 }
 
@@ -373,14 +438,27 @@ export function ModerationPage({
  * is a problem now rather than whoever has ever accumulated the most.
  */
 function ReportQueue({
+	search,
 	revision,
+	navigate,
 	onOpenPlayer,
 }: {
+	search: string
 	revision: number
+	navigate: (to: string) => void
 	onOpenPlayer: (id: number) => void
 }) {
-	const [sinceDays, setSinceDays] = useState('30')
-	const [minReports, setMinReports] = useState('3')
+	// In the URL for the same reason the search's filters are: a moderator who widens the
+	// window to 90 days, opens a player and presses Back must come back to the 90 days
+	// they were reading, not to a list quietly reset to the default.
+	const params = new URLSearchParams(search)
+	const sinceDays = params.get('sinceDays') ?? '30'
+	const minReports = params.get('minReports') ?? '3'
+	const queueUrl = (next: { sinceDays?: string; minReports?: string }) => {
+		const updated = new URLSearchParams({ sinceDays, minReports, ...next })
+		return `/moderation?${updated.toString()}`
+	}
+
 	const { data, error } = useStaffData<ReportedPlayerTally[]>(
 		`/api/staff/reports/top-reported?sinceDays=${encodeURIComponent(sinceDays)}&minReports=${encodeURIComponent(minReports)}`,
 		[revision]
@@ -398,7 +476,10 @@ function ReportQueue({
 			<div className="mod-filters">
 				<label>
 					Window
-					<select value={sinceDays} onChange={(e) => setSinceDays(e.target.value)}>
+					<select
+						value={sinceDays}
+						onChange={(e) => navigate(queueUrl({ sinceDays: e.target.value }))}
+					>
 						<option value="7">Last 7 days</option>
 						<option value="30">Last 30 days</option>
 						<option value="90">Last 90 days</option>
@@ -408,12 +489,20 @@ function ReportQueue({
 				</label>
 				<label>
 					Minimum reports
-					<input
-						type="number"
-						min="1"
+					{/* A select rather than a number box: each change is now a navigation, and a
+					    free-text field would push a history entry per digit typed — which would
+					    make the back button useless again, the thing this page is fixing. A
+					    threshold is coarse anyway; nobody needs to ask for seven. */}
+					<select
 						value={minReports}
-						onChange={(e) => setMinReports(e.target.value)}
-					/>
+						onChange={(e) => navigate(queueUrl({ minReports: e.target.value }))}
+					>
+						<option value="1">1 or more</option>
+						<option value="2">2 or more</option>
+						<option value="3">3 or more</option>
+						<option value="5">5 or more</option>
+						<option value="10">10 or more</option>
+					</select>
 				</label>
 			</div>
 
@@ -459,81 +548,145 @@ function ReportQueue({
 	)
 }
 
-/** The search form's state — mirrors the query params `searchReportsHandler` reads. */
+/**
+ * The search form's state. These are the SAME names the staff endpoint reads as query
+ * params (`searchReportsHandler`) and the same ones the panel's own URL carries, so the
+ * form, the address bar and the request can't drift apart — one spelling throughout.
+ *
+ * `from`/`to` are the `YYYY-MM-DD` a date input gives, converted to instants only when the
+ * request goes out; keeping the URL in the input's own format is what lets a bookmarked
+ * search repopulate the boxes exactly as they were typed.
+ */
 interface SearchFilters {
-	reported: string
-	reporter: string
-	category: string
+	reportedPlayerId: string
+	reporterPlayerId: string
+	reportCategory: string
 	banned: string
 	from: string
 	to: string
 }
 
 const EMPTY_FILTERS: SearchFilters = {
-	reported: '',
-	reporter: '',
-	category: '',
+	reportedPlayerId: '',
+	reporterPlayerId: '',
+	reportCategory: '',
 	banned: '',
 	from: '',
 	to: '',
 }
 
+/** Read the filters back out of the panel's URL. Absent keys read as empty. */
+function filtersFromSearch(search: string): SearchFilters {
+	const params = new URLSearchParams(search)
+	const read = (key: keyof SearchFilters) => params.get(key) ?? ''
+	return {
+		reportedPlayerId: read('reportedPlayerId'),
+		reporterPlayerId: read('reporterPlayerId'),
+		reportCategory: read('reportCategory'),
+		banned: read('banned'),
+		from: read('from'),
+		to: read('to'),
+	}
+}
+
+/**
+ * The panel URL for a set of filters and a page. Empty values are left OUT rather than
+ * written as blanks, so an unfiltered search is the bare `/moderation/search` and the
+ * address bar says only what was actually asked for.
+ */
+function searchUrl(filters: SearchFilters, skip: number): string {
+	const params = new URLSearchParams()
+	for (const [key, value] of Object.entries(filters)) {
+		if (value !== '') params.set(key, value)
+	}
+	if (skip > 0) params.set('skip', String(skip))
+	const query = params.toString()
+	return query === '' ? '/moderation/search' : `/moderation/search?${query}`
+}
+
 /**
  * Search the report log.
+ *
+ * The filters and the page live in the URL, not in component state: a moderator searches,
+ * opens a player, and presses Back — and has to land on the results they were reading,
+ * not on an empty form. It also makes a search linkable, which is how one moderator hands
+ * another a slice of the log to look at.
  *
  * The two player boxes take either an id or an `@username`, resolved through `accounts`'
  * search before the query goes out — a moderator following up a Discord report has a name,
  * not a number, and making them look it up elsewhere first is the kind of friction that
- * ends in nobody using the panel.
+ * ends in nobody using the panel. The URL holds the resolved ID, since that is what was
+ * searched and what makes the link reproducible.
  */
 function ReportSearch({
+	search,
 	revision,
+	navigate,
 	onOpenPlayer,
 	onBan,
 	onChanged,
 }: {
+	search: string
 	revision: number
+	navigate: (to: string) => void
 	onOpenPlayer: (id: number) => void
 	onBan: (report: ReportRow) => void
 	onChanged: () => void
 }) {
-	const [form, setForm] = useState<SearchFilters>(EMPTY_FILTERS)
-	// The query actually in flight, separate from what's typed: a search runs when it is
-	// submitted, not on every keystroke, and the ids in it are resolved by then.
-	const [query, setQuery] = useState<string | null>('?take=' + PAGE_SIZE)
-	const [skip, setSkip] = useState(0)
+	const applied = filtersFromSearch(search)
+	const skip = Number.parseInt(new URLSearchParams(search).get('skip') ?? '0', 10) || 0
+	// What is TYPED, which runs ahead of what is applied — a search happens on submit, not
+	// on every keystroke. Keyed on the URL so that arriving at a different search (a link,
+	// or the back button) resets the boxes to it instead of stranding the last thing typed.
+	const [form, setForm] = useState<SearchFilters>(applied)
+	const [formKey, setFormKey] = useState(search)
+	if (formKey !== search) {
+		setFormKey(search)
+		setForm(applied)
+	}
 	const { pending, error: formError, run } = useAction()
 
-	const path = query === null ? null : `/api/staff/reports${query}&skip=${skip}`
-	const { data, error } = useStaffData<{ reports: ReportRow[]; total: number }>(path, [revision])
+	const params = new URLSearchParams({ take: String(PAGE_SIZE), skip: String(skip) })
+	if (applied.reportedPlayerId !== '') params.set('reportedPlayerId', applied.reportedPlayerId)
+	if (applied.reporterPlayerId !== '') params.set('reporterPlayerId', applied.reporterPlayerId)
+	if (applied.reportCategory !== '') params.set('reportCategory', applied.reportCategory)
+	if (applied.banned !== '') params.set('banned', applied.banned)
+	// A date input gives a bare `YYYY-MM-DD`, so the window is sent as local midnights,
+	// which is what the moderator meant by it. `to` is EXCLUSIVE on the server, so the day
+	// typed there is included only by pushing the bound to the next midnight.
+	if (applied.from !== '') params.set('from', new Date(applied.from).toISOString())
+	if (applied.to !== '') {
+		const to = new Date(applied.to)
+		to.setDate(to.getDate() + 1)
+		params.set('to', to.toISOString())
+	}
+
+	const { data, error } = useStaffData<{ reports: ReportRow[]; total: number }>(
+		`/api/staff/reports?${params.toString()}`,
+		[revision]
+	)
 	const reports = data?.reports ?? []
 	const names = useNames(reports.flatMap((r) => [r.reported_player_id, r.reporter_player_id]))
 
 	const submit = (e: React.FormEvent) => {
 		e.preventDefault()
 		void run(async () => {
-			const params = new URLSearchParams({ take: String(PAGE_SIZE) })
-			// Either box may hold a name; resolve before searching so the query is by id, as
-			// the report rows are.
-			if (form.reported.trim() !== '') {
-				params.set('reportedPlayerId', String(await playerIdFrom(form.reported)))
+			// Either box may hold a name; resolve before navigating so the URL carries the id,
+			// as the report rows do.
+			const resolved: SearchFilters = {
+				...form,
+				reportedPlayerId:
+					form.reportedPlayerId.trim() === ''
+						? ''
+						: String(await playerIdFrom(form.reportedPlayerId)),
+				reporterPlayerId:
+					form.reporterPlayerId.trim() === ''
+						? ''
+						: String(await playerIdFrom(form.reporterPlayerId)),
 			}
-			if (form.reporter.trim() !== '') {
-				params.set('reporterPlayerId', String(await playerIdFrom(form.reporter)))
-			}
-			if (form.category !== '') params.set('reportCategory', form.category)
-			if (form.banned !== '') params.set('banned', form.banned)
-			// A date input gives a bare `YYYY-MM-DD`; `to` is exclusive on the server, so a
-			// day entered there includes that whole day only if it is pushed to the next
-			// midnight. Both are sent as local midnights, which is what the moderator meant.
-			if (form.from !== '') params.set('from', new Date(form.from).toISOString())
-			if (form.to !== '') {
-				const to = new Date(form.to)
-				to.setDate(to.getDate() + 1)
-				params.set('to', to.toISOString())
-			}
-			setSkip(0)
-			setQuery(`?${params.toString()}`)
+			// Back to page one: the new filters have their own result set, and staying on
+			// page three of it would usually show nothing.
+			navigate(searchUrl(resolved, 0))
 			return ''
 		})
 	}
@@ -550,24 +703,24 @@ function ReportSearch({
 				<label>
 					Reported player
 					<input
-						value={form.reported}
+						value={form.reportedPlayerId}
 						placeholder="@name or id"
-						onChange={(e) => setForm({ ...form, reported: e.target.value })}
+						onChange={(e) => setForm({ ...form, reportedPlayerId: e.target.value })}
 					/>
 				</label>
 				<label>
 					Reported by
 					<input
-						value={form.reporter}
+						value={form.reporterPlayerId}
 						placeholder="@name or id"
-						onChange={(e) => setForm({ ...form, reporter: e.target.value })}
+						onChange={(e) => setForm({ ...form, reporterPlayerId: e.target.value })}
 					/>
 				</label>
 				<label>
 					Category
 					<select
-						value={form.category}
-						onChange={(e) => setForm({ ...form, category: e.target.value })}
+						value={form.reportCategory}
+						onChange={(e) => setForm({ ...form, reportCategory: e.target.value })}
 					>
 						<option value="">Any</option>
 						{Object.entries(CATEGORY_LABEL).map(([id, label]) => (
@@ -608,14 +761,12 @@ function ReportSearch({
 					<button type="submit" disabled={pending}>
 						{pending ? 'Searching…' : 'Search'}
 					</button>
+					{/* Clearing is a navigation like any other search, so it goes in the history
+					    too — Back after a mis-click returns to what was being read. */}
 					<button
 						type="button"
 						className="linkish"
-						onClick={() => {
-							setForm(EMPTY_FILTERS)
-							setSkip(0)
-							setQuery(`?take=${PAGE_SIZE}`)
-						}}
+						onClick={() => navigate(searchUrl(EMPTY_FILTERS, 0))}
 					>
 						Clear
 					</button>
@@ -638,14 +789,22 @@ function ReportSearch({
 						onBan={onBan}
 						onChanged={onChanged}
 					/>
+					{/* Paging is navigation, so each page is its own history entry: Back walks
+					    back through the pages a moderator read rather than out of the panel. */}
 					<div className="mod-pager">
-						<button disabled={skip === 0} onClick={() => setSkip(Math.max(skip - PAGE_SIZE, 0))}>
+						<button
+							disabled={skip === 0}
+							onClick={() => navigate(searchUrl(applied, Math.max(skip - PAGE_SIZE, 0)))}
+						>
 							Previous
 						</button>
 						<span className="muted">
 							{skip + 1}–{Math.min(skip + PAGE_SIZE, total)} of {total}
 						</span>
-						<button disabled={skip + PAGE_SIZE >= total} onClick={() => setSkip(skip + PAGE_SIZE)}>
+						<button
+							disabled={skip + PAGE_SIZE >= total}
+							onClick={() => navigate(searchUrl(applied, skip + PAGE_SIZE))}
+						>
 							Next
 						</button>
 					</div>
@@ -791,8 +950,9 @@ function StandingBans({
 		<section className="card">
 			<h2>Standing bans</h2>
 			<p className="muted">
-				Bans in force right now, longest-lasting first. An expired ban isn&apos;t here — it has
-				served its time, and the report stays as the record that it happened.
+				Bans in force right now, most recent first — so a ban handed down by mistake is at the top,
+				where you would go looking for it. An expired ban isn&apos;t here: it has served its time,
+				and the report stays as the record that it happened.
 			</p>
 			{error && <p className="error">{error}</p>}
 			{data === null ? (
@@ -868,20 +1028,22 @@ function StandingBans({
 function PlayerHistory({
 	playerId,
 	revision,
+	navigate,
 	onBan,
-	onClose,
 }: {
 	playerId: number
 	revision: number
+	navigate: (to: string) => void
 	onBan: (report: ReportRow) => void
-	onClose: () => void
 }) {
+	// Bumped by a write that leaves you on this page — lifting a ban from the table below.
+	const [ownRevision, setOwnRevision] = useState(0)
 	const { data, error } = useStaffData<{
 		playerId: number
 		reports: ReportRow[]
 		warnings: WarningRow[]
 		activeBan: ReportRow | null
-	}>(`/api/staff/players/${playerId}`, [revision])
+	}>(`/api/staff/players/${playerId}`, [revision, ownRevision])
 	const reports = data?.reports ?? []
 	const warnings = data?.warnings ?? []
 	const names = useNames([
@@ -893,9 +1055,7 @@ function PlayerHistory({
 	return (
 		<>
 			<section className="card">
-				<button className="linkish" onClick={onClose}>
-					← Back to the tables
-				</button>
+				<BackLink navigate={navigate} label="Back to the tables" />
 				<h2>
 					<PlayerName id={playerId} names={names} />
 				</h2>
@@ -926,7 +1086,12 @@ function PlayerHistory({
 				{reports.length === 0 ? (
 					<p className="muted">Nobody has reported this player.</p>
 				) : (
-					<ReportTable reports={reports} names={names} onBan={onBan} onChanged={onClose} />
+					<ReportTable
+						reports={reports}
+						names={names}
+						onBan={onBan}
+						onChanged={() => setOwnRevision((n) => n + 1)}
+					/>
 				)}
 			</section>
 
@@ -1055,8 +1220,7 @@ function FileReport({ onFiled }: { onFiled: (report: ReportRow) => void }) {
 	const [player, setPlayer] = useState('')
 	const [category, setCategory] = useState(String(KickReportCategory.Misc))
 	const [details, setDetails] = useState('')
-	const [roomId, setRoomId] = useState('')
-	const { pending, error, done, run } = useAction()
+	const { pending, error, run } = useAction()
 
 	return (
 		<section className="card">
@@ -1075,14 +1239,13 @@ function FileReport({ onFiled }: { onFiled: (report: ReportRow) => void }) {
 								reportedPlayerId: await playerIdFrom(player),
 								reportCategory: Number(category),
 								details: details.trim(),
-								roomId: roomId.trim() === '' ? 0 : Number(roomId),
 							},
 						})
-						setPlayer('')
-						setDetails('')
-						setRoomId('')
+						// Straight to the ban page for the new report, which names it — so no
+						// success line is returned here: this form is gone by the time one could
+						// be read, and the fields don't need clearing for the same reason.
 						onFiled(report)
-						return `Filed report #${report.id}.`
+						return ''
 					})
 				}}
 			>
@@ -1110,21 +1273,11 @@ function FileReport({ onFiled }: { onFiled: (report: ReportRow) => void }) {
 					<textarea
 						value={details}
 						rows={4}
-						placeholder="What you saw, and where you saw it. Kept internally."
+						placeholder="What you saw, where you saw it, and anything a second moderator would need. Kept internally."
 						onChange={(e) => setDetails(e.target.value)}
 					/>
 				</label>
-				<label>
-					Room id (optional)
-					<input
-						value={roomId}
-						inputMode="numeric"
-						placeholder="If it happened in a particular room"
-						onChange={(e) => setRoomId(e.target.value)}
-					/>
-				</label>
 				{error && <p className="error">{error}</p>}
-				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
 					{pending ? 'Filing…' : 'File report'}
 				</button>
@@ -1153,21 +1306,58 @@ const BAN_LENGTHS: Array<{ label: string; days: number | null }> = [
  * Says out loud what applying it does beyond the row: the player is thrown out of the
  * instance they are standing in, which is the part that is not obvious from "ban".
  */
-function BanDialog({
-	report,
-	onClose,
-	onDone,
-}: {
-	report: ReportRow
-	onClose: () => void
-	onDone: () => void
-}) {
+function BanDialog({ reportId, navigate }: { reportId: number; navigate: (to: string) => void }) {
 	const [choice, setChoice] = useState('7')
 	const { pending, error, run } = useAction()
-	const names = useNames([report.reported_player_id])
+	// The report is READ here rather than handed down as a prop, which is what makes the
+	// URL self-sufficient: a reload, or a pasted `/moderation/reports/12/ban`, opens the
+	// same form instead of a blank page. It is also the report as it stands NOW — if
+	// somebody else banned it while this was being opened, that shows.
+	const { data: report, error: loadError } = useStaffData<ReportRow>(
+		`/api/staff/reports/${reportId}`
+	)
+	const names = useNames(report ? [report.reported_player_id] : [])
+
+	if (loadError !== '') {
+		return (
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<p className="error">{loadError}</p>
+			</section>
+		)
+	}
+	if (report === null) {
+		return (
+			<section className="card">
+				<p className="muted">Loading report #{reportId}…</p>
+			</section>
+		)
+	}
+
+	// Already actioned — reached by a stale link or the back button after banning. Shown
+	// as the standing ban it is rather than as a form that would silently re-ban and
+	// restart the clock.
+	if (report.banned === 1) {
+		return (
+			<section className="card">
+				<BackLink navigate={navigate} label="Back to the tables" />
+				<h2>
+					<PlayerName id={report.reported_player_id} names={names} /> is already banned
+				</h2>
+				<p className="muted">
+					Report #{report.id} — {expiryLabel(report)}. Lift it from the tables if this was a
+					mistake.
+				</p>
+				<button onClick={() => navigate(`/moderation/players/${report.reported_player_id}`)}>
+					See their history
+				</button>
+			</section>
+		)
+	}
 
 	return (
 		<section className="card mod-dialog">
+			<BackLink navigate={navigate} label="Back to the tables" />
 			<h2>
 				Ban <PlayerName id={report.reported_player_id} names={names} />
 			</h2>
@@ -1193,7 +1383,10 @@ function BanDialog({
 									? { banned: true, permanent: true }
 									: { banned: true, days: length.days },
 						})
-						onDone()
+						// Onto the player's record rather than back where they came from: it is
+						// the confirmation that the ban landed and the place to lift it from if it
+						// was wrong, and it means Back doesn't return to a spent form.
+						navigate(`/moderation/players/${report.reported_player_id}`)
 						return ''
 					})
 				}}
@@ -1218,7 +1411,14 @@ function BanDialog({
 					<button type="submit" disabled={pending}>
 						{pending ? 'Banning…' : 'Apply ban'}
 					</button>
-					<button type="button" className="linkish" onClick={onClose}>
+					<button
+						type="button"
+						className="linkish"
+						onClick={() => {
+							if (window.history.length > 1) window.history.back()
+							else navigate('/moderation')
+						}}
+					>
 						Cancel
 					</button>
 				</div>

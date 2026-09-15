@@ -431,14 +431,25 @@ export async function getTopReported(
 }
 
 /**
- * Every ban in force right now, longest-lasting first — the staff panel's standing-bans
- * list (`www`: `GET /api/staff/bans`).
+ * Every ban in force right now, MOST RECENTLY HANDED DOWN FIRST — the staff panel's
+ * standing-bans list (`www`: `GET /api/staff/bans`).
  *
  * "In force" is `getActiveBan`'s test applied to the whole table rather than to one
  * player: a row whose `ban_expires` has passed has served its time and is not listed,
  * though it stays as the record that it happened. A player with several in force appears
  * once per ban — each is a separate report, and which report justified which ban is the
  * point of the list.
+ *
+ * Ordered by WHEN THE BAN LANDED because the list's job is catching mistakes: the ban most
+ * likely to be wrong is the one just handed down, and a moderator who has slipped goes
+ * looking for it at the top. Ordering by severity instead (longest-lasting first, as this
+ * did) buries a fresh one-day ban under every permanent ban ever issued — exactly the
+ * wrong way round for the one read this list exists to serve.
+ *
+ * `COALESCE(banned_at, created_at)`: a ban set before 0020_report_ban_audit.sql added
+ * `banned_at` has only its report's date to sort by, which is the same fallback the block
+ * screen uses. Without the coalesce those rows would sort as NULL — all together at one
+ * end, in no order at all.
  */
 export async function getBansInForce(
 	db: D1Database,
@@ -449,7 +460,7 @@ export async function getBansInForce(
 		.prepare(
 			`SELECT * FROM report
 			 WHERE banned = 1 AND (ban_expires IS NULL OR ban_expires > ?1)
-			 ORDER BY ban_expires IS NOT NULL, ban_expires DESC, id DESC
+			 ORDER BY COALESCE(banned_at, created_at) DESC, id DESC
 			 LIMIT ?2`
 		)
 		.bind(now.toISOString(), Math.min(Math.max(take, 1), 500))
