@@ -51,6 +51,31 @@ bun runx admin grant-developer --account 1 --revoke
 bun runx admin grant-moderator --username alice --remote
 ```
 
+### `reload-plus` — credit every Plus subscriber's tokens
+
+Also exposed directly as `just reload-plus`.
+
+```sh
+just reload-plus 1000 --dry-run     # list subscribers and their balances, change nothing
+just reload-plus 1000 --remote      # +1000 RecCenterTokens to each subscriber, production
+```
+
+Adds `<amount>` RecCenterTokens (currency type 2) to the `balance` row of every account
+whose `hasPlus` flag is set — the flag `grant-plus` and the website's Discord claim write.
+Subscribers are found through the indexed `has_plus` column on `account` (auth migration
+0009), so the reload is one statement however many accounts there are. Nothing schedules
+it: run it when the subscription's tokens are due, and note that running it twice credits
+twice.
+
+A subscriber who has never loaded the game has no balance row yet. They get one holding
+their signup grant **plus** the reload, so the grant is not lost — the grant amount is
+`RECFLARE_STARTING_TOKENS` from the environment or `.env`, falling back to econ's default
+of 10000. Prints every credited account with its resulting balance.
+
+This command targets the `balance` table, so it runs under `apps/econ`'s wrangler config;
+with `--local` that is econ's dev D1 state, which needs both `balance` and a migrated
+`account` table in it.
+
 ### `lookup` — print an account
 
 ```sh
@@ -65,7 +90,7 @@ the account has a password, the developer role, and the moderator role.
 
 ### Selecting an account
 
-Every command targets exactly one account, by **either**:
+Every command except `reload-plus` targets exactly one account, by **either**:
 
 - `--account <id>` — numeric account id
 - `--username <name>` — username (case-insensitive)

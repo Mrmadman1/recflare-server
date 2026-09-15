@@ -2,7 +2,12 @@ import * as readline from 'node:readline'
 import { Command } from '@commander-js/extra-typings'
 import Table from 'cli-table3'
 
-import { execSql, resolveRemote, sqlStr, target } from '../d1'
+import {
+	DEFAULT_STARTING_TOKENS,
+	PLUS_MEMBERS_SQL,
+	plusReloadSql,
+} from '../../../../apps/econ/src/currency'
+import { execSql, readRootEnv, resolveRemote, sqlStr, target } from '../d1'
 import { hashPassword } from '../password'
 
 import type { D1ExecResult } from '../d1'
@@ -19,6 +24,7 @@ import type { D1ExecResult } from '../d1'
  *   runx admin lookup          --username alice [--remote]
  *   runx admin grant-developer --account 1 [--revoke] [--remote]
  *   runx admin grant-plus      --username alice [--revoke] [--remote]
+ *   runx admin reload-plus     <amount> [--dry-run] [--remote]
  */
 
 /**
@@ -173,6 +179,83 @@ const grantModerator = grantRoleCommand('grant-moderator', 'isModerator', 'moder
  */
 const grantPlus = grantRoleCommand('grant-plus', 'hasPlus', 'Rec Room Plus', 'subscription')
 
+/**
+ * The Rec Room Plus token reload: credit every subscriber's RecCenterTokens balance by
+ * `amount`, in one statement. Nothing schedules this — an operator runs it when the
+ * subscription's tokens are due (`just reload-plus 1000 --remote`), so running it twice
+ * credits twice; `--dry-run` shows who would be credited and what they hold, and changes
+ * nothing.
+ *
+ * Who is a subscriber is `account.hasPlus`, found through the `has_plus` generated column
+ * (auth migration 0009) — the same flag `grant-plus` and the website's Discord claim set,
+ * read straight off the row, so it does not lag a login the way the token's `rn.plus`
+ * claim does. A subscriber who has never touched econ has no balance row yet; they get one
+ * holding their signup grant plus the reload, so the grant isn't lost — see
+ * `plusReloadSql`. The grant amount is `RECFLARE_STARTING_TOKENS` from the environment
+ * or .env, the value a deploy ships to econ, falling back to econ's built-in default.
+ *
+ * Runs under econ's wrangler config because `balance` is econ's table; locally that
+ * means econ's dev D1 state, which has to hold both `balance` AND a migrated `account`.
+ */
+/** A row of `PLUS_MEMBERS_SQL` (and, sans `username`, of the reload's `RETURNING`). */
+interface PlusMemberRow {
+	account_id: number
+	username?: string | null
+	/** NULL when the account has no balance row yet, i.e. its signup grant is still pending. */
+	amount: number | null
+}
+
+const reloadPlus = new Command('reload-plus')
+	.description('Credit every Rec Room Plus subscriber with <amount> RecCenterTokens')
+	.argument('<amount>', 'Tokens to add to each subscriber (a positive integer)')
+	.option('--dry-run', 'List the subscribers and their balances without crediting', false)
+	.option('--local', 'Target the local dev database (the default).', false)
+	.option('--remote', 'Target the deployed database instead of the local dev database.', false)
+	.action(async (amountArg, opts) => {
+		if (!/^\d+$/.test(amountArg) || Number(amountArg) < 1) {
+			throw new Error('<amount> must be a positive integer')
+		}
+		const amount = Number(amountArg)
+		const remote = resolveRemote(opts)
+		const startingRaw = await readRootEnv('RECFLARE_STARTING_TOKENS')
+		const startingTokens = startingRaw == null ? DEFAULT_STARTING_TOKENS : Number(startingRaw)
+		if (!Number.isInteger(startingTokens) || startingTokens < 0) {
+			throw new Error(`RECFLARE_STARTING_TOKENS is not a non-negative integer: ${startingRaw}`)
+		}
+
+		console.log(`Plus subscribers on ${target(remote)}`)
+		const before = (await execSql<PlusMemberRow>(PLUS_MEMBERS_SQL, remote, 'econ')).results
+		if (before.length === 0) {
+			console.log(chalk.yellow('no accounts have hasPlus set — nothing to reload'))
+			return
+		}
+		const table = new Table({ head: ['account', 'username', 'tokens'] })
+		for (const r of before) {
+			table.push([
+				String(r.account_id),
+				r.username ?? '',
+				r.amount == null ? chalk.dim(`(none: grant ${startingTokens} pending)`) : String(r.amount),
+			])
+		}
+		console.log(table.toString())
+
+		if (opts.dryRun) {
+			console.log(
+				chalk.yellow(`dry run: would add ${amount} tokens to ${before.length} account(s)`)
+			)
+			return
+		}
+
+		console.log(`Adding ${amount} tokens to ${before.length} account(s)`)
+		const credited = (
+			await execSql<PlusMemberRow>(plusReloadSql(amount, startingTokens), remote, 'econ')
+		).results
+		const after = new Table({ head: ['account', 'tokens'] })
+		for (const r of credited) after.push([String(r.account_id), String(r.amount)])
+		console.log(after.toString())
+		console.log(chalk.green(`✓ ${amount} tokens added to ${credited.length} account(s)`))
+	})
+
 const lookup = new Command('lookup')
 	.description('Print an account by id or username')
 	.option('--account <id>', 'Account id to look up')
@@ -224,6 +307,7 @@ export const adminCmd = new Command('admin')
 	.addCommand(grantDeveloper)
 	.addCommand(grantModerator)
 	.addCommand(grantPlus)
+	.addCommand(reloadPlus)
 	.addCommand(lookup)
 	.addHelpText(
 		'after',
@@ -239,5 +323,7 @@ Examples:
   $ runx admin grant-developer --account 1 [--revoke]
   $ runx admin grant-moderator --username alice --remote
   $ runx admin grant-plus --username alice          # Rec Room Plus; takes effect next login
+  $ runx admin reload-plus 1000 --remote            # +1000 tokens to every Plus subscriber
+  $ runx admin reload-plus 1000 --dry-run           # just list them
   $ runx admin lookup --username alice --remote`
 	)

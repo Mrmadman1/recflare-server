@@ -18,8 +18,8 @@ import { getRepoRoot } from './path'
 /** The one shared database every D1-backed worker binds. */
 export const DB_NAME = 'recflare'
 
-export interface D1ExecResult {
-	results: Array<Record<string, unknown>>
+export interface D1ExecResult<Row = Record<string, unknown>> {
+	results: Row[]
 	success: boolean
 	meta: { changes?: number; rows_read?: number }
 }
@@ -37,15 +37,27 @@ export function resolveRemote(opts: { local?: boolean; remote?: boolean }): bool
 	return opts.remote === true
 }
 
-/** The deployed D1's real id, from the environment or the gitignored root .env. */
-export async function getRemoteD1Id(): Promise<string> {
-	if (process.env.RECFLARE_D1) return process.env.RECFLARE_D1
+/**
+ * One `RECFLARE_*` setting, from the process environment first and the gitignored root
+ * `.env` second — the same precedence `recflare_load_env` in src/sh/env.sh gives the deploy
+ * and dev scripts, so a CLI reads the value a deploy would ship. Undefined when set in
+ * neither place (a commented-out line in .env is "not set").
+ */
+export async function readRootEnv(key: string): Promise<string | undefined> {
+	if (process.env[key]) return process.env[key]
 	const envPath = path.join(getRepoRoot(), '.env')
 	if (await fs.pathExists(envPath)) {
 		const content = await fs.readFile(envPath, 'utf8')
-		const m = content.match(/^\s*RECFLARE_D1\s*=\s*(.+?)\s*$/m)
+		const m = content.match(new RegExp(`^\\s*${key}\\s*=\\s*(.+?)\\s*$`, 'm'))
 		if (m) return m[1].replace(/^["']|["']$/g, '')
 	}
+	return undefined
+}
+
+/** The deployed D1's real id, from the environment or the gitignored root .env. */
+export async function getRemoteD1Id(): Promise<string> {
+	const id = await readRootEnv('RECFLARE_D1')
+	if (id) return id
 	throw new Error('RECFLARE_D1 is not set — add the recflare D1 id to .env (see .env.example)')
 }
 
@@ -95,16 +107,16 @@ async function runD1(worker: string, extraArgs: string[], remote: boolean): Prom
  * only a duration, with no reliable `changes` count, so a statement that needs to know what it
  * matched has to say `RETURNING`.
  */
-export async function execSql(
+export async function execSql<Row = Record<string, unknown>>(
 	sql: string,
 	remote: boolean,
 	worker = 'auth'
-): Promise<D1ExecResult> {
+): Promise<D1ExecResult<Row>> {
 	const stdout = await runD1(worker, ['--command', sql, '--json'], remote)
 	// wrangler --json prints a one-element array of results to stdout.
 	const start = stdout.indexOf('[')
 	if (start === -1) throw new Error(`unexpected d1 execute output:\n${stdout}`)
-	const parsed = JSON.parse(stdout.slice(start)) as D1ExecResult[]
+	const parsed = JSON.parse(stdout.slice(start)) as Array<D1ExecResult<Row>>
 	const first = parsed[0]
 	if (!first) throw new Error(`empty d1 execute result:\n${stdout}`)
 	return first

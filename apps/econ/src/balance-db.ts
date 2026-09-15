@@ -1,4 +1,11 @@
 import { BalancePlatform } from '../../notify/src/notification-payloads'
+import { CurrencyType } from './currency'
+
+// The currency vocabulary and the Plus reload SQL live in the import-free `currency.ts` so
+// the Node CLI in @repo/tools can share them; re-exported here so this stays the module
+// everything else reads balances from.
+export { CurrencyType, DEFAULT_STARTING_TOKENS, PLUS_MEMBERS_SQL, plusReloadSql } from './currency'
+export type { CurrencyTypeValue } from './currency'
 
 /**
  * Currency balances on the shared `recflare` D1 database.
@@ -15,50 +22,6 @@ import { BalancePlatform } from '../../notify/src/notification-payloads'
  */
 
 /**
- * The currencies the client knows about (its `CurrencyType` enum, obfuscated
- * `GKPEKOLBBJL` — which lists every member below except `RoomInventoryItem`). The client sends
- * these ints in the balance/storefront paths — `/api/storefronts/v4/balance/2` is
- * RecCenterTokens — so the values are fixed by the client, not by us.
- *
- * What each one is:
- *  - `Invalid` (0): the enum's zero value. Never a real balance; a request for it is
- *    a client bug or a probe, and `isSpendable` rejects it.
- *  - `LaserTagTickets` (1): earned in the Laser Tag activity, spent in its own store.
- *  - `RecCenterTokens` (2): THE general-purpose currency — what players mean by
- *    "tokens", earned everywhere and spent in the avatar/gift-drop storefronts. This
- *    is the only one the client fetches on load, and the only one we grant at signup.
- *  - `LostSkullsGold` (100) / `DraculaSilver` (101): per-activity currencies for the
- *    Isle of Lost Skulls and Rise of Jumbo quests. Earned and spent inside those
- *    activities only.
- *  - `RecRoyaleSeason1` (200): a season currency for Rec Royale; legacy, no live faucet.
- *  - `RoomCurrency` (300) / `RoomInventoryItem` (301): NOT global balances. These are
- *    scoped to a specific room and served by the `/api/roomcurrencies/*` and
- *    `/api/roomconsumables/*` endpoints, whose rows are keyed by room as well as by
- *    account. They must never be stored in this (account, currency) table — a single
- *    row here couldn't say WHICH room's currency it is, so a player's coins in one
- *    room would spend in every other. `isSpendable` rejects them for that reason.
- *  - `ProgressionEvent` (400): an XP/progression counter the client models as a
- *    currency. Not spendable.
- *  - `RoomieCredits` (500): the newest member of the client's enum. Nothing here grants or
- *    spends it yet; it is listed so the enum matches the client's and a value arriving on
- *    the wire has a name rather than reading as an unknown number.
- */
-export const CurrencyType = {
-	Invalid: 0,
-	LaserTagTickets: 1,
-	RecCenterTokens: 2,
-	LostSkullsGold: 100,
-	DraculaSilver: 101,
-	RecRoyaleSeason1: 200,
-	RoomCurrency: 300,
-	RoomInventoryItem: 301,
-	ProgressionEvent: 400,
-	RoomieCredits: 500,
-} as const
-
-export type CurrencyTypeValue = (typeof CurrencyType)[keyof typeof CurrencyType]
-
-/**
  * The account-scoped currencies this table stores. Everything else in `CurrencyType`
  * is either not a balance (Invalid, ProgressionEvent) or is room-scoped and belongs to
  * the room-currency endpoints (RoomCurrency, RoomInventoryItem) — see the enum doc.
@@ -73,13 +36,6 @@ const SPENDABLE: readonly number[] = [
 
 /** Whether a currency is an account-scoped balance this table may hold. */
 export const isSpendable = (currencyType: number): boolean => SPENDABLE.includes(currencyType)
-
-/**
- * The signup grant, in RecCenterTokens, when the `STARTING_TOKENS` var is unset.
- * An operator overrides it in wrangler.jsonc `vars`; 0 is a valid setting and means
- * players start broke.
- */
-export const DEFAULT_STARTING_TOKENS = 10_000
 
 /**
  * What a player starts with, granted lazily the first time their balances are touched

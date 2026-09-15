@@ -44,6 +44,8 @@ import {
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
 	getBalance,
+	PLUS_MEMBERS_SQL,
+	plusReloadSql,
 	spendCurrency,
 } from '../../balance-db'
 import {
@@ -5654,5 +5656,75 @@ describe('catalog', () => {
 		expect(await getCatalogItem(env.DB, 'untouched-by-any-load')).toBeNull()
 		expect(await getCatalogItem(env.DB, 'merge-test-new')).toBeNull()
 		expect(await countCatalog(env.DB)).toEqual({ avatar_item: 1 })
+	})
+})
+
+/**
+ * The operator's Plus token reload (`just reload-plus`), which is SQL text rather than a
+ * helper because it is run through `wrangler d1 execute`. Exercised here against a real D1
+ * so the upsert's two halves — "existing row gains the amount" and "missing row is created
+ * with the signup grant folded in" — are pinned, and so the `has_plus` generated column the
+ * statement depends on is proven to exist in the mirrored schema.
+ */
+describe('plus token reload', () => {
+	const seed = async (accountId: number, hasPlus: boolean | undefined) => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId,
+					username: `Plus${accountId}`,
+					...(hasPlus === undefined ? {} : { hasPlus }),
+				})
+			)
+			.run()
+	}
+
+	test('credits every hasPlus account once, folding the signup grant into new rows', async () => {
+		await seed(8001, true) // subscriber with an existing balance
+		await seed(8002, true) // subscriber who has never touched econ: no balance row
+		await seed(8003, false) // explicitly not a subscriber
+		await seed(8004, undefined) // flag never set
+		await env.DB.prepare(
+			'INSERT OR REPLACE INTO balance (account_id, currency_type, amount) VALUES (8001, 2, 250)'
+		).run()
+		await env.DB.prepare(
+			'INSERT OR REPLACE INTO balance (account_id, currency_type, amount) VALUES (8003, 2, 250)'
+		).run()
+
+		// The read half: subscribers only, with the pending grant shown as a NULL balance.
+		const members = await env.DB.prepare(PLUS_MEMBERS_SQL).all<{
+			account_id: number
+			username: string
+			amount: number | null
+		}>()
+		expect(members.results.filter((r) => r.account_id >= 8001 && r.account_id <= 8004)).toEqual([
+			{ account_id: 8001, username: 'Plus8001', amount: 250 },
+			{ account_id: 8002, username: 'Plus8002', amount: null },
+		])
+
+		const res = await env.DB.prepare(plusReloadSql(1000, 500)).all<{
+			account_id: number
+			amount: number
+		}>()
+		const credited = res.results.filter((r) => r.account_id >= 8001 && r.account_id <= 8004)
+		expect(credited).toEqual(
+			expect.arrayContaining([
+				{ account_id: 8001, amount: 1250 },
+				{ account_id: 8002, amount: 1500 },
+			])
+		)
+		expect(credited).toHaveLength(2)
+
+		// The non-subscribers were left exactly as they were, and the fresh row is now a real
+		// grant: `ensureStartingBalances` sees it and does not grant again.
+		expect(await getBalance(env.DB, 8003, CurrencyType.RecCenterTokens, 500)).toBe(250)
+		expect(await getBalance(env.DB, 8004, CurrencyType.RecCenterTokens, 500)).toBe(500)
+		expect(await getBalance(env.DB, 8002, CurrencyType.RecCenterTokens, 500)).toBe(1500)
+	})
+
+	test('rejects a non-positive amount or a negative grant before touching the database', () => {
+		expect(() => plusReloadSql(0, 500)).toThrow('positive integer')
+		expect(() => plusReloadSql(1.5, 500)).toThrow('positive integer')
+		expect(() => plusReloadSql(100, -1)).toThrow('non-negative integer')
 	})
 })

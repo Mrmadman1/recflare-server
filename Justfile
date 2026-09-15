@@ -109,10 +109,18 @@ update *args:
 runx *args:
   bun runx "$@"
 
-# Admin account tools (set-password, clear-password, grant-developer, lookup).
+# Admin account tools (set-password, clear-password, grant-developer, grant-plus, lookup).
 # Run `just admin --help` for usage and examples. See CLI.md.
 [group('4. utility')]
 [positional-arguments]
 [no-cd]
 admin *args:
   bun runx admin "$@"
+
+# Credit every Rec Room Plus subscriber's RecCenterTokens balance by <amount>. Defaults to
+# --local; pass --remote for production, --dry-run to only list who'd be credited. See CLI.md.
+[group('4. utility')]
+[positional-arguments]
+[no-cd]
+reload-plus *args:
+  bun runx admin reload-plus "$@"

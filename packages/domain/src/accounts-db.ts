@@ -13,18 +13,25 @@
 
 /**
  * Schema DDL — the head schema, i.e. what the table looks like after every migration
- * (0001_accounts + 0002_avatar, sans seed INSERTs; 0004 added a `platform_id` generated
- * column and 0008 dropped it again, so it appears here in neither form).
+ * (0001_accounts + 0002_avatar + 0009_account_has_plus, sans seed INSERTs; 0004 added a
+ * `platform_id` generated column and 0008 dropped it again, so it appears here in neither
+ * form).
+ *
+ * `has_plus` mirrors the blob's `hasPlus` so the operator's Plus token reload can find every
+ * subscriber through its partial index instead of scanning every account's JSON. It is 1 for
+ * JSON true, 0 for false and NULL when the key is absent; the index holds only the 1s.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS account (
 		data TEXT NOT NULL,
 		avatar TEXT,
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
-		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL
+		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
+		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_accounts_username_lower ON account (username_lower)`,
+	`CREATE INDEX IF NOT EXISTS idx_account_has_plus ON account (has_plus) WHERE has_plus = 1`,
 ]
 
 /** Client-facing account shape (camelCase, exactly as the client's AccountDTO). */
