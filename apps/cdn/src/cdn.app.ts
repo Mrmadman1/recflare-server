@@ -329,6 +329,30 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `data/${c.req.param('id')}`)
 	)
 
+	// Custom avatar item assetbundles by name. A first-party custom avatar item (see the
+	// `api` worker's `custom_avatar_item`) is rendered from its `CurrentSaves`, each of
+	// which names a built Unity assetbundle by bare filename (`UnityAsset`, e.g.
+	// `anx442dm1a79kp9n4kugkbgd0.assetbundle`) that the client fetches from `/avatar/`.
+	// Streamed from R2 under `avatar/`. The rest of the path is matched so a foldered
+	// upload would resolve the same way as the other blob prefixes.
+	.get(
+		'/avatar/:asset{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve a custom avatar item assetbundle',
+			description: [
+				'Streams the object stored under `avatar/<asset>` — the built Unity assetbundle the',
+				'client downloads to render a first-party custom avatar item on one body type. The',
+				'name comes from a save’s `UnityAsset` (or `UnityAsset2`) in the item’s `CurrentSaves`',
+				'(see the `api` worker), a bare filename such as `anx442dm1a79kp9n4kugkbgd0.assetbundle`.',
+				'The worker does not interpret the bytes.',
+			].join(' '),
+			parameters: [keyParam('asset', 'The assetbundle filename.', true), ...CONDITIONAL_HEADERS],
+			responses: assetResponses('The assetbundle'),
+		}),
+		(c) => serveAsset(c, `avatar/${c.req.param('asset')}`)
+	)
+
 // The generated spec. Documentation only — no request is validated against it (see
 // openapi.ts). `hide: true` keeps this route out of its own output.
 app.get(
@@ -343,11 +367,13 @@ app.get(
 					description: [
 						'Binary asset delivery for recflare, a private-server reimplementation of the Rec',
 						'Room backend. Streams the blobs the client downloads while playing — anti-cheat',
-						'signatures, saved room scenes, invention data and generic client uploads — out of',
+						'signatures, saved room scenes, invention data, generic client uploads and custom',
+						'avatar item assetbundles — out of',
 						'the shared `recflare-cdn` R2 bucket, plus the JSON config files the client reads',
 						'from `/config/`.',
 						'',
-						'Everything is keyed by prefix (`sigs/`, `room/`, `invention/`, `data/`) and served as',
+						'Everything is keyed by prefix (`sigs/`, `room/`, `invention/`, `data/`, `avatar/`) and',
+						'served as',
 						'`application/octet-stream`; the worker never interprets what it hands back. Reads',
 						'are unauthenticated — a caller needs the exact key, which only comes from an',
 						'authenticated call to another worker.',

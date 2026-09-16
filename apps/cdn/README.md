@@ -15,8 +15,8 @@ route of its own, bundled rather than an asset, because its file is named differ
 its path.
 
 Objects are keyed by prefix — `sigs/` (anti-cheat signatures), `room/` (saved room
-scenes, and room images by their bare `ImageName`), `invention/` (invention data) — and
-served as `application/octet-stream`; the worker never interprets what it hands back.
+scenes, and room images by their bare `ImageName`), `invention/` (invention data), `data/`
+(generic client uploads), `avatar/` (custom avatar item assetbundles) — and served as `application/octet-stream`; the worker never interprets what it hands back.
 Reads are unauthenticated: a caller needs the exact key, which only comes from an
 authenticated call to another worker.
 

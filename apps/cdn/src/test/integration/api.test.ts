@@ -271,6 +271,21 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('GET /avatar/:asset streams the custom avatar item assetbundle from R2', async () => {
+		// A bare filename — what a first-party item's `CurrentSaves[].UnityAsset` names.
+		const name = 'anx442dm1a79kp9n4kugkbgd0.assetbundle'
+		await env.CDN_ASSETS.put(`avatar/${name}`, new Uint8Array([7, 8, 9]))
+		const res = await exports.default.fetch(`${ORIGIN}/avatar/${name}`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('application/octet-stream')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([7, 8, 9]))
+	})
+
+	test('GET /avatar/:asset 404s when the assetbundle is absent', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/avatar/missing.assetbundle`)
+		expect(res.status).toBe(404)
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -293,6 +308,7 @@ describe('cdn endpoints', () => {
 		)
 		expect([...documented].sort()).toEqual([
 			'GET /',
+			'GET /avatar/{asset}',
 			'GET /config/LoadingScreenTipData',
 			'GET /config/{name}',
 			'GET /data/{id}',
