@@ -6470,8 +6470,11 @@ describe('relationships', () => {
 		await mutate('/api/relationships/v2/sendfriendrequest', '770', 771)
 
 		// Both sides hear about it, each seeing the other player and their own side's
-		// type: the sender Sent (1), the recipient Received (2).
-		expect(await sentNotifications()).toEqual([
+		// type: the sender Sent (1), the recipient Received (2). The target ALSO gets the
+		// request itself as a FriendInvite (4) message — that is what the client shows.
+		const sent = await sentNotifications()
+		expect(sent).toHaveLength(3)
+		expect(sent.slice(0, 2)).toEqual([
 			{
 				playerId: 770,
 				notificationType: 1,
@@ -6483,6 +6486,34 @@ describe('relationships', () => {
 				data: { PlayerID: 770, RelationshipType: 2, Favorited: 0, Ignored: 0, Muted: 0 },
 			},
 		])
+		expect(sent[2]?.playerId).toBe(771)
+		expect(sent[2]?.notificationType).toBe(2) // NotificationType.MessageReceived
+		expect(sent[2]?.data).toMatchObject({ FromPlayerId: 770, ToPlayerId: 771, Type: 4, Data: null })
+
+		// The message is stored under the same id, so an offline target finds it on login.
+		const frameId = (sent[2]?.data as unknown as { Id: number }).Id
+		expect(frameId).toBeGreaterThan(0)
+		const inbox = (await (
+			await exports.default.fetch(`${ORIGIN}/api/messages/v2/get`, { headers: await bearer('771') })
+		).json()) as Array<{ Id: number; FromPlayerId: number; Type: number }>
+		expect(inbox.find((m) => m.Id === frameId)).toMatchObject({ FromPlayerId: 770, Type: 4 })
+	})
+
+	test('a re-sent request says nothing; a crossing request tells the requester it was accepted', async () => {
+		await mutate('/api/relationships/v2/sendfriendrequest', '772', 773)
+		await resetNotifications()
+		// Re-sending an outstanding request is a no-op: nothing is pushed at all.
+		await mutate('/api/relationships/v2/sendfriendrequest', '772', 773)
+		expect(await sentNotifications()).toEqual([])
+		// The crossing request auto-accepts: both hear Friend, and the ORIGINAL requester
+		// (772) is told their request was accepted rather than asked anything.
+		await mutate('/api/relationships/v2/sendfriendrequest', '773', 772)
+		const sent = await sentNotifications()
+		expect(sent).toHaveLength(3)
+		expect(sent.slice(0, 2).every((n) => n.notificationType === 1)).toBe(true)
+		expect(sent[2]?.playerId).toBe(772)
+		expect(sent[2]?.notificationType).toBe(2) // NotificationType.MessageReceived
+		expect(sent[2]?.data).toMatchObject({ FromPlayerId: 773, ToPlayerId: 772, Type: 40 })
 	})
 
 	test('accepting notifies both players as Friend', async () => {
@@ -6490,8 +6521,13 @@ describe('relationships', () => {
 		await resetNotifications()
 		await mutate('/api/relationships/v2/acceptfriendrequest', '781', 780)
 
-		const sent = await sentNotifications()
-		expect(sent).toHaveLength(2)
+		const all = await sentNotifications()
+		expect(all).toHaveLength(3)
+		// The requester also gets the acceptance as a FriendRequestAccepted (40) message.
+		expect(all[2]?.playerId).toBe(780)
+		expect(all[2]?.notificationType).toBe(2) // NotificationType.MessageReceived
+		expect(all[2]?.data).toMatchObject({ FromPlayerId: 781, ToPlayerId: 780, Type: 40, Data: null })
+		const sent = all.slice(0, 2)
 		// Friend (3) is symmetric, so both sides see the same type, each pointing at the other.
 		expect(sent).toEqual(
 			expect.arrayContaining([
@@ -6538,8 +6574,10 @@ describe('relationships', () => {
 		await mutate('/api/relationships/v2/sendfriendrequest', '821', 820)
 
 		const sent = await sentNotifications()
-		expect(sent).toHaveLength(2)
-		for (const n of sent) expect(n.data.RelationshipType).toBe(3)
+		expect(sent).toHaveLength(3)
+		for (const n of sent.slice(0, 2)) expect(n.data.RelationshipType).toBe(3)
+		// ...and 820, whose request this crossed, is told it was accepted.
+		expect(sent[2]).toMatchObject({ playerId: 820, notificationType: 2, data: { Type: 40 } })
 	})
 })
 

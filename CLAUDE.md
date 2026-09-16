@@ -216,6 +216,12 @@ inconsistency here without checking the client first.
   `GiftPackage` null — no box is minted. `GET /econ/customAvatarItems/v1/owned` is that table
   joined to the item record PLUS everything the caller created (drafts included): a creator
   owns their own through `CreatorAccountId`, and the bag refuses to sell it to them.
+- A friend request is SHOWN to the target as a Message of type 4 `FriendInvite` (`api`:
+  `/api/relationships/v2/sendfriendrequest`), and an acceptance to the requester as type 40
+  `FriendRequestAccepted` (`acceptfriendrequest`, and the crossing-request auto-accept),
+  each stored and pushed as `MessageReceived`. The `RelationshipChanged` frames only
+  refresh relationship state: sent alone, the request "worked" server-side and the target
+  saw nothing. Same pattern as the cheer.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

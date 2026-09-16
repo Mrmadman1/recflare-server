@@ -11,7 +11,9 @@ import {
 	getMutualFriendIds,
 	getNotificationsForPlayer,
 	getRelationshipsForPlayer,
+	MessageType,
 	MUTUAL_FRIENDS_LIMIT,
+	RelationshipType,
 	removeFriend,
 	sendFriendRequest,
 	setRelationshipFlag,
@@ -120,6 +122,34 @@ async function notifyBoth(
 	if (!change.changed) return
 	await notifyRelationship(c, playerId, change.self)
 	await notifyRelationship(c, otherId, change.other)
+}
+
+/**
+ * Store and push the MESSAGE that a friend-graph change shows the other player. The
+ * `RelationshipChanged` frames above only refresh relationship state; what the client
+ * actually surfaces — the request in their inbox with accept/decline, the "accepted your
+ * request" line — is a Message of the right {@link MessageType} delivered as
+ * `MessageReceived`, and stored so it's still there in `GET /api/messages/v2/get` for a
+ * player who was offline. `Data` is NULL for both — the client's Message DTO carries
+ * `"Data": null` on a FriendInvite (a payload-less type, unlike a DM's empty string); the
+ * sender id is the whole payload.
+ * Delivery failure is logged by `pushMessage`; the row is committed either way.
+ */
+async function pushFriendMessage(
+	c: Context<App>,
+	fromPlayerId: number,
+	toPlayerId: number,
+	type: MessageType.FriendInvite | MessageType.FriendRequestAccepted
+): Promise<void> {
+	await pushMessage(
+		c,
+		await createNotification(c.env.DB, {
+			FromPlayerId: fromPlayerId,
+			ToPlayerId: toPlayerId,
+			Type: type,
+			Data: null,
+		})
+	)
 }
 
 /**
@@ -454,8 +484,10 @@ export const socialRoutes = new Hono<App>({ strict: false })
 		'/api/relationships/v2/sendfriendrequest',
 		friendMutation(
 			'Send a friend request',
-			'Offer friendship to another player. Re-sending an outstanding request is a no-op ' +
-				'and notifies nobody.'
+			'Offer friendship to another player. A new request also lands in the target’s inbox ' +
+				'as a `FriendInvite` message (type 4), pushed as `MessageReceived` — that message, ' +
+				'not the `RelationshipChanged` frame, is what the client shows them. Re-sending an ' +
+				'outstanding request is a no-op and notifies nobody.'
 		),
 		async (c) => {
 			const id = await authedId(c)
@@ -464,6 +496,17 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			if (target === null || target === id) return c.json({ error: 'invalid player id' }, 400)
 			const change = await sendFriendRequest(c.env.DB, id, target)
 			await notifyBoth(c, id, target, change)
+			// A NEW request is what the target sees as a FriendInvite message (the reference
+			// sends it on exactly this outcome). A request that crosses one the target already
+			// had out auto-accepts instead — so the target hears their own request was accepted,
+			// as if they'd been accepted the ordinary way. A no-op re-send says nothing.
+			if (change.changed) {
+				if (change.self.RelationshipType === RelationshipType.FriendRequestSent) {
+					await pushFriendMessage(c, id, target, MessageType.FriendInvite)
+				} else if (change.self.RelationshipType === RelationshipType.Friend) {
+					await pushFriendMessage(c, id, target, MessageType.FriendRequestAccepted)
+				}
+			}
 			return c.json(change.self)
 		}
 	)
@@ -474,8 +517,9 @@ export const socialRoutes = new Hono<App>({ strict: false })
 		'/api/relationships/v2/acceptfriendrequest',
 		friendMutation(
 			'Accept a friend request',
-			'Turn a pending incoming request into a friendship. Accepting nothing pending is a ' +
-				'no-op and notifies nobody.'
+			'Turn a pending incoming request into a friendship. The requester is told with a ' +
+				'`FriendRequestAccepted` message (type 40) pushed as `MessageReceived`. Accepting ' +
+				'nothing pending is a no-op and notifies nobody.'
 		),
 		async (c) => {
 			const id = await authedId(c)
@@ -484,6 +528,10 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			if (target === null || target === id) return c.json({ error: 'invalid player id' }, 400)
 			const change = await acceptFriendRequest(c.env.DB, id, target)
 			await notifyBoth(c, id, target, change)
+			// The requester is told, as a FriendRequestAccepted message from the accepter.
+			if (change.changed) {
+				await pushFriendMessage(c, id, target, MessageType.FriendRequestAccepted)
+			}
 			return c.json(change.self)
 		}
 	)
