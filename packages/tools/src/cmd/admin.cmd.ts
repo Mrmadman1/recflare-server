@@ -269,10 +269,11 @@ const CUSTOM_AVATAR_ITEM_EXPORT = 'apps/econ/static/db/2025-1-cai.json'
  * Load the first-party custom avatar items into `custom_avatar_item` (owned by the `api`
  * worker). Like `runx catalog load`: the table's STRUCTURE is a migration, its first-party
  * CONTENTS are not, and this is the reload. Each record lands as the row's JSON with its
- * `CreatorAccountId` forced to the Coach account (1) — what makes it stock content here — (the
- * statements come from api's `custom-avatar-items-load.ts`, the same ones the migration
- * generator writes), an id already present is REPLACED, and nothing is deleted — the players'
- * own shirts share the table and an export never mentions them. Re-running is always safe.
+ * `CreatorAccountId` forced to the Coach account (1) — what makes it stock content here — and
+ * each save's `ThumbnailFileName` put under `avatar/` (the statements come from api's
+ * `custom-avatar-items-load.ts`, the same ones the migration generator writes), an id already
+ * present is REPLACED, and nothing is deleted — the players' own shirts share the table and an
+ * export never mentions them. Re-running is always safe.
  */
 const caiLoad = new Command('cai-load')
 	.description('Load first-party custom avatar items from an export JSON (merges; never deletes)')

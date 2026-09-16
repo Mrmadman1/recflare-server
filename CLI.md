@@ -89,14 +89,15 @@ Loads an export of `CustomAvatarItem` records (a JSON array, a `{ Results }` pag
 record) into the `custom_avatar_item` table, each stored as the row's JSON with its
 `CreatorAccountId` forced to 1, the Coach account, whatever the export said: that is what
 files it as stock content (the storefront tab searches by creator) and what a purchase
-pays. It MERGES: an id already in the table has its row replaced, and nothing is deleted, so the
+pays. Each save's `ThumbnailFileName` is put under `avatar/`, where this server serves
+those images from (a name already prefixed is left alone). It MERGES: an id already in the table has its row replaced, and nothing is deleted, so the
 players' own shirts, which share the table, are untouched. Re-running is safe. The load is
 verified by counting rows and probing ids from across the export; it fails loudly rather
 than report a partial load. `--dry-run` reads and validates the export and prints the
 statement count without writing.
 
-The saves in an export name assetbundles and thumbnails by bare filename; the load stores
-the names only.
+The saves in an export name their assetbundles by bare filename; the load stores the
+names only.
 
 ### `lookup` — print an account
 

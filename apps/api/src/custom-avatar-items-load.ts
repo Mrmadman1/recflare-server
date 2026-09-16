@@ -9,10 +9,10 @@
  * mapping with no imports, so both sides can use it.
  *
  * A row is the record as JSON (see 0022_custom_avatar_item_json.sql), so a load is the export
- * verbatim: no per-field mapping, and a field the source adds later rides along. Two things
+ * verbatim: no per-field mapping, and a field the source adds later rides along. Three things
  * change on the way in: `PurchaseInfo`, a store-side projection the worker fills at read time,
- * is stripped, and `CreatorAccountId` is FORCED to the Coach account — see
- * {@link customAvatarItemRowLiteral}.
+ * is stripped; `CreatorAccountId` is FORCED to the Coach account; and each save's
+ * `ThumbnailFileName` is put under the `avatar/` prefix — see {@link customAvatarItemRowLiteral}.
  */
 
 /**
@@ -22,6 +22,13 @@
  * in Workers types.
  */
 export const COACH_ACCOUNT_ID = 1
+
+/**
+ * Where a save's thumbnail is served from. The export names it bare
+ * (`f2y1ndzuvm5ke2hjmn4cwfwfl.png`); this server keeps those images under `avatar/` in the
+ * image bucket, so the name is prefixed on the way in and the client asks for the right key.
+ */
+export const SAVE_THUMBNAIL_PREFIX = 'avatar/'
 
 /** The least an export record must carry to be a row. Everything else is kept as-is. */
 export interface CustomAvatarItemExportRecord {
@@ -60,18 +67,47 @@ export function readCustomAvatarItemExport(parsed: unknown): CustomAvatarItemExp
 }
 
 /**
- * One record as the SQL string literal its row holds: the JSON, minus `PurchaseInfo`, with
- * `CreatorAccountId` overridden to {@link COACH_ACCOUNT_ID} whatever the export said. An
+ * A save's `ThumbnailFileName` under {@link SAVE_THUMBNAIL_PREFIX}. Idempotent — a name that
+ * already carries the prefix is left alone — so loading a file that was itself dumped from
+ * this table does not stack a second `avatar/`. Anything that is not a non-empty string
+ * (null, absent) is returned as it came.
+ */
+export function prefixSaveThumbnail(name: unknown): unknown {
+	if (typeof name !== 'string' || name === '') return name
+	return name.startsWith(SAVE_THUMBNAIL_PREFIX) ? name : SAVE_THUMBNAIL_PREFIX + name
+}
+
+/**
+ * One record as the SQL string literal its row holds: the JSON, minus `PurchaseInfo`, with two
+ * fields rewritten.
+ *
+ * `CreatorAccountId` is overridden to {@link COACH_ACCOUNT_ID} whatever the export said. An
  * imported item is first-party content by definition, and the creator id is what makes it so
  * here: the storefront tab finds stock items by `creator_account_id = 1`
  * (`includeCoachItems=True`), and a sale pays the creator. An export from another server
  * carries THAT server's creator ids — an item filed under one of those would vanish from the
  * storefront into the user-generated tab, and its price would be paid to whichever local
  * account happened to share the number.
+ *
+ * Each save's `ThumbnailFileName` is prefixed with {@link SAVE_THUMBNAIL_PREFIX}, which is where
+ * this server serves those images from. The rest of the save — the assetbundle names above
+ * all — is untouched.
  */
 export function customAvatarItemRowLiteral(record: CustomAvatarItemExportRecord): string {
 	const { PurchaseInfo: _purchaseInfo, ...stored } = record
-	const row = { ...stored, CreatorAccountId: COACH_ACCOUNT_ID }
+	const saves = Array.isArray(stored.CurrentSaves)
+		? stored.CurrentSaves.map((save: unknown) =>
+				save && typeof save === 'object' && !Array.isArray(save)
+					? {
+							...(save as Record<string, unknown>),
+							ThumbnailFileName: prefixSaveThumbnail(
+								(save as { ThumbnailFileName?: unknown }).ThumbnailFileName
+							),
+						}
+					: save
+			)
+		: stored.CurrentSaves
+	const row = { ...stored, CreatorAccountId: COACH_ACCOUNT_ID, CurrentSaves: saves }
 	return `'${JSON.stringify(row).replaceAll("'", "''")}'`
 }
 

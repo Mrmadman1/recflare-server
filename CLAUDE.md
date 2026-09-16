@@ -203,7 +203,8 @@ inconsistency here without checking the client first.
   those four NULL and is rendered from `CurrentSaves` — one built Unity assetbundle per
   `BodyType`, which the client picks by the wearer's body. The row is the record as JSON, so an
   import is the export verbatim except that `CreatorAccountId` is forced to 1, the Coach — which
-  is what files it as stock content and whom a sale pays (`just cai-load` loads it;
+  is what files it as stock content and whom a sale pays — and each save's `ThumbnailFileName`
+  is put under `avatar/`, where this server serves it from (`just cai-load` loads it;
   `apps/api/scripts/import-custom-avatar-items.ts` writes a migration; re-importing an id
   replaces it). Serve both through one shape: the shirt carries
   empty `CurrentSaves`/`Tags` and null `CustomBadgeMetadata`, never a missing key. The saves

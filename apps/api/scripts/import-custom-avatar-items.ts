@@ -12,11 +12,12 @@
  * For a load that needs no migration and no deploy — the usual case — use
  * `just admin cai-load` instead, which runs the same statements straight against a database.
  * The statements come from src/custom-avatar-items-load.ts either way: each record stored as
- * the row's JSON minus `PurchaseInfo` and with `CreatorAccountId` forced to the Coach account
- * (1), an existing id REPLACED, nothing deleted.
+ * the row's JSON minus `PurchaseInfo`, with `CreatorAccountId` forced to the Coach account (1)
+ * and each save's `ThumbnailFileName` put under `avatar/`, an existing id REPLACED, nothing
+ * deleted.
  *
- * The saves name assetbundles and thumbnails by bare filename; the migration does nothing
- * about those files, which have to be served from wherever the client fetches them.
+ * The saves name assetbundles by bare filename; the migration does nothing about those files,
+ * which have to be served from wherever the client fetches them.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
