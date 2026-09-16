@@ -99,6 +99,28 @@ statement count without writing.
 The saves in an export name their assetbundles by bare filename; the load stores the
 names only.
 
+A record's `Price` is what a purchase charges, and the official export mostly says 0. The
+prices come from a storefront dump instead, `apps/econ/static/db/Watch_EnumValue_3.json`
+(a `{ StoreItems }` page with price and rarity, joined on
+`GiftDrop.AvatarItemInfo.DownloadableAvatarItemId` = `CustomAvatarItemId`). Before loading
+a fresh export, write those prices into it:
+
+```sh
+bun apps/api/scripts/price-custom-avatar-items.ts \
+  apps/econ/static/db/2025-1-cai.json apps/econ/static/db/Watch_EnumValue_3.json
+just cai-load --remote
+```
+
+The script rewrites the export in place with the base token price (`CurrencyType` 2),
+ignoring any sale. It warns about every price it changes that wasn't 0 before. The
+storefront only prices items already in the export; nothing is added from it. An item the
+storefront doesn't list keeps its old price, unless that price is 0, which would make it
+free to buy. Those items (the Cryptid Creek event rewards and the Evergrown Hip Pack) get the
+catalog's rarity-50 price, `PRICE_BY_RARITY[50]` in `apps/econ/src/catalog-load.ts`. The
+script names every item the storefront doesn't list. The
+committed `2025-1-cai.json` is already priced. Rarity isn't carried over, since the record
+has no field for it.
+
 ### `lookup` — print an account
 
 ```sh

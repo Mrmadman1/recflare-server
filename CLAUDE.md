@@ -206,7 +206,11 @@ inconsistency here without checking the client first.
   is what files it as stock content and whom a sale pays — and each save's `ThumbnailFileName`
   is put under `avatar/`, where this server serves it from (`just cai-load` loads it;
   `apps/api/scripts/import-custom-avatar-items.ts` writes a migration; re-importing an id
-  replaces it). Serve both through one shape: the shirt carries
+  replaces it). The export's `Price` is mostly 0, and a purchase charges the record's `Price`,
+  so first-party prices are written into the export from the storefront dump
+  (`apps/econ/static/db/Watch_EnumValue_3.json`, joined on
+  `AvatarItemInfo.DownloadableAvatarItemId`) by `apps/api/scripts/price-custom-avatar-items.ts`
+  before loading. Serve both through one shape: the shirt carries
   empty `CurrentSaves`/`Tags` and null `CustomBadgeMetadata`, never a missing key. The saves
   name their assetbundles and thumbnails by bare filename; storing the record does nothing
   about serving those files.

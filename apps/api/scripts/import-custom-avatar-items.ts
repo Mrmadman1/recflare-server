@@ -16,6 +16,9 @@
  * and each save's `ThumbnailFileName` put under `avatar/`, an existing id REPLACED, nothing
  * deleted.
  *
+ * The export's `Price` is mostly 0; run `price-custom-avatar-items.ts` against it first to fill
+ * in prices from the storefront dump.
+ *
  * The saves name assetbundles by bare filename; the migration does nothing about those files,
  * which have to be served from wherever the client fetches them.
  */
