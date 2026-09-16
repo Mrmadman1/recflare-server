@@ -207,6 +207,15 @@ inconsistency here without checking the client first.
   empty `CurrentSaves`/`Tags` and null `CustomBadgeMetadata`, never a missing key. The saves
   name their assetbundles and thumbnails by bare filename; storing the record does nothing
   about serving those files.
+- Buying a custom avatar item goes through the ordinary bag (`econ`: `POST /api/items/bulkpurchase`)
+  as a line whose `ItemPurchaseMethodId` is `{ Type: 1, Guid: <CustomAvatarItemId> }`, beside
+  the `Type: 0, NumberId` catalog lines. It is a SALE between players: the price leaves the buyer
+  in the bag's one debit and is credited to the item's `CreatorAccountId` (pushed to them as a
+  `StorefrontBalanceUpdate` carrying their resulting total), ownership is a row in
+  `inventory_custom`, and the entry's `Data.CustomAvatarItem` is the whole item record with
+  `GiftPackage` null — no box is minted. `GET /econ/customAvatarItems/v1/owned` is that table
+  joined to the item record PLUS everything the caller created (drafts included): a creator
+  owns their own through `CreatorAccountId`, and the bag refuses to sell it to them.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

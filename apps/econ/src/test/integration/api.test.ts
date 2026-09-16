@@ -73,6 +73,7 @@ import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../ch
 import { buildRotation, rotationIndex, withWeeklyGift } from '../../challenge-rotation'
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
+import { grantCustomAvatarItem, INVENTORY_CUSTOM_SCHEMA_DDL } from '../../inventory-custom-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
 import { ROOM_CONSUMABLE_SCHEMA_DDL, ROOM_INVENTORY_SCHEMA_DDL } from '../../room-consumable-db'
@@ -163,6 +164,7 @@ beforeAll(async () => {
 	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of INVENTORY_CUSTOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_CURRENCY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -523,14 +525,69 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
-	test('GET /econ/customAvatarItems/v1/owned 401s without a token, returns an empty paginated stub', async () => {
+	test('GET /econ/customAvatarItems/v1/owned 401s without a token, lists what the caller bought', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/econ/customAvatarItems/v1/owned`)
 		expect(anon.status).toBe(401)
+		// Nothing bought yet: the paginated envelope, empty.
 		const res = await exports.default.fetch(`${ORIGIN}/econ/customAvatarItems/v1/owned`, {
-			headers: await bearer(),
+			headers: await bearer('610'),
 		})
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ Results: [], TotalResults: 0 })
+
+		// Two bought items and two the caller made (one still a draft): the owned list is what
+		// was BOUGHT plus what they CREATED, each as the whole record out of
+		// `custom_avatar_item`, oldest first by when it became theirs — a purchase's time for
+		// a bought item, the item's creation for a made one.
+		const make = (name: string, creator: number, accessibility = 1, createdAt?: Date) =>
+			createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: creator,
+					name,
+					description: '',
+					price: 100,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				createdAt
+			)
+		const first = await make('Bought First', 205)
+		const second = await make('Bought Second', 206)
+		const made = await make('Made Myself', 610, 1, new Date('2026-08-03T00:00:00Z'))
+		const draft = await make('Made Myself, Unpublished', 610, 0, new Date('2026-08-04T00:00:00Z'))
+		await grantCustomAvatarItem(
+			env.DB,
+			610,
+			second.CustomAvatarItemId,
+			new Date('2026-08-02T00:00:00Z')
+		)
+		await grantCustomAvatarItem(
+			env.DB,
+			610,
+			first.CustomAvatarItemId,
+			new Date('2026-08-01T00:00:00Z')
+		)
+		// Someone else's purchase of the same item is theirs, not the caller's.
+		await grantCustomAvatarItem(env.DB, 611, first.CustomAvatarItemId)
+
+		const owned = await exports.default.fetch(`${ORIGIN}/econ/customAvatarItems/v1/owned`, {
+			headers: await bearer('610'),
+		})
+		expect(owned.status).toBe(200)
+		expect(await owned.json()).toEqual({
+			Results: [
+				{ ...first, PurchaseInfo: null },
+				{ ...second, PurchaseInfo: null },
+				{ ...made, PurchaseInfo: null },
+				{ ...draft, PurchaseInfo: null },
+			],
+			TotalResults: 4,
+		})
 	})
 
 	test('GET /api/objectives/v1/myprogress returns the default progress (no auth)', async () => {
@@ -3113,7 +3170,7 @@ describe('econ endpoints', () => {
 				Data: {
 					GiftPackage: Record<string, unknown> | null
 					PurchasableItemId: number | null
-					CustomAvatarItem: null
+					CustomAvatarItem: Record<string, unknown> | null
 				}
 			}>
 		} | null
@@ -3428,6 +3485,200 @@ describe('econ endpoints', () => {
 		)
 		expect(received?.accountId).toBe(207)
 		expect(received?.payload).toMatchObject({ Id: box?.Id, FromPlayerId: 960, GiftContext: 500 })
+	})
+
+	// ---- custom avatar items in the bag --------------------------------------------------
+	// A line whose `ItemPurchaseMethodId` is a `Guid` (Type 1) names a custom avatar item by its
+	// `CustomAvatarItemId`, resolved against the `custom_avatar_item` table rather than the
+	// catalog. It is a SALE between players: the price leaves the buyer and lands on the
+	// creator, ownership lands in `inventory_custom`, and there is no gift box.
+
+	/** A guid-keyed bag line, in the shape the client posts one. */
+	const customLine = (
+		guid: string,
+		requestedPrice: number,
+		extra: Record<string, unknown> = {}
+	) => ({
+		ItemPurchaseMethodId: { Type: 1, NumberId: null, Guid: guid },
+		RequestedPrice: requestedPrice,
+		Gift: null,
+		CouponConsumablePlayerMappingId: null,
+		DuplicateItemCount: 1,
+		...extra,
+	})
+
+	/** A published custom item by `creator`, at `price` tokens. */
+	const customItem = (creator: number, price: number, accessibility = 1) =>
+		createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: creator,
+			name: 'Bag Visor',
+			description: '',
+			price,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#fff',
+			accessibility,
+			designFilename: 'design_x.bin',
+			thumbnailImageFilename: 'thumb_x.png',
+		})
+
+	const tokens = (accountId: number) =>
+		getBalance(env.DB, accountId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+
+	test('POST /api/items/bulkpurchase sells a custom avatar item: buyer pays, creator is paid, item is owned', async () => {
+		// Buyer 620 and creator 621 are both fresh, so each starts on the default grant — the
+		// creator's is seeded before the payout lands, or the credit would create their row and
+		// eat their signup tokens.
+		const item = await customItem(621, 900)
+		await drainFrames()
+		const res = await bulkPurchase('620', {
+			PurchaseItemRequests: [customLine(item.CustomAvatarItemId, 900)],
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as BulkBody
+		expect(body.Success).toBe(true)
+		expect(body.Error).toBe(null)
+		const value = body.Value!
+		expect(value.Balance).toBe(DEFAULT_STARTING_TOKENS - 900)
+		expect(value.Platform).toBe(-2)
+		expect(codes(body)).toEqual([0])
+		// The entry names the item rather than a catalog id, carries the WHOLE record for the
+		// client to render, and has no box: the item went straight into the inventory.
+		expect(value.BalanceUpdates[0].Data).toEqual({
+			GiftPackage: null,
+			PurchasableItemId: null,
+			CustomAvatarItem: { ...item, PurchaseInfo: null },
+		})
+
+		// The money moved both ways.
+		expect(await tokens(620)).toBe(DEFAULT_STARTING_TOKENS - 900)
+		expect(await tokens(621)).toBe(DEFAULT_STARTING_TOKENS + 900)
+		// The creator hears about the sale as a plain update carrying their RESULTING total,
+		// then the buyer's one purchase frame for the bag — both set the account-wide bucket.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 621,
+				notificationType: NotificationType.StorefrontBalanceUpdate,
+				payload: { Balance: DEFAULT_STARTING_TOKENS + 900, CurrencyType: 2, Platform: -2 },
+			},
+			{
+				accountId: 620,
+				notificationType: NotificationType.StorefrontBalancePurchase,
+				payload: {
+					BalanceAddType: 1400,
+					Delta: -900,
+					Balance: DEFAULT_STARTING_TOKENS - 900,
+					Platform: -2,
+					CurrencyType: 2,
+				},
+			},
+		])
+
+		// Owned now: the item shows on the buyer's owned list, and no gift box was left behind.
+		const owned = await exports.default.fetch(`${ORIGIN}/econ/customAvatarItems/v1/owned`, {
+			headers: await bearer('620'),
+		})
+		expect(await owned.json()).toEqual({
+			Results: [{ ...item, PurchaseInfo: null }],
+			TotalResults: 1,
+		})
+		const gifts = await exports.default.fetch(`${ORIGIN}/api/avatar/v2/gifts`, {
+			headers: await bearer('620'),
+		})
+		expect(await gifts.json()).toEqual([])
+
+		// Buying it again is refused as AlreadyOwned and charges nothing.
+		const again = await bulkPurchase('620', {
+			PurchaseItemRequests: [customLine(item.CustomAvatarItemId, 900)],
+		})
+		const againBody = (await again.json()) as BulkBody
+		expect(againBody.Success).toBe(false)
+		expect(againBody.Error).toBe('Already owned')
+		expect(await tokens(620)).toBe(DEFAULT_STARTING_TOKENS - 900)
+		expect(await tokens(621)).toBe(DEFAULT_STARTING_TOKENS + 900)
+	})
+
+	test('POST /api/items/bulkpurchase mixes a custom item into a catalog bag, matching the guid case-insensitively', async () => {
+		// The exact bag the client posts from the store: storefront 3, tokens, partial success
+		// on. One catalog line and one custom line, the guid upper-cased as the client sometimes
+		// sends it, settle together in ONE debit.
+		const item = await customItem(623, 100)
+		const res = await bulkPurchase('622', {
+			PurchaseItemRequests: [
+				line(SF3_ITEM.id, SF3_ITEM.price),
+				customLine(item.CustomAvatarItemId.toUpperCase(), 100),
+			],
+		})
+		const body = (await res.json()) as BulkBody
+		expect(body.Success).toBe(true)
+		expect(codes(body)).toEqual([0, 0])
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - SF3_ITEM.price - 100)
+		expect(body.Value!.BalanceUpdates[0].Data.PurchasableItemId).toBe(SF3_ITEM.id)
+		expect(body.Value!.BalanceUpdates[0].Data.CustomAvatarItem).toBe(null)
+		expect(body.Value!.BalanceUpdates[1].Data.PurchasableItemId).toBe(null)
+		expect(body.Value!.BalanceUpdates[1].Data.CustomAvatarItem).toMatchObject({
+			CustomAvatarItemId: item.CustomAvatarItemId,
+		})
+		expect(await tokens(623)).toBe(DEFAULT_STARTING_TOKENS + 100)
+	})
+
+	test('POST /api/items/bulkpurchase refuses the custom lines that cannot be sold, per line', async () => {
+		const draft = await customItem(625, 100, 0)
+		const own = await customItem(624, 100)
+		const priced = await customItem(625, 300)
+		const res = await bulkPurchase('624', {
+			PurchaseItemRequests: [
+				// A draft (Accessibility 0) is visible to its creator alone; to a buyer it is no item.
+				customLine(draft.CustomAvatarItemId, 100),
+				// An id nothing has.
+				customLine(crypto.randomUUID(), 100),
+				// The buyer's own item: they own it already, and would be paying themself.
+				customLine(own.CustomAvatarItemId, 100),
+				// A stale price.
+				customLine(priced.CustomAvatarItemId, 200),
+				// Owned once: no stacking.
+				customLine(priced.CustomAvatarItemId, 300, { DuplicateItemCount: 2 }),
+				// Not giftable: a custom item comes without a box to announce it with.
+				customLine(priced.CustomAvatarItemId, 300, {
+					Gift: { ToPlayerId: 626, Anonymous: false, Message: 'hi' },
+				}),
+				// And the one good line, which the partial bag still buys.
+				customLine(priced.CustomAvatarItemId, 300),
+			],
+		})
+		const body = (await res.json()) as BulkBody
+		expect(body.Success).toBe(true)
+		// 4 NoItemAvailable, 4, 8 PlayerNotEligible, 6 RequestedPriceDoesNotMatch,
+		// 7 RequestedAmountNotAllowed, 8, 0 OK.
+		expect(codes(body)).toEqual([4, 4, 8, 6, 7, 8, 0])
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - 300)
+		expect(
+			body.Value!.BalanceUpdates.slice(0, 6).every((u) => u.Data.CustomAvatarItem === null)
+		).toBe(true)
+		expect(await tokens(625)).toBe(DEFAULT_STARTING_TOKENS + 300)
+
+		// Without partial success the first bad line refuses the whole bag, unpaid.
+		const strict = await bulkPurchase('627', {
+			PurchaseItemRequests: [
+				customLine(priced.CustomAvatarItemId, 300),
+				customLine(draft.CustomAvatarItemId, 100),
+			],
+			AllowPartialSuccess: false,
+		})
+		const strictBody = (await strict.json()) as BulkBody
+		expect(strictBody.Success).toBe(false)
+		expect(strictBody.Error).toBe('Item not found')
+		expect(await tokens(627)).toBe(DEFAULT_STARTING_TOKENS)
+		expect(await tokens(625)).toBe(DEFAULT_STARTING_TOKENS + 300)
+
+		// A custom item is priced in tokens only: a bag in another currency cannot buy one.
+		const wrongCurrency = await bulkPurchase('627', {
+			PurchaseItemRequests: [customLine(priced.CustomAvatarItemId, 300)],
+			CurrencyType: 1,
+		})
+		const wrongBody = (await wrongCurrency.json()) as BulkBody
+		expect(wrongBody.Success).toBe(false)
+		expect(wrongBody.Error).toBe('Currency type not available for this item')
 	})
 
 	test('POST /api/items/bulkpurchase 404s a bag gifting to a player that does not exist', async () => {

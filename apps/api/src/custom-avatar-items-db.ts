@@ -163,9 +163,17 @@ const DTO_DEFAULTS = {
 	PurchaseInfo: null,
 } as const
 
-function toDto(row: Row): CustomAvatarItem {
-	const stored = JSON.parse(row.data) as CustomAvatarItem
+/**
+ * A stored row's JSON as the client's record. Exported for the `econ` worker's owned-items
+ * read, which joins `inventory_custom` to this table and must serve the same shape.
+ */
+export function parseCustomAvatarItem(data: string): CustomAvatarItem {
+	const stored = JSON.parse(data) as CustomAvatarItem
 	return { ...DTO_DEFAULTS, ...stored, RankingContext: null, PurchaseInfo: null }
+}
+
+function toDto(row: Row): CustomAvatarItem {
+	return parseCustomAvatarItem(row.data)
 }
 
 /** Inserts a new player-made custom avatar item and returns it as the client's DTO. */

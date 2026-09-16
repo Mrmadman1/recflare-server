@@ -108,9 +108,12 @@ export const RoomEconConfig = z.object({
 	EnableSortingTabs: z.boolean().describe('Always false — no per-room config is stored'),
 })
 
-/** `GET /econ/customAvatarItems/v1/owned` — paginated owned custom items. */
+/**
+ * `GET /econ/customAvatarItems/v1/owned` — the caller's bought custom items, each the full
+ * `CustomAvatarItem` record as the `api` worker serves it (see its `CustomAvatarItemDto`).
+ */
 export const CustomAvatarItemsResponse = z.object({
-	Results: JsonArray,
+	Results: z.array(JsonObject),
 	TotalResults: z.int(),
 })
 
@@ -310,13 +313,17 @@ export const BuyItemResponse = z.object({
 /**
  * How a bulk-purchase line names its item. A discriminated id: the client buys both
  * catalog items (a storefront `PurchasableItemId`, under `NumberId`, `Type` 0) and
- * guid-keyed ones (UGC / custom avatar items). Only the numeric form resolves here —
- * nothing sells guid-keyed items yet, so a `Guid` id fails its line.
+ * guid-keyed ones (`Type` 1, a custom avatar item's `CustomAvatarItemId` under `Guid`),
+ * which resolve against the `custom_avatar_item` table and are paid to their creator.
  */
 export const ItemPurchaseMethodId = z.object({
-	Type: z.int().describe('0 = NumberId. Anything else names a guid-keyed item we can’t sell'),
+	Type: z.int().describe('0 = NumberId (a storefront item); 1 = Guid (a custom avatar item)'),
 	NumberId: z.int().nullable().optional().describe('The storefront PurchasableItemId'),
-	Guid: z.string().nullable().optional().describe('The guid-keyed item id; always null here'),
+	Guid: z
+		.string()
+		.nullable()
+		.optional()
+		.describe('The `CustomAvatarItemId` of a custom avatar item, for Type 1'),
 })
 
 /**
@@ -364,7 +371,9 @@ export const BulkPurchaseResponse = z.object({
 									'and under `BypassGiftPackages` — the item is granted either way'
 							),
 							PurchasableItemId: z.int().nullable().describe('The catalog item this line named'),
-							CustomAvatarItem: z.null().describe('The UGC counterpart; never sold here'),
+							CustomAvatarItem: JsonObject.nullable().describe(
+								'The whole `CustomAvatarItem` record on a guid-keyed line that sold; null otherwise'
+							),
 						}),
 					})
 				)

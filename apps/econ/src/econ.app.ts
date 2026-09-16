@@ -75,6 +75,11 @@ import {
 	grantConsumable,
 } from './consumables-db'
 import { getEquipment, grantEquipment, setEquipmentFavorited } from './equipment-db'
+import {
+	getOwnedCustomAvatarItems,
+	grantCustomAvatarItem,
+	ownedCustomAvatarItemIds,
+} from './inventory-custom-db'
 import { getInventory, grantItem, toAvatarItemV4 } from './inventory-db'
 import {
 	AUTHED,
@@ -1656,8 +1661,9 @@ interface BulkLineFailure {
 	error: string
 }
 
-/** A line that resolved to something buyable, with the catalog's own price. */
-interface BulkPurchaseLine {
+/** A line that resolved to a catalog item, with the catalog's own price. */
+interface BulkCatalogLine {
+	kind: 'catalog'
 	method: PurchaseMethodId
 	item: StoreItem
 	/** The UNIT price from the catalog — `count` copies cost `price * count`. */
@@ -1667,18 +1673,36 @@ interface BulkPurchaseLine {
 }
 
 /**
+ * A line that resolved to a CUSTOM avatar item — a guid-keyed line, the `Guid` being the
+ * item's `CustomAvatarItemId` — at the item's own `Price`. Owned once, so `count` is one; the
+ * price goes to the item's creator rather than nowhere, which is what makes it a sale.
+ */
+interface BulkCustomLine {
+	kind: 'custom'
+	method: PurchaseMethodId
+	custom: CustomAvatarItem
+	price: number
+	count: 1
+	gift: null
+}
+
+/** A line that resolved to something buyable. */
+type BulkPurchaseLine = BulkCatalogLine | BulkCustomLine
+
+/**
  * One `BalanceUpdates[].Data` — what a single requested item turned into. Unlike buyItem's,
  * it NAMES the purchase rather than describing the drop: the client already has the catalog
  * entry for `PurchasableItemId`, so the only thing it can't reconstruct is the box.
  *
- * `CustomAvatarItem` is the UGC counterpart of `PurchasableItemId`, and both it and
- * `GiftPackage` are null on a line that didn't sell. Nothing here fills `CustomAvatarItem`:
- * no catalog we serve sells guid-keyed items.
+ * `CustomAvatarItem` is the UGC counterpart of `PurchasableItemId`: the whole item record on
+ * a guid-keyed line that sold, which the client has nothing else to render it from. Both it
+ * and `GiftPackage` are null on a line that didn't sell, and a custom item comes without a
+ * box — it is granted straight into `inventory_custom` rather than wrapped.
  */
 interface BulkPurchaseData {
 	GiftPackage: Record<string, unknown> | null
 	PurchasableItemId: number | null
-	CustomAvatarItem: null
+	CustomAvatarItem: CustomAvatarItem | null
 }
 
 /** `ItemPurchaseMethodId.Type` for a numeric (storefront `PurchasableItemId`) id. */
@@ -1819,18 +1843,10 @@ function resolveBulkLine(
 	line: PurchaseItemRequest,
 	storefront: Storefront | null,
 	currencyType: number,
-	subscriber: boolean
+	subscriber: boolean,
+	custom: CustomBagContext
 ): BulkPurchaseLine | BulkLineFailure {
 	const method = toPurchaseMethodId(line.ItemPurchaseMethodId)
-	// Guid-keyed ids name UGC / custom avatar items, which no catalog here sells. Failing the
-	// line (rather than the request) is what lets a bag of ordinary items still go through.
-	if (method.Type !== PURCHASE_METHOD_NUMBER_ID || method.NumberId === null) {
-		return {
-			method,
-			code: UpdateResponse.NoItemAvailable,
-			error: 'Only numeric storefront item ids can be bought',
-		}
-	}
 	// Nothing issues coupons, so a line claiming one would otherwise be charged full price
 	// for a discount it thinks it applied.
 	if (
@@ -1849,6 +1865,18 @@ function resolveBulkLine(
 			method,
 			code: UpdateResponse.RequestedAmountNotAllowed,
 			error: 'DuplicateItemCount must be a positive integer',
+		}
+	}
+	// A guid-keyed line names a CUSTOM avatar item, resolved against the `custom_avatar_item`
+	// table rather than the bag's catalog.
+	if (method.Type === PURCHASE_METHOD_TYPE_GUID) {
+		return resolveCustomLine(line, method, count, currencyType, custom)
+	}
+	if (method.Type !== PURCHASE_METHOD_NUMBER_ID || method.NumberId === null) {
+		return {
+			method,
+			code: UpdateResponse.NoItemAvailable,
+			error: 'Only storefront item ids and custom avatar item guids can be bought',
 		}
 	}
 	if (storefront === null) {
@@ -1886,12 +1914,89 @@ function resolveBulkLine(
 		}
 	}
 	const gift = typeof line.Gift === 'object' && line.Gift !== null ? line.Gift : null
-	return { method, item, price: checked.charge, count, gift }
+	return { kind: 'catalog', method, item, price: checked.charge, count, gift }
+}
+
+/**
+ * What a bag's guid-keyed lines resolve against, read ONCE for the bag: the custom avatar
+ * items it names (keyed by lowercased id — a GUID's case is not part of its identity, and the
+ * client is not consistent about it) and which of them the buyer already owns.
+ */
+interface CustomBagContext {
+	buyerId: number
+	items: Map<string, CustomAvatarItem>
+	owned: Set<string>
+}
+
+/**
+ * Resolve a guid-keyed line to the custom avatar item it names, or the failure its entry will
+ * carry. The rules are buyInvention's, per line: the item must exist and be published
+ * (`Accessibility` 0 is a draft, visible to its creator alone), the buyer must not be its
+ * creator (who owns it already — and would be paying themself) nor own it already, and the
+ * posted `RequestedPrice` must be the item's `Price` — no subscriber band, since a custom
+ * item has no `SubscriberPrices`. Custom items are priced in RecCenterTokens only, as the
+ * store lists them, so a bag in another currency cannot buy one. Owned once, so a count above
+ * one is refused as it is for an avatar item; and not giftable, since a custom item is granted
+ * without a box and a gift here would land on the receiver unannounced.
+ */
+function resolveCustomLine(
+	line: PurchaseItemRequest,
+	method: PurchaseMethodId,
+	count: number,
+	currencyType: number,
+	custom: CustomBagContext
+): BulkCustomLine | BulkLineFailure {
+	const guid = method.Guid?.toLowerCase() ?? null
+	const item = guid === null ? undefined : custom.items.get(guid)
+	if (guid === null || item === undefined || item.Accessibility === 0) {
+		return { method, code: UpdateResponse.NoItemAvailable, error: 'Item not found' }
+	}
+	if (item.CreatorAccountId === custom.buyerId) {
+		return {
+			method,
+			code: UpdateResponse.PlayerNotEligible,
+			error: 'Cannot buy your own item',
+		}
+	}
+	if (custom.owned.has(guid)) {
+		return { method, code: UpdateResponse.AlreadyOwned, error: 'Already owned' }
+	}
+	if (currencyType !== CurrencyType.RecCenterTokens) {
+		return {
+			method,
+			code: UpdateResponse.NoItemAvailable,
+			error: 'Currency type not available for this item',
+		}
+	}
+	if (count !== 1) {
+		return {
+			method,
+			code: UpdateResponse.RequestedAmountNotAllowed,
+			error: 'This item can only be bought once per line',
+		}
+	}
+	if (typeof line.Gift === 'object' && line.Gift !== null) {
+		return {
+			method,
+			code: UpdateResponse.PlayerNotEligible,
+			error: 'Custom avatar items cannot be gifted',
+		}
+	}
+	if (line.RequestedPrice !== item.Price) {
+		return {
+			method,
+			code: UpdateResponse.RequestedPriceDoesNotMatch,
+			error: !Number.isInteger(line.RequestedPrice)
+				? 'RequestedPrice is required'
+				: 'Price has changed',
+		}
+	}
+	return { kind: 'custom', method, custom: item, price: item.Price, count: 1, gift: null }
 }
 
 /** Whether a resolved line is buyable or is already a failure. */
 function isBulkLine(resolved: BulkPurchaseLine | BulkLineFailure): resolved is BulkPurchaseLine {
-	return 'item' in resolved
+	return 'kind' in resolved
 }
 
 /**
@@ -2540,29 +2645,34 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The player's owned custom avatar items. [Authorize]; paginated. Empty stub for
-	// now (no DB binding). The client downloads these when custom-item creation is
-	// allowed; a 404 here surfaces as "Failed to download unlocked avatar items".
+	// The player's owned custom avatar items. [Authorize]; the paginated envelope. What the
+	// caller has BOUGHT through bulkpurchase (`inventory_custom`) plus what they CREATED, each
+	// the whole `CustomAvatarItem` record out of the item table. The client downloads these
+	// when custom-item creation is allowed; a 404 here surfaces as "Failed to download
+	// unlocked avatar items".
 	.get(
 		'/econ/customAvatarItems/v1/owned',
 		describeRoute({
 			tags: ['Avatar'],
 			summary: 'Owned custom avatar items',
 			description: [
-				'Paginated owned custom items. Empty stub for now. The client requests this when',
-				'custom-item creation is allowed; a 404 shows as “Failed to download unlocked',
-				'avatar items”.',
+				'The custom avatar items the caller owns — bought (`POST /api/items/bulkpurchase` with',
+				'a guid-keyed line) or created (`CreatorAccountId`, drafts included) — each as its full',
+				'`CustomAvatarItem` record out of the `custom_avatar_item` table, oldest first by when',
+				'it became theirs, in the `{ Results, TotalResults }` envelope. No paging is applied',
+				'(the client sends none), so `TotalResults` is the list’s length.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(CustomAvatarItemsResponse, 'Paginated results (empty for now)'),
+				200: json(CustomAvatarItemsResponse, 'The owned items'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json({ Results: [], TotalResults: 0 })
+			const Results = await getOwnedCustomAvatarItems(c.env.DB, id)
+			return c.json({ Results, TotalResults: Results.length })
 		}
 	)
 
@@ -4428,9 +4538,16 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Buy a bag of storefront items',
 			description: [
 				'Resolves every line against the bag’s storefront catalog (one read for the whole',
-				'bag), confirms each line’s `RequestedPrice` still matches, debits the total in ONE',
-				'atomic spend, grants what sold, and answers the `{ Success, Error, error_id, Value }`',
-				'envelope. `Value.Balance` is the RESULTING total (not buyItem’s change) in the',
+				'bag) — or, for a line whose `ItemPurchaseMethodId` is a `Guid` (Type 1), against the',
+				'`custom_avatar_item` table, the guid being a `CustomAvatarItemId` — confirms each',
+				'line’s `RequestedPrice` still matches, debits the total in ONE atomic spend, grants',
+				'what sold, and answers the `{ Success, Error, error_id, Value }` envelope. A custom',
+				'item is a sale between players: its price is paid to its creator (pushed to them as',
+				'a balance update), ownership lands in `inventory_custom` with no gift box, and the',
+				'entry’s `CustomAvatarItem` carries the item itself. A custom line fails with',
+				'AlreadyOwned on a re-buy, PlayerNotEligible for its own creator or when gifted, and',
+				'NoItemAvailable for a draft, an unknown id or a currency other than RecCenterTokens.',
+				'`Value.Balance` is the RESULTING total (not buyItem’s change) in the',
 				'`Platform` bucket named beside it, and `BalanceUpdates` carries one entry per',
 				'REQUESTED item, each with its own `UpdateResponse`. `AllowPartialSuccess` lets some',
 				'of those be non-OK while `Success` stays true; without it a single bad line refuses',
@@ -4509,9 +4626,29 @@ const app = new Hono<App>({ strict: false })
 				catalogItems.length === 0
 					? storefront
 					: { StoreItems: [...(storefront?.StoreItems ?? []), ...catalogItems] }
+			// The bag may also name CUSTOM avatar items — a line whose id is a `Guid`, the item's
+			// `CustomAvatarItemId` — which resolve against the `custom_avatar_item` table rather than
+			// the catalog. One read for the items the bag names and one for which of them the buyer
+			// already owns, so each line still resolves in memory.
+			const guids = lines.flatMap((line) => {
+				const method = toPurchaseMethodId(line.ItemPurchaseMethodId)
+				return method.Type === PURCHASE_METHOD_TYPE_GUID && method.Guid !== null
+					? [method.Guid.toLowerCase()]
+					: []
+			})
+			const custom: CustomBagContext = {
+				buyerId: id,
+				items: new Map(
+					(await getCustomAvatarItems(c.env.DB, guids)).map((item) => [
+						item.CustomAvatarItemId.toLowerCase(),
+						item,
+					])
+				),
+				owned: await ownedCustomAvatarItemIds(c.env.DB, id, guids),
+			}
 			const subscriber = await isSubscriber(c)
 			const resolved = lines.map((line) =>
-				resolveBulkLine(line, bagCatalog, currencyType as number, subscriber)
+				resolveBulkLine(line, bagCatalog, currencyType as number, subscriber, custom)
 			)
 			const buyable = resolved.filter(isBulkLine)
 
@@ -4576,13 +4713,45 @@ const app = new Hono<App>({ strict: false })
 			// A query drop (a loot box) rolls against sf3, the big catalog. Read it ONCE for the
 			// whole bag and only when a line actually holds one — a bag of ordinary items should
 			// not pull a thousand-item catalog in to grant them.
-			const rollCatalog = affordable.some((line) => line.item.GiftDrop.IsQuery === true)
+			const rollCatalog = affordable.some(
+				(line) => line.kind === 'catalog' && line.item.GiftDrop.IsQuery === true
+			)
 				? await loadRollCatalog(c)
 				: undefined
 
 			// Grant what sold, keeping each line's box so the entry built below can carry it.
 			const packages = new Map<BulkPurchaseLine, Record<string, unknown> | null>()
 			for (const line of affordable) {
+				if (line.kind === 'custom') {
+					// A custom item is a SALE between players, settled the way buyInvention settles
+					// one: the buyer's share of the bag was debited above, so record ownership first
+					// (a buyer who paid and got the item but left the creator unpaid is recoverable;
+					// a buyer charged for nothing is not), then pay the creator the item's price.
+					// The creator's signup grant is seeded BEFORE crediting them: `creditCurrency`
+					// upserts the balance row, and `ensureStartingBalances` is an INSERT OR IGNORE,
+					// so a creator who had never touched their balance would otherwise have the row
+					// created here and lose their starting tokens forever. The creator is a
+					// different, probably-online player with no response to read, so the sale is
+					// pushed as a plain update carrying their RESULTING total (what `creditCurrency`
+					// returns) — sending the payout would set their whole balance to it.
+					await grantCustomAvatarItem(c.env.DB, id, line.custom.CustomAvatarItemId)
+					if (line.price > 0) {
+						const creatorId = line.custom.CreatorAccountId
+						await ensureStartingBalances(c.env.DB, creatorId, startingTokens)
+						const creatorBalance = await creditCurrency(
+							c.env.DB,
+							creatorId,
+							currencyType as number,
+							line.price,
+							startingTokens
+						)
+						await pushBalanceUpdate(c, creatorId, currencyType as number, creatorBalance)
+					}
+					// No box: the item is in the buyer's inventory outright, and the entry below
+					// carries the item itself for the client to render.
+					packages.set(line, null)
+					continue
+				}
 				// Same routing as buyItem: a Gift block sends the item (and its box) to another
 				// player while the caller pays, a named gift shows the sender, and a self-buy or an
 				// anonymous gift is attributed to the "Coach" system account.
@@ -4636,12 +4805,13 @@ const app = new Hono<App>({ strict: false })
 						} satisfies BulkPurchaseData,
 					}
 				}
+				const sold = bought.has(line)
 				return {
-					UpdateResponse: bought.has(line) ? UpdateResponse.OK : UpdateResponse.NotEnoughCredit,
+					UpdateResponse: sold ? UpdateResponse.OK : UpdateResponse.NotEnoughCredit,
 					Data: {
 						GiftPackage: packages.get(line) ?? null,
 						PurchasableItemId: line.method.NumberId,
-						CustomAvatarItem: null,
+						CustomAvatarItem: sold && line.kind === 'custom' ? line.custom : null,
 					} satisfies BulkPurchaseData,
 				}
 			})
