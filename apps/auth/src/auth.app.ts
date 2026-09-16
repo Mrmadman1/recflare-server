@@ -47,6 +47,7 @@ import {
 	PlatformIdsRequest,
 	PlatformType,
 	RestrictionDto,
+	roleFilter,
 	roleLookup,
 	TokenRequest,
 	TokenResponse,
@@ -198,6 +199,51 @@ async function placeNewPlayerInOrientation(
 /** The Bearer token's account id (`sub`), or null when there's no valid token. */
 async function authedId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+}
+
+/** Whether one account row holds a role. Absent/false both mean no role. */
+function holdsRole(account: Account, role: 'developer' | 'moderator'): boolean {
+	return (role === 'developer' ? account.isDeveloper : account.isModerator) === true
+}
+
+/**
+ * The ONE-player lookup (`/role/{role}/{id}`): a BARE JSON boolean — the client reads the body
+ * as a bool, not as an object — or an empty 404 for a player this server has no account for,
+ * mirroring the reference API. An id that is not a number is answered as unknown (404) rather
+ * than as a 400: `/role/developer/nonsense` is just an id that matches nothing.
+ */
+async function roleAnswer(c: Context<App>, role: 'developer' | 'moderator', id: string) {
+	logger.info(`${role} role lookup`, { id })
+	const accountId = Number.parseInt(id, 10)
+	const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
+	if (!account) return c.body(null, 404)
+	return c.json(holdsRole(account, role))
+}
+
+/**
+ * The BULK form (`/role/{role}?id=1&id=2`): WHICH of the players asked about hold the role, as
+ * an array of ints. A different question from the single lookup and so a different shape —
+ * never that route's boolean.
+ *
+ * A FILTER, so nothing here is an error: an id that names no account, or names one without the
+ * role, is left out, and a query naming no ids answers `[]`. A 404 would be wrong — the
+ * question "which of these are developers" has the answer "none of them", not "no such thing".
+ *
+ * Answered in the order the query asked, de-duplicated, so a caller can read the result
+ * against its own list. One round trip however many ids are named: `getAccountsByIds` splits
+ * the read across statements when it exceeds D1's bound-parameter limit.
+ */
+async function roleFilterAnswer(c: Context<App>, role: 'developer' | 'moderator') {
+	// `queries` and not `query`: the ids arrive as a REPEATED parameter, and `query` would
+	// collapse them to the first and silently answer about one player out of the set.
+	const asked = c.req.queries('id') ?? []
+	const ids = [...new Set(asked.map((v) => Number.parseInt(v, 10)).filter(Number.isInteger))]
+	logger.info(`${role} role filter`, { asked: asked.length, ids: ids.length })
+	if (ids.length === 0) return c.json([])
+
+	const accounts = await getAccountsByIds(c.env.DB, ids)
+	const holders = new Set(accounts.filter((a) => holdsRole(a, role)).map((a) => a.accountId))
+	return c.json(ids.filter((id) => holders.has(id)))
 }
 
 /**
@@ -1172,26 +1218,29 @@ const app = new Hono<App>()
 	// is off by default and only an operator grants it (via `runx admin grant-developer`,
 	// which sets the account's isDeveloper flag); it also rides in the token's `role`
 	// claim (see accountRoles).
-	.get('/role/developer/:id', describeRoute(roleLookup('developer')), async (c) => {
-		const { id } = c.req.param()
-		logger.info('developer role lookup', { id })
-		const accountId = Number.parseInt(id, 10)
-		const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
-		if (!account) return c.body(null, 404)
-		return c.json(account.isDeveloper === true)
-	})
+	.get('/role/developer/:id', describeRoute(roleLookup('developer')), (c) =>
+		roleAnswer(c, 'developer', c.req.param('id'))
+	)
+
+	// The BULK form — `/role/developer?id=2&id=3` answers WHICH of those players are developers,
+	// as an array of ints. A route of its own rather than an optional `:id?` segment, and a
+	// different answer shape from the single lookup above: both are kept because the client asks
+	// both ways (the path form is the 2023 one).
+	.get('/role/developer', describeRoute(roleFilter('developer')), (c) =>
+		roleFilterAnswer(c, 'developer')
+	)
 
 	// Moderator role lookup, mirroring developer (bare boolean, 404 for unknown player).
 	// Operator-granted only (via `runx admin grant-moderator`); the flag also rides in
 	// the token's `role` claim.
-	.get('/role/moderator/:id', describeRoute(roleLookup('moderator')), async (c) => {
-		const { id } = c.req.param()
-		logger.info('moderator role lookup', { id })
-		const accountId = Number.parseInt(id, 10)
-		const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
-		if (!account) return c.body(null, 404)
-		return c.json(account.isModerator === true)
-	})
+	.get('/role/moderator/:id', describeRoute(roleLookup('moderator')), (c) =>
+		roleAnswer(c, 'moderator', c.req.param('id'))
+	)
+
+	// Moderator's bulk form, kept in step with developer's above.
+	.get('/role/moderator', describeRoute(roleFilter('moderator')), (c) =>
+		roleFilterAnswer(c, 'moderator')
+	)
 
 	// @guess Oculus nonce. The client asks for this before a Meta login; the exact shape
 	// it expects hasn't been observed, so this mints a fresh 64-char hex nonce (the length

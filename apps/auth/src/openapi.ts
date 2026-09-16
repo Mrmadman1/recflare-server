@@ -239,7 +239,9 @@ export function roleLookup(role: 'developer' | 'moderator') {
 		description:
 			`Returns a bare JSON boolean (\`true\`/\`false\`), not an object. Off by default and ` +
 			`granted only by an operator via \`runx admin grant-${role}\`. The same flag also rides ` +
-			`in the access token's \`role\` claim, so the client rarely needs this route.`,
+			`in the access token's \`role\` claim, so the client rarely needs this route.\n\n` +
+			`This is the ONE-player form. \`/role/${role}?id=\` is a different question with a ` +
+			`different answer shape — which of several players hold the role, as an array.`,
 		parameters: [
 			{
 				name: 'id',
@@ -252,6 +254,45 @@ export function roleLookup(role: 'developer' | 'moderator') {
 		responses: {
 			200: json(z.boolean(), `\`true\` if the player has the ${role} role`),
 			404: { description: 'No such player (empty body)' },
+		},
+	}
+}
+
+/**
+ * The BULK form: `/role/{role}?id=1&id=2` answers which of those players hold the role, as an
+ * array of ints. Not the single lookup's boolean — a different question, so a different shape;
+ * the two live side by side because the client asks both ways.
+ */
+export function roleFilter(role: 'developer' | 'moderator') {
+	return {
+		tags: ['Roles'],
+		summary: `Which of these players have the ${role} role`,
+		description:
+			`The subset of the accounts named by \`?id=\` that hold the ${role} role, as an ARRAY ` +
+			`OF INTS — not a boolean, and not an object. Ids are repeated (\`?id=1&id=2\`), not ` +
+			`comma-joined.\n\n` +
+			`It is a FILTER, so a player who does not hold the role is simply absent from the ` +
+			`answer, as is an id matching no account — neither is an error, and a query naming no ` +
+			`ids answers \`[]\`. Results keep the order the query asked in, and a repeated id ` +
+			`yields at most one entry.\n\n` +
+			`The role is off by default and granted only by an operator via ` +
+			`\`runx admin grant-${role}\`.`,
+		parameters: [
+			{
+				name: 'id',
+				in: 'query' as const,
+				required: false,
+				description:
+					'An account id to test, repeated once per player. Ids that are non-numeric, unknown ' +
+					'or lack the role are left out of the answer rather than erroring.',
+				style: 'form' as const,
+				explode: true,
+				schema: { type: 'array' as const, items: { type: 'string' as const } },
+				example: ['2', '42'],
+			},
+		],
+		responses: {
+			200: json(z.int().array(), `The ids, of those asked for, that hold the ${role} role`),
 		},
 	}
 }

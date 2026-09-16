@@ -1396,6 +1396,80 @@ describe('auth worker routes', () => {
 		expect((await exports.default.fetch(`${ORIGIN}/role/moderator/99999`)).status).toBe(404)
 	})
 
+	// `/role/{role}?id=` is a BULK FILTER — which of these players hold the role, as an array
+	// of ints — not the single lookup's boolean. Different question, different shape.
+	test('GET /role/developer?id= answers which of the players are developers', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4242, username: 'DevPlayer', isDeveloper: true }))
+			.run()
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4244, username: 'DevPlayer2', isDeveloper: true }))
+			.run()
+
+		// INTS, not strings, and not a boolean.
+		const one = await exports.default.fetch(`${ORIGIN}/role/developer?id=4242`)
+		expect(one.status).toBe(200)
+		expect(await one.json()).toEqual([4242])
+
+		// The subset that holds the role: 42 exists without the flag and 99999 not at all, and
+		// neither is an error — a filter answers "none of them", never 404.
+		const many = await exports.default.fetch(
+			`${ORIGIN}/role/developer?id=42&id=4242&id=99999&id=4244`
+		)
+		expect(many.status).toBe(200)
+		expect(await many.json()).toEqual([4242, 4244])
+
+		// Ordered as asked, so a caller can read the answer against its own list.
+		const reversed = await exports.default.fetch(`${ORIGIN}/role/developer?id=4244&id=4242`)
+		expect(await reversed.json()).toEqual([4244, 4242])
+
+		// A repeated id yields at most one entry.
+		const repeated = await exports.default.fetch(`${ORIGIN}/role/developer?id=4242&id=4242`)
+		expect(await repeated.json()).toEqual([4242])
+	})
+
+	test('GET /role/developer?id= answers [] rather than erroring', async () => {
+		// No ids, only unknown ids, only un-flagged ids, and a non-numeric id all answer an empty
+		// array with a 200 — nothing about this question is a 400 or a 404.
+		for (const query of ['', '?id=99999', '?id=42', '?id=nonsense', '?id=']) {
+			const res = await exports.default.fetch(`${ORIGIN}/role/developer${query}`)
+			expect(res.status, query).toBe(200)
+			expect(await res.json(), query).toEqual([])
+		}
+	})
+
+	// The repeated parameter is the whole point: reading only the first would silently answer
+	// about one player out of the set.
+	test('GET /role/developer?id= reads every repeated id, not just the first', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4242, username: 'DevPlayer', isDeveloper: true }))
+			.run()
+		const res = await exports.default.fetch(`${ORIGIN}/role/developer?id=42&id=4242`)
+		expect(await res.json()).toEqual([4242])
+	})
+
+	test('GET /role/moderator?id= filters on the moderator flag alone', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4343, username: 'ModPlayer', isModerator: true }))
+			.run()
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4242, username: 'DevPlayer', isDeveloper: true }))
+			.run()
+		// The two roles are independent flags: a developer is not implicitly a moderator.
+		const res = await exports.default.fetch(`${ORIGIN}/role/moderator?id=4242&id=4343&id=42`)
+		expect(await res.json()).toEqual([4343])
+	})
+
+	// The single lookup keeps its own shape — the bulk form must not have changed it.
+	test('GET /role/developer/:id is still a bare boolean, not an array', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 4242, username: 'DevPlayer', isDeveloper: true }))
+			.run()
+		expect(await (await exports.default.fetch(`${ORIGIN}/role/developer/4242`)).json()).toBe(true)
+		expect(await (await exports.default.fetch(`${ORIGIN}/role/developer/42`)).json()).toBe(false)
+		expect((await exports.default.fetch(`${ORIGIN}/role/developer/99999`)).status).toBe(404)
+	})
+
 	test('unknown path returns 404', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/nope`)
 		expect(res.status).toBe(404)
@@ -1426,7 +1500,9 @@ describe('auth worker routes', () => {
 			'GET /eac/challenge',
 			'GET /oculus/nonce',
 			'GET /privileges/me/restrictions',
+			'GET /role/developer',
 			'GET /role/developer/{id}',
+			'GET /role/moderator',
 			'GET /role/moderator/{id}',
 			'POST /account/me/changepassword',
 			'POST /cachedlogin/forplatformid/{platform}/{id}',
