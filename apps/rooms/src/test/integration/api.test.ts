@@ -1676,16 +1676,148 @@ describe('rooms endpoints', () => {
 				error: 'Co-ownership must be invited, not granted!',
 			})
 		}
-		// `role=0` is the invited player's decline, not an owner-side revoke.
-		expect(await envOf(await putForm('/rooms/2/roles/860', { role: '0' }, '1'))).toMatchObject({
-			success: false,
-		})
-		expect(await roleOf(860)).toMatchObject({ Role: 10 })
 
 		// A grant leaves a pending co-owner invite standing — the two are answered separately.
 		expect((await putForm('/rooms/2/roles/861/invite', { role: '30' }, '1')).status).toBe(200)
 		expect((await putForm('/rooms/2/roles/861', { role: '20' }, '1')).status).toBe(200)
 		expect(await roleOf(861)).toMatchObject({ Role: 20, InvitedRole: 30 })
+	})
+
+	it('PUT /rooms/:id/roles/:accountId with role=0 from an owner REVOKES the role', async () => {
+		type Role = { AccountId: number; Role: number; InvitedRole: number }
+		const rolesOf = async (): Promise<Role[]> =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]
+		const roleOf = async (accountId: number) =>
+			(await rolesOf()).find((r) => r.AccountId === accountId)
+
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		expect((await putForm('/rooms/2/roles/880', { role: '10' }, '1')).status).toBe(200)
+		expect(await roleOf(880)).toMatchObject({ Role: 10 })
+
+		// The owner removes the role. The RECORD goes — there is no "holds no role" tier — and
+		// the envelope carries the whole updated room, which is what the client re-renders from.
+		const revoked = await putForm('/rooms/2/roles/880', { role: '0' }, '1')
+		expect(revoked.status).toBe(200)
+		const body = (await envOf(revoked)) as {
+			success: boolean
+			error: string
+			value: { Roles: Role[] }
+		}
+		expect(body).toMatchObject({ success: true, error: '' })
+		expect(body.value.Roles.some((r) => r.AccountId === 880)).toBe(false)
+		expect(await roleOf(880)).toBeUndefined()
+
+		// A body naming NO role is the same removal.
+		expect((await putForm('/rooms/2/roles/881', { role: '20' }, '1')).status).toBe(200)
+		expect(await envOf(await putForm('/rooms/2/roles/881', {}, '1'))).toMatchObject({
+			success: true,
+		})
+		expect(await roleOf(881)).toBeUndefined()
+
+		// ...but a role that is PRESENT and unparseable is still malformed, and must not be read
+		// as a removal — a typo'd tier silently stripping someone would be the worst outcome.
+		expect((await putForm('/rooms/2/roles/881', { role: '20' }, '1')).status).toBe(200)
+		expect(await envOf(await putForm('/rooms/2/roles/881', { role: 'nope' }, '1'))).toMatchObject({
+			success: false,
+			error: 'You must provide a valid role!',
+		})
+		expect(await roleOf(881)).toMatchObject({ Role: 20 })
+
+		// A co-owner may revoke a helper tier.
+		expect(await envOf(await putForm('/rooms/2/roles/881', { role: '0' }, '2'))).toMatchObject({
+			success: true,
+		})
+		expect(await roleOf(881)).toBeUndefined()
+
+		// Removing a role the player does not hold is not a failure: they asked for no role, and
+		// there is none. Nothing changes.
+		const before = await rolesOf()
+		expect(await envOf(await putForm('/rooms/2/roles/889', { role: '0' }, '1'))).toMatchObject({
+			success: true,
+		})
+		expect(await rolesOf()).toEqual(before)
+
+		// The gate still applies: no token 401s, and no standing in the room 403s.
+		expect((await putForm('/rooms/2/roles/882', { role: '0' })).status).toBe(401)
+		expect((await putForm('/rooms/2/roles/882', { role: '0' }, '999')).status).toBe(403)
+	})
+
+	it('a role revoke cannot touch the owner, and co-owners cannot revoke each other', async () => {
+		type Role = { AccountId: number; Role: number; InvitedRole: number }
+		const roleOf = async (accountId: number) =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]).find(
+				(r) => r.AccountId === accountId
+			)
+		const refused = { success: false, error: 'You cannot remove that role!' }
+
+		// Ownership is not a role anyone beside it can take away — it moves only by transfer.
+		// Account 1 is RecCenter's creator; its co-owner cannot remove it.
+		expect(await envOf(await putForm('/rooms/2/roles/1', { role: '0' }, '2'))).toMatchObject(
+			refused
+		)
+
+		// Make 883 a second co-owner the only legal way: invited, then accepted.
+		expect((await putForm('/rooms/2/roles/883/invite', { role: '30' }, '1')).status).toBe(200)
+		expect((await putForm('/rooms/2/roles/883', { role: '30' }, '883')).status).toBe(200)
+		expect(await roleOf(883)).toMatchObject({ Role: 30 })
+
+		// Co-owners are peers, so one cannot strip the other — whichever asked first would win.
+		expect(await envOf(await putForm('/rooms/2/roles/883', { role: '0' }, '2'))).toMatchObject(
+			refused
+		)
+		expect(await envOf(await putForm('/rooms/2/roles/2', { role: '0' }, '883'))).toMatchObject(
+			refused
+		)
+		expect(await roleOf(883)).toMatchObject({ Role: 30 })
+
+		// The room's owner is not their peer, and may.
+		expect(await envOf(await putForm('/rooms/2/roles/883', { role: '0' }, '1'))).toMatchObject({
+			success: true,
+		})
+		expect(await roleOf(883)).toBeUndefined()
+	})
+
+	it('a role revoke takes a standing invite with it, and never removes your own entry', async () => {
+		type Role = { AccountId: number; Role: number; InvitedRole: number }
+		const roleOf = async (accountId: number) =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/2/roles`)).json()) as Role[]).find(
+				(r) => r.AccountId === accountId
+			)
+
+		// The whole entry goes, so a pending co-owner invite on it is withdrawn too.
+		expect((await putForm('/rooms/2/roles/884/invite', { role: '30' }, '1')).status).toBe(200)
+		expect((await putForm('/rooms/2/roles/884', { role: '10' }, '1')).status).toBe(200)
+		expect(await roleOf(884)).toMatchObject({ Role: 10, InvitedRole: 30 })
+		expect((await putForm('/rooms/2/roles/884', { role: '0' }, '1')).status).toBe(200)
+		expect(await roleOf(884)).toBeUndefined()
+
+		// On your OWN entry the path means answering an invite, which has to name its answer. An
+		// empty body is a removal, and removing yourself is not what that branch does.
+		expect((await putForm('/rooms/2/roles/885/invite', { role: '30' }, '1')).status).toBe(200)
+		expect(await envOf(await putForm('/rooms/2/roles/885', {}, '885'))).toMatchObject({
+			success: false,
+			error: 'You must provide a valid role!',
+		})
+		expect(await roleOf(885)).toMatchObject({ InvitedRole: 30 })
+	})
+
+	it('a revoke pushes a RoomUpdate to the room and to the player who lost the role', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: { RoomId: number } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+
+		expect((await putForm('/rooms/4/roles/887', { role: '20' }, '1')).status).toBe(200)
+		// A bystander in the room, and the player losing the role standing somewhere else.
+		await putInRoom(886, 4)
+		await putInRoom(887, 2)
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		expect((await putForm('/rooms/4/roles/887', { role: '0' }, '1')).status).toBe(200)
+
+		const pushed = (await (await hub().fetch('http://do/all')).json()) as Sent[]
+		expect(pushed.map((n) => n.playerId).sort((a, b) => a - b)).toEqual([886, 887])
+		expect(pushed.every((n) => n.data.RoomId === 4)).toBe(true)
+
+		for (const id of [886, 887]) await clearPresence(id)
 	})
 
 	it('a grant pushes a RoomUpdate to the room and to the affected player', async () => {

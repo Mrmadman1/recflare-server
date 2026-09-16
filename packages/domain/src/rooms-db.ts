@@ -633,6 +633,63 @@ export async function setRoomRole(
 }
 
 /**
+ * REVOKE a room role — dropping the target's `Roles` entry outright. This is how a room's
+ * owner or a co-owner takes back a role they handed out, and it is the counterpart to
+ * {@link setRoomRole}: there is no "demote to nothing" tier, because {@link Role.None} is the
+ * resting value of a PENDING invite rather than a role somebody holds. An entry that confers
+ * nothing should not exist, so a revoke removes the record.
+ *
+ * Two entries are protected, and both refuse by returning null without writing:
+ *
+ *  - The room's OWNER — `CreatorAccountId`, or a {@link Role.Creator} entry. Ownership is not
+ *    a role to be taken away by anyone standing beside it; it moves through
+ *    {@link transferRoomOwnership} and nowhere else. Without this a co-owner could remove the
+ *    creator's entry, and on an older room whose creator has no entry at all they could not —
+ *    so the check is on `CreatorAccountId` as well as on the tier.
+ *  - A CO-OWNER entry, unless the caller is the room's owner. Co-owners are peers: letting one
+ *    remove another means whichever of them asks first wins, and the room's owner is the only
+ *    person who is not a peer of theirs. A co-owner may still revoke the helper tiers.
+ *
+ * Removing a role a player does not have is NOT a failure — the room comes back unchanged and
+ * nothing is written. The caller asked for this player to hold no role, and they hold none;
+ * answering an error would make a client retrying a removal look broken.
+ *
+ * Takes any pending `InvitedRole` with it, since the whole entry goes. That is the same
+ * trade {@link answerRoomRoleInvite} makes when declining, and it means revoking a role from
+ * someone who has a co-owner invite standing also withdraws the invite.
+ *
+ * `removedByAccountId` is not stamped anywhere — the entry it would be stamped on is the one
+ * being deleted — and is read only to decide which of the two protections apply. The caller
+ * supplies the already-loaded room (after its gate) to avoid a re-read; the whole room JSON
+ * is rewritten.
+ */
+export async function removeRoomRole(
+	db: D1Database,
+	roomId: number,
+	targetAccountId: number,
+	removedByAccountId: number,
+	room: Room
+): Promise<Room | null> {
+	if (room.CreatorAccountId === targetAccountId) return null
+
+	const roles = roomRoles(room)
+	const index = roles.findIndex((r) => r.AccountId === targetAccountId)
+	if (index === -1) return room
+
+	const entry = roles[index]
+	if (entry.Role === Role.Creator) return null
+	if (entry.Role === Role.CoOwner && !isRoomOwner(room, removedByAccountId)) return null
+
+	roles.splice(index, 1)
+	const updated: Room = { ...room, Roles: roles }
+	await db
+		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
+		.bind(roomId, serializeRoom(updated))
+		.run()
+	return updated
+}
+
+/**
  * TRANSFER a room to a new owner: the recipient becomes {@link Role.Creator} and the
  * outgoing owner is left as {@link Role.CoOwner}, keeping their access to a room they built
  * without keeping the room.

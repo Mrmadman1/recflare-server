@@ -50,6 +50,7 @@ import {
 	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
+	removeRoomRole,
 	Role,
 	roomNameRejection,
 	roomRoles,
@@ -2108,6 +2109,15 @@ const app = new Hono<App>()
 				'that needs an invite, so it cannot be the one grant that skips the ceremony.',
 				'Any pending invite on the entry is left standing.',
 				'',
+				'**The same caller, REVOKING a role** — `role=0`, or a body naming no role at all.',
+				'There is no "holds no role" tier, so the target’s entry is removed outright, taking',
+				'any pending invite on it with it. Two entries are protected and refused: the room’s',
+				'owner (its creator, or a Creator entry), whose ownership moves only by transfer; and',
+				'a co-owner, unless the caller is the room’s owner — co-owners are peers and cannot',
+				'revoke each other. Removing a role the player does not hold succeeds and changes',
+				'nothing. A role that is present but not a number is still a rejection, never read as',
+				'a removal.',
+				'',
 				'**The invited player, answering their own co-owner invite.** Accepting promotes',
 				'their entry from its pending `InvitedRole` to the real `Role` and clears the',
 				'pending one — an accepted entry reads `Role: 30, InvitedRole: 0`, so an invite',
@@ -2134,7 +2144,10 @@ const app = new Hono<App>()
 					schema: { type: 'string', pattern: '^[0-9]+$' },
 				},
 			],
-			requestBody: form(RoleRequest, 'The role tier, or 0 to decline an invite'),
+			requestBody: form(
+				RoleRequest,
+				'The role tier; 0 or absent to revoke, or 0 to decline your own invite'
+			),
 			responses: {
 				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
@@ -2151,24 +2164,45 @@ const app = new Hono<App>()
 			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
 
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-			const role = typeof body.role === 'string' ? Number.parseInt(body.role, 10) : Number.NaN
-			if (Number.isNaN(role)) return roomEnvelope(c, null, 'You must provide a valid role!')
+			// A body naming NO role means "no role" — the owner-side removal below. A role that
+			// is present but not a number is still malformed, so the two are kept apart: the
+			// absent case must not swallow a typo'd tier and silently strip someone.
+			const rawRole = typeof body.role === 'string' ? body.role.trim() : ''
+			const namesRole = rawRole !== ''
+			const role = namesRole ? Number.parseInt(rawRole, 10) : Role.None
+			if (namesRole && Number.isNaN(role)) {
+				return roomEnvelope(c, null, 'You must provide a valid role!')
+			}
 
 			// Acting on your OWN entry is answering an invite — the only thing a player with
 			// no standing in the room may do here, and the only way a co-owner role is ever
 			// taken. An owner targeting themselves lands here too, and has no invite to answer.
 			if (targetAccountId === accountId) {
+				// Answering an invite still has to NAME the answer: accepting names the tier offered
+				// and declining is an explicit `role=0`. An empty body is a removal, and removing
+				// your own entry is not what this branch does.
+				if (!namesRole) return roomEnvelope(c, null, 'You must provide a valid role!')
 				const answered = await answerRoomRoleInvite(c.env.DB, roomId, accountId, role, room)
 				if (!answered) return roomEnvelope(c, null, 'You have no such invite to this room!')
 				await pushRoomUpdateToRoom(c, roomId, answered)
 				return roomEnvelope(c, answered)
 			}
 
-			// Otherwise it is a grant, and the room's owner/co-owner gate applies.
+			// Otherwise it is a grant or a REVOKE, and the room's owner/co-owner gate applies.
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
-			// `role=0` is the invited player's decline, not an owner-side revoke — there is no
-			// revoke yet, and letting one in here would let a co-owner strip the other.
-			if (role === Role.None) return roomEnvelope(c, null, 'You must provide a valid role!')
+
+			// `role=0` on SOMEONE ELSE'S entry is the owner-side revoke: there is no "holds no
+			// role" tier, so removing the role means removing the record. (The same value on your
+			// own entry is a decline, handled above — whose entry it is, is what tells them
+			// apart.) `removeRoomRole` owns the two protections: ownership is never revoked this
+			// way, and only the room's owner may revoke a co-owner, so co-owners cannot strip
+			// each other.
+			if (role === Role.None) {
+				const removed = await removeRoomRole(c.env.DB, roomId, targetAccountId, accountId, room)
+				if (!removed) return roomEnvelope(c, null, 'You cannot remove that role!')
+				await pushRoomUpdateToRoom(c, roomId, removed, [targetAccountId])
+				return roomEnvelope(c, removed)
+			}
 
 			// Null means the tier has to be ACCEPTED rather than handed over: nobody force-adds
 			// a co-owner. `setRoomRole` refuses it itself — the rule belongs to the room's
