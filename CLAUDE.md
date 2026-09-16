@@ -196,6 +196,17 @@ inconsistency here without checking the client first.
   ten rows as `RankStart` 0, `RankEnd` 9, both inclusive, so reading them as 1-based also
   serves nine rows starting at the runner-up. The unranked sentinel stays a big number
   (99999) precisely because 0 is now a real rank, first place.
+- A custom avatar item (`api`: `custom_avatar_item`, every `/api/customAvatarItems/*` read) is ONE
+  record for two kinds of thing. A player-made shirt has `BaseAvatarItemId`/`BaseAvatarItemColor`
+  and a design PNG (`DesignFilename`, `ThumbnailImageFilename`) and an empty `CurrentSaves`; a
+  FIRST-PARTY item (imported from the official export, Coach-authored, its own `OutfitType`) has
+  those four NULL and is rendered from `CurrentSaves` — one built Unity assetbundle per
+  `BodyType`, which the client picks by the wearer's body. The row is the record as JSON, so an
+  import is the export verbatim (`apps/api/scripts/import-custom-avatar-items.ts` writes the
+  migration; re-importing an id replaces it). Serve both through one shape: the shirt carries
+  empty `CurrentSaves`/`Tags` and null `CustomBadgeMetadata`, never a missing key. The saves
+  name their assetbundles and thumbnails by bare filename; storing the record does nothing
+  about serving those files.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

@@ -374,7 +374,36 @@ export const CreateCustomAvatarItemRequest = z.object({
 	design: z.string().describe('The design blob (binary file part)'),
 })
 
-/** The client's `CustomAvatarItem` record. */
+/**
+ * One built version of a first-party item, PascalCase as it rides inside `CurrentSaves`: the
+ * Unity assetbundle the client downloads to render the item on one `BodyType`, its hash, and
+ * the thumbnail the store shows. `AdditionalConfiguration` is the client's own JSON-in-a-string.
+ * Not the camelCase `CustomAvatarItemSave` of the legacy-item lookup below — same save,
+ * different casing and field set.
+ */
+export const CustomAvatarItemCurrentSave = z.object({
+	CustomAvatarItemSaveId: z.int(),
+	CustomAvatarItemId: z.string(),
+	UnityAssetId: z.string(),
+	BodyType: z.int(),
+	OutfitType: z.int(),
+	QAState: z.int(),
+	CreatedAt: z.string(),
+	ModifiedAt: z.string(),
+	Description: z.string().nullable(),
+	ThumbnailFileName: z.string(),
+	AdditionalConfiguration: z.string().describe('JSON-in-a-string'),
+	UnityAsset: z.string(),
+	UnityAssetHash: z.string(),
+	UnityAsset2: z.string().nullable(),
+	UnityAsset2Hash: z.string().nullable(),
+})
+
+/**
+ * The client's `CustomAvatarItem` record, served straight out of the row's JSON. A player-made
+ * shirt has a base item and a design PNG and no saves; a first-party item has the four
+ * base/filename fields null and is rendered from `CurrentSaves` instead.
+ */
 export const CustomAvatarItemDto = z.object({
 	CustomAvatarItemId: z.string(),
 	CreatorAccountId: z.number().int(),
@@ -385,16 +414,19 @@ export const CustomAvatarItemDto = z.object({
 	ForceCannotPublish: z.boolean(),
 	IsFeatured: z.boolean(),
 	IsRecRoomApproved: z.boolean(),
-	BaseAvatarItemId: z.number().int(),
-	BaseAvatarItemColor: z.string(),
-	DesignFilename: z.string(),
-	ThumbnailImageFilename: z.string(),
+	BaseAvatarItemId: z.number().int().nullable(),
+	BaseAvatarItemColor: z.string().nullable(),
+	DesignFilename: z.string().nullable(),
+	ThumbnailImageFilename: z.string().nullable(),
 	CreatedAt: z.string(),
 	ModifiedAt: z.string(),
 	PreviewOrientation: z.number().int(),
 	RankingContext: z.null(),
 	OutfitType: z.number().int(),
-	CurrentSaves: z.array(z.unknown()),
+	CurrentSaves: z.array(CustomAvatarItemCurrentSave),
+	Tags: z.array(z.object({ TagType: z.int(), Value: z.string() })),
+	CustomBadgeMetadata: z.unknown().nullable(),
+	RankedEntityId: z.string(),
 	PurchaseInfo: z.null(),
 })
 

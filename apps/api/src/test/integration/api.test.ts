@@ -35,6 +35,7 @@ import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	createCustomAvatarItem,
 	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+	importCustomAvatarItem,
 } from '../../custom-avatar-items-db'
 import {
 	countGoing,
@@ -999,7 +1000,8 @@ describe('public endpoints', () => {
 		const unflagged = await createCustomAvatarItem(env.DB, item('Unflagged', 1))
 		// Nothing flags items yet, so flag straight in the table — the unflagged one stays.
 		await env.DB.prepare(
-			'UPDATE custom_avatar_item SET is_featured = 1 WHERE custom_avatar_item_id != ?1'
+			`UPDATE custom_avatar_item SET data = json_set(data, '$.IsFeatured', json('true'))
+			 WHERE custom_avatar_item_id != ?1`
 		)
 			.bind(unflagged.CustomAvatarItemId)
 			.run()
@@ -1153,7 +1155,8 @@ describe('public endpoints', () => {
 			// slots to filter across, so set them straight in the table.
 			expect(created.OutfitType).toBe(105)
 			await env.DB.prepare(
-				'UPDATE custom_avatar_item SET outfit_type = ?2 WHERE custom_avatar_item_id = ?1'
+				`UPDATE custom_avatar_item SET data = json_set(data, '$.OutfitType', ?2)
+				 WHERE custom_avatar_item_id = ?1`
 			)
 				.bind(created.CustomAvatarItemId, outfitType)
 				.run()
@@ -1318,6 +1321,152 @@ describe('public endpoints', () => {
 					'&unityAssetVersion=3'
 			)
 		).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+	})
+
+	test('GET /api/customAvatarItems/v1/search serves an imported first-party item as exported', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+
+		// A first-party item, as the official service exports it: the same record as a player's
+		// shirt with the base-item and filename fields NULL and a built Unity assetbundle per
+		// body type in `CurrentSaves`. The flat table could not hold this at all; the JSON row
+		// stores it verbatim and the search serves it back as-is, saves included.
+		const wings = {
+			Accessibility: 1,
+			BaseAvatarItemColor: null,
+			BaseAvatarItemId: null,
+			CreatedAt: '2024-09-26T21:32:48.523Z',
+			CreatorAccountId: 1,
+			CurrentSaves: [
+				{
+					AdditionalConfiguration:
+						'{"v":1,"d":{"n":"(BB_SkellyWings_Shoulder)","o":100,"b":0,"ir":[6,184,0],"p":"3a74ca85-fa71-44c7-9c28-aabd605908db","a":"09999705-15d4-4a84-9c0a-65cfe5bde8d7"},"ls":1}',
+					BodyType: 0,
+					CreatedAt: '2024-10-02T22:50:38.809Z',
+					CustomAvatarItemId: '83fe651f-15b3-46a7-8afc-adec32c35568',
+					CustomAvatarItemSaveId: 1083,
+					Description: null,
+					ModifiedAt: '2024-11-27T02:34:07.523Z',
+					OutfitType: 100,
+					QAState: 2,
+					ThumbnailFileName: 'f2y1ndzuvm5ke2hjmn4cwfwfl.png',
+					UnityAsset: '3rdxsypmi0bdkxzrt1qmz1dpa.assetbundle',
+					UnityAsset2: '5vs37avnijsc98dylvs9pl58v.assetbundle',
+					UnityAsset2Hash: '/QYNs1vk1E+GF6qhVf3eR4YUCb0z4vFVkzPIA6mqjqY=',
+					UnityAssetHash: 'hQjd30phdbC0U7lBMOX/YtpwxEjPwVvVJaQ/4UzKA0Y=',
+					UnityAssetId: '7ba365a7-cf85-4029-80a3-7d0a08ab6ce6',
+				},
+				{
+					AdditionalConfiguration:
+						'{"v":1,"d":{"n":"(FB_SkellyWings_Shoulder)","o":100,"b":1,"ir":[6,186,0],"p":"09999705-15d4-4a84-9c0a-65cfe5bde8d7","a":"3a74ca85-fa71-44c7-9c28-aabd605908db"},"ls":1}',
+					BodyType: 1,
+					CreatedAt: '2024-10-02T22:52:04.891Z',
+					CustomAvatarItemId: '83fe651f-15b3-46a7-8afc-adec32c35568',
+					CustomAvatarItemSaveId: 1085,
+					Description: null,
+					ModifiedAt: '2024-11-27T02:34:07.523Z',
+					OutfitType: 100,
+					QAState: 2,
+					ThumbnailFileName: 'div4cdxc5b7ameui0d5h8ickl.png',
+					UnityAsset: '2azq1ngn5w621qjeb4vxb64j6.assetbundle',
+					UnityAsset2: '5ppm948m3znl2chvbvy88j092.assetbundle',
+					UnityAsset2Hash: 'ZtPbhPSKXkBD9bsmajTmO7A99Ew8tCQBYjE1THE+VUk=',
+					UnityAssetHash: 'TCPaQ1+T74pPBWiVChCYDyC/MNHjHbWEYk7leIqVTOU=',
+					UnityAssetId: '03413da3-e63c-4971-8ca9-c726bc90c0e2',
+				},
+			],
+			CustomAvatarItemId: '83fe651f-15b3-46a7-8afc-adec32c35568',
+			CustomBadgeMetadata: null,
+			Description:
+				'This item will have a fix on its connection point to the back on some body types in a future patch.',
+			DesignFilename: null,
+			ForceCannotPublish: false,
+			IsFeatured: false,
+			IsRecRoomApproved: true,
+			ModifiedAt: '2025-02-19T05:19:28.328Z',
+			Name: 'Skeletal Wings',
+			OutfitType: 100,
+			PreviewOrientation: 0,
+			Price: 6000,
+			RankedEntityId: '83fe651f-15b3-46a7-8afc-adec32c35568',
+			RankingContext: null,
+			Tags: [{ TagType: 0, Value: 'export' }],
+			ThumbnailImageFilename: null,
+		}
+		await importCustomAvatarItem(env.DB, wings)
+		// A player-made shirt beside it, to prove the two kinds share one table and one shape.
+		const shirt = await createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 205,
+			name: 'Skeleton Tee',
+			description: '',
+			price: 0,
+			baseAvatarItemId: 2184,
+			baseAvatarItemColor: '#F55C1A',
+			accessibility: 1,
+			designFilename: 'design_x.bin',
+			thumbnailImageFilename: 'thumb_x.png',
+		})
+
+		const search = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/search${query}`)
+			expect(res.status, query).toBe(200)
+			return (await res.json()) as Array<Record<string, unknown>>
+		}
+
+		// The storefront tab's real query finds it (Coach-authored, OutfitType 100 among the
+		// dozen slots asked for) and serves the record exactly as exported, plus the store-side
+		// `PurchaseInfo` the client asked for with `includePurchaseInfos` (null until priced).
+		const store = await search(
+			'?outfitTypes=0&outfitTypes=2&outfitTypes=3&outfitTypes=10&outfitTypes=20&outfitTypes=100' +
+				'&outfitTypes=101&outfitTypes=102&outfitTypes=103&outfitTypes=200&outfitTypes=300' +
+				'&outfitTypes=301&includePurchaseInfos=True&includeCoachItems=True&ordering=0&skip=0' +
+				'&take=100&unityAssetTarget=0&unityAssetVersion=3'
+		)
+		expect(store).toEqual([{ ...wings, PurchaseInfo: null }])
+
+		// Text search matches it by name and by description, and by its id typed whole.
+		expect((await search('?searchQuery=skeletal')).map((i) => i.Name)).toEqual(['Skeletal Wings'])
+		expect((await search('?searchQuery=connection%20point')).map((i) => i.Name)).toEqual([
+			'Skeletal Wings',
+		])
+		expect(
+			(await search('?searchQuery=83FE651F-15B3-46A7-8AFC-ADEC32C35568')).map((i) => i.Name)
+		).toEqual(['Skeletal Wings'])
+		// "skeleton" is not a substring of "skeletal": only the shirt.
+		expect((await search('?searchQuery=skeleton')).map((i) => i.Name)).toEqual(['Skeleton Tee'])
+
+		// The user-generated-content tab's query does not see it: wrong side of the catalog and
+		// wrong slot both.
+		expect(
+			(await search('?outfitTypes=105&includeCoachItems=False')).map((i) => i.CustomAvatarItemId)
+		).toEqual([shirt.CustomAvatarItemId])
+
+		// A player-made shirt still carries the full shape — empty saves, empty tags — so the
+		// client decodes both kinds through one parser.
+		const [tee] = await search('?searchQuery=skeleton')
+		expect(tee).toMatchObject({
+			BaseAvatarItemId: 2184,
+			CurrentSaves: [],
+			Tags: [],
+			CustomBadgeMetadata: null,
+			RankedEntityId: shirt.CustomAvatarItemId,
+		})
+
+		// Re-importing the same id REPLACES the record (a corrected export lands) rather than
+		// duplicating or being ignored.
+		await importCustomAvatarItem(env.DB, { ...wings, Price: 5000 })
+		expect((await search('?searchQuery=skeletal')).map((i) => i.Price)).toEqual([5000])
+
+		// The bulk lookup resolves it too, saves and all.
+		const bulk = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded', ...(await bearer('42')) },
+			body: new URLSearchParams([['customAvatarItemIds', wings.CustomAvatarItemId]]),
+		})
+		expect(bulk.status).toBe(200)
+		const [got] = (await bulk.json()) as Array<{ CurrentSaves: unknown[]; Price: number }>
+		expect(got.CurrentSaves).toHaveLength(2)
+		expect(got.Price).toBe(5000)
 	})
 
 	test('GET /api/customAvatarItems/v2/fromCreator/:id shows unpublished items only to the creator', async () => {
@@ -4104,11 +4253,16 @@ describe('custom avatar items', () => {
 			BaseAvatarItemColor: '#F55C1A',
 			PreviewOrientation: 0,
 			RankingContext: null,
-			OutfitType: 0,
+			// Filed as a custom shirt, the slot the store's user-generated-content tab searches.
+			OutfitType: 105,
+			// The full shape a first-party item carries, empty: no built saves, no tags.
 			CurrentSaves: [],
+			Tags: [],
+			CustomBadgeMetadata: null,
 			PurchaseInfo: null,
 		})
 		const itemId = body.Value.CustomAvatarItemId as string
+		expect(body.Value.RankedEntityId).toBe(itemId)
 		expect(itemId).toMatch(/^[0-9a-f-]{36}$/)
 		const date = (body.Value.CreatedAt as string).slice(0, 10)
 		expect(body.Value.ThumbnailImageFilename).toBe(`avatar-item/${date}/${itemId}-thumb.png`)
@@ -4126,8 +4280,10 @@ describe('custom avatar items', () => {
 			new Uint8Array([4, 5, 6])
 		)
 
+		// The row is the record as JSON, with the queried fields generated off it.
 		const row = await env.DB.prepare(
-			'SELECT name, creator_account_id FROM custom_avatar_item WHERE custom_avatar_item_id = ?1'
+			`SELECT json_extract(data, '$.Name') AS name, creator_account_id
+			 FROM custom_avatar_item WHERE custom_avatar_item_id = ?1`
 		)
 			.bind(body.Value.CustomAvatarItemId)
 			.first()
@@ -4302,7 +4458,7 @@ describe('custom avatar items', () => {
 
 			// Neither rejected request may create metadata or leave one of its two objects behind.
 			const row = await env.DB.prepare(
-				"SELECT COUNT(*) AS n FROM custom_avatar_item WHERE name = 'bounded'"
+				"SELECT COUNT(*) AS n FROM custom_avatar_item WHERE json_extract(data, '$.Name') = 'bounded'"
 			).first<{ n: number }>()
 			expect(row?.n).toBe(0)
 			expect((await env.IMAGES.list({ prefix: 'avatar-item/' })).objects).toHaveLength(

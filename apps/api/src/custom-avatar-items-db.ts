@@ -1,42 +1,88 @@
 /**
- * Custom avatar items — player-designed items built on a base catalog item — on the
- * shared `recflare` D1 database. One column per field of the client's `CustomAvatarItem`
- * DTO, so a row maps straight onto the response.
+ * Custom avatar items on the shared `recflare` D1 database: the player-designed shirts built
+ * on a base catalog item, and the first-party items imported from the official service, which
+ * are the same record with a set of built Unity assetbundles (`CurrentSaves`) in place of a
+ * base item and a design PNG.
  *
- * The two uploads that accompany a creation (the design blob and the thumbnail PNG) live
- * in the shared image bucket (`recflare-img`, the `IMAGES` binding) under
- * `avatar-item/<date>/<id>-thumb.png` and `<id>-design.png`; the two filename columns hold
- * those bucket keys, which the `img` worker serves back by key.
+ * A row is the client's `CustomAvatarItem` record verbatim, as JSON in `data` — the layout the
+ * `invention`, `event`, `room`, `account` and `club` tables use — with the fields the queries
+ * filter and sort on exposed as generated (virtual) columns. So a row IS the response, an
+ * import is the exported record as-is, and a field the source adds later is served without a
+ * migration. The flat one-column-per-field table this replaced (0015) could not hold a
+ * first-party item at all: its base-item and filename columns were NOT NULL, and it had no home
+ * for the saves.
  *
- * The `api` worker owns the schema/migration (migrations/0015_custom_avatar_item.sql,
- * applied under its own `migrations_table`).
+ * `CurrentSaves` stays EMBEDDED rather than in a child table: the client reads a save off its
+ * item and picks one by `BodyType`, and nothing on this server looks a save up by its bare id
+ * (the legacy-item lookup keys them by `AvatarItemDesc`). Room saves got their own table
+ * because the client points at one by bare id; that does not apply here.
+ *
+ * The two uploads that accompany a player's creation (the design blob and the thumbnail PNG)
+ * live in the shared image bucket (`recflare-img`, the `IMAGES` binding) under
+ * `avatar-item/<date>/<id>-thumb.png` and `<id>-design.png`; `ThumbnailImageFilename` and
+ * `DesignFilename` hold those bucket keys, which the `img` worker serves back by key. A
+ * first-party item has both null and is rendered from its saves' assetbundles instead.
+ *
+ * The `api` worker owns the schema/migration (migrations/0015_custom_avatar_item.sql, rebuilt
+ * as JSON by 0022_custom_avatar_item_json.sql, applied under its own `migrations_table`).
  */
 
-/** Schema DDL (mirror of migrations/0015_custom_avatar_item.sql). */
+/** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS custom_avatar_item (
-		custom_avatar_item_id TEXT PRIMARY KEY,
-		creator_account_id INTEGER NOT NULL,
-		name TEXT NOT NULL,
-		description TEXT NOT NULL DEFAULT '',
-		price INTEGER NOT NULL DEFAULT 0,
-		accessibility INTEGER NOT NULL DEFAULT 0,
-		force_cannot_publish INTEGER NOT NULL DEFAULT 0,
-		is_featured INTEGER NOT NULL DEFAULT 0,
-		is_rec_room_approved INTEGER NOT NULL DEFAULT 0,
-		base_avatar_item_id INTEGER NOT NULL,
-		base_avatar_item_color TEXT NOT NULL,
-		design_filename TEXT NOT NULL,
-		thumbnail_image_filename TEXT NOT NULL,
-		created_at TEXT NOT NULL,
-		modified_at TEXT NOT NULL,
-		preview_orientation INTEGER NOT NULL DEFAULT 0,
-		outfit_type INTEGER NOT NULL DEFAULT 0
+		data TEXT NOT NULL,
+		custom_avatar_item_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.CustomAvatarItemId')) VIRTUAL,
+		creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL,
+		accessibility INTEGER GENERATED ALWAYS AS (json_extract(data, '$.Accessibility')) VIRTUAL,
+		outfit_type INTEGER GENERATED ALWAYS AS (json_extract(data, '$.OutfitType')) VIRTUAL,
+		price INTEGER GENERATED ALWAYS AS (json_extract(data, '$.Price')) VIRTUAL,
+		is_featured INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsFeatured')) VIRTUAL,
+		created_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.CreatedAt')) VIRTUAL,
+		name_lower TEXT GENERATED ALWAYS AS (lower(coalesce(json_extract(data, '$.Name'), ''))) VIRTUAL,
+		description_lower TEXT GENERATED ALWAYS AS (lower(coalesce(json_extract(data, '$.Description'), ''))) VIRTUAL
 	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_avatar_item_id ON custom_avatar_item (custom_avatar_item_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_custom_avatar_item_creator ON custom_avatar_item (creator_account_id)`,
 ]
 
-/** The client's `CustomAvatarItem` record (PascalCase, as served). */
+/**
+ * One built version of a first-party item, as the client's PascalCase `CustomAvatarItemSave`:
+ * a Unity assetbundle (`UnityAsset`, with `UnityAsset2` a second variant) the client downloads
+ * to render the item, plus the thumbnail it shows in the store. An item carries one per
+ * `BodyType` it was built for; the client picks the save matching the wearer's body.
+ * `AdditionalConfiguration` is the client's own JSON-in-a-string document and is served as
+ * stored. Not the camelCase `CustomAvatarItemSave` the legacy-item lookup documents — same
+ * save, different casing and field set; keep the two apart.
+ */
+export interface CustomAvatarItemSave {
+	CustomAvatarItemSaveId: number
+	CustomAvatarItemId: string
+	UnityAssetId: string
+	BodyType: number
+	OutfitType: number
+	QAState: number
+	CreatedAt: string
+	ModifiedAt: string
+	Description: string | null
+	ThumbnailFileName: string
+	AdditionalConfiguration: string
+	UnityAsset: string
+	UnityAssetHash: string
+	UnityAsset2: string | null
+	UnityAsset2Hash: string | null
+}
+
+/** A tag on an item (`{ TagType: 0, Value: "export" }` on the imported first-party items). */
+export interface CustomAvatarItemTag {
+	TagType: number
+	Value: string
+}
+
+/**
+ * The client's `CustomAvatarItem` record (PascalCase, as served). The four nullable fields are
+ * null on a first-party item, which has no base item or design PNG: it is rendered from
+ * `CurrentSaves` instead, which is empty on a player-made shirt.
+ */
 export interface CustomAvatarItem {
 	CustomAvatarItemId: string
 	CreatorAccountId: number
@@ -47,16 +93,19 @@ export interface CustomAvatarItem {
 	ForceCannotPublish: boolean
 	IsFeatured: boolean
 	IsRecRoomApproved: boolean
-	BaseAvatarItemId: number
-	BaseAvatarItemColor: string
-	DesignFilename: string
-	ThumbnailImageFilename: string
+	BaseAvatarItemId: number | null
+	BaseAvatarItemColor: string | null
+	DesignFilename: string | null
+	ThumbnailImageFilename: string | null
 	CreatedAt: string
 	ModifiedAt: string
 	PreviewOrientation: number
 	RankingContext: null
 	OutfitType: number
-	CurrentSaves: never[]
+	CurrentSaves: CustomAvatarItemSave[]
+	Tags: CustomAvatarItemTag[]
+	CustomBadgeMetadata: unknown
+	RankedEntityId: string
 	PurchaseInfo: null
 }
 
@@ -71,7 +120,8 @@ export interface CustomAvatarItem {
  * This is what the store's user-generated-content tab searches for, ALONE
  * (`GET /api/customAvatarItems/v1/search?outfitTypes=105&includeCoachItems=False`), so it is
  * what every created item must be filed under: the table's default of 0 (Hat) matched nothing,
- * and the tab sat empty over a full catalog.
+ * and the tab sat empty over a full catalog. The imported first-party items carry their own
+ * slot (a wing is 100, Shoulder) and are found by the storefront tab's dozen-slot query.
  *
  * Not to be confused with the search's `itemTypes`, a different 3-member enum (All -1, None 0,
  * Shirt 1) whose Shirt is 1, not 101 or 105. The client sends `itemTypes=-1` (All) alongside
@@ -97,82 +147,85 @@ export interface CreateCustomAvatarItemInput {
 }
 
 interface Row {
-	custom_avatar_item_id: string
-	creator_account_id: number
-	name: string
-	description: string
-	price: number
-	accessibility: number
-	force_cannot_publish: number
-	is_featured: number
-	is_rec_room_approved: number
-	base_avatar_item_id: number
-	base_avatar_item_color: string
-	design_filename: string
-	thumbnail_image_filename: string
-	created_at: string
-	modified_at: string
-	preview_orientation: number
-	outfit_type: number
+	data: string
 }
+
+/**
+ * What a stored record may lack and the response must carry: an imported record predates
+ * some of these, and `PurchaseInfo` is a store-side projection (`econ` prices items), never
+ * stored. Everything the record does carry wins over these.
+ */
+const DTO_DEFAULTS = {
+	CurrentSaves: [] as CustomAvatarItemSave[],
+	Tags: [] as CustomAvatarItemTag[],
+	CustomBadgeMetadata: null,
+	RankingContext: null,
+	PurchaseInfo: null,
+} as const
 
 function toDto(row: Row): CustomAvatarItem {
-	return {
-		CustomAvatarItemId: row.custom_avatar_item_id,
-		CreatorAccountId: row.creator_account_id,
-		Name: row.name,
-		Description: row.description,
-		Price: row.price,
-		Accessibility: row.accessibility,
-		ForceCannotPublish: row.force_cannot_publish === 1,
-		IsFeatured: row.is_featured === 1,
-		IsRecRoomApproved: row.is_rec_room_approved === 1,
-		BaseAvatarItemId: row.base_avatar_item_id,
-		BaseAvatarItemColor: row.base_avatar_item_color,
-		DesignFilename: row.design_filename,
-		ThumbnailImageFilename: row.thumbnail_image_filename,
-		CreatedAt: row.created_at,
-		ModifiedAt: row.modified_at,
-		PreviewOrientation: row.preview_orientation,
-		RankingContext: null,
-		OutfitType: row.outfit_type,
-		CurrentSaves: [],
-		PurchaseInfo: null,
-	}
+	const stored = JSON.parse(row.data) as CustomAvatarItem
+	return { ...DTO_DEFAULTS, ...stored, RankingContext: null, PurchaseInfo: null }
 }
 
-/** Inserts a new custom avatar item and returns it as the client's DTO. */
+/** Inserts a new player-made custom avatar item and returns it as the client's DTO. */
 export async function createCustomAvatarItem(
 	db: D1Database,
 	input: CreateCustomAvatarItemInput,
 	now: Date = new Date()
 ): Promise<CustomAvatarItem> {
 	const ts = now.toISOString()
+	const record: Omit<CustomAvatarItem, 'PurchaseInfo'> = {
+		CustomAvatarItemId: input.customAvatarItemId,
+		CreatorAccountId: input.creatorAccountId,
+		Name: input.name,
+		Description: input.description,
+		Price: input.price,
+		Accessibility: input.accessibility,
+		ForceCannotPublish: false,
+		IsFeatured: false,
+		IsRecRoomApproved: false,
+		BaseAvatarItemId: input.baseAvatarItemId,
+		BaseAvatarItemColor: input.baseAvatarItemColor,
+		DesignFilename: input.designFilename,
+		ThumbnailImageFilename: input.thumbnailImageFilename,
+		CreatedAt: ts,
+		ModifiedAt: ts,
+		PreviewOrientation: 0,
+		OutfitType: input.outfitType ?? OUTFIT_TYPE_CUSTOM_SHIRT,
+		CurrentSaves: [],
+		Tags: [],
+		CustomBadgeMetadata: null,
+		RankedEntityId: input.customAvatarItemId,
+		RankingContext: null,
+	}
 	const row = await db
-		.prepare(
-			`INSERT INTO custom_avatar_item (
-				custom_avatar_item_id, creator_account_id, name, description, price, accessibility,
-				base_avatar_item_id, base_avatar_item_color, design_filename, thumbnail_image_filename,
-				created_at, modified_at, outfit_type
-			) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
-			RETURNING *`
-		)
-		.bind(
-			input.customAvatarItemId,
-			input.creatorAccountId,
-			input.name,
-			input.description,
-			input.price,
-			input.accessibility,
-			input.baseAvatarItemId,
-			input.baseAvatarItemColor,
-			input.designFilename,
-			input.thumbnailImageFilename,
-			ts,
-			input.outfitType ?? OUTFIT_TYPE_CUSTOM_SHIRT
-		)
+		.prepare('INSERT INTO custom_avatar_item (data) VALUES (?1) RETURNING data')
+		.bind(JSON.stringify(record))
 		.first<Row>()
 	if (!row) throw new Error('custom_avatar_item insert returned no row')
+	return toDto(row)
+}
+
+/**
+ * Stores a record as exported from the official service (the first-party items), verbatim,
+ * replacing any row with the same `CustomAvatarItemId` so a re-import with corrections lands.
+ * This is what the generated import migration does in SQL; it is here for tests and tooling.
+ */
+export async function importCustomAvatarItem(
+	db: D1Database,
+	record: Omit<CustomAvatarItem, 'PurchaseInfo'> & { PurchaseInfo?: unknown }
+): Promise<CustomAvatarItem> {
+	const { PurchaseInfo: _purchaseInfo, ...stored } = record
+	const row = await db
+		.prepare(
+			`INSERT INTO custom_avatar_item (data) VALUES (?1)
+			 ON CONFLICT(custom_avatar_item_id) DO UPDATE SET data = excluded.data
+			 RETURNING data`
+		)
+		.bind(JSON.stringify(stored))
+		.first<Row>()
+	if (!row) throw new Error('custom_avatar_item import returned no row')
 	return toDto(row)
 }
 
@@ -200,6 +253,8 @@ export interface UgcPurchasableItem {
  * The store-facing projection of a custom avatar item. `RoomId` is echoed from the
  * request — the item table has no room; what the client wants it for is still unknown.
  * `PurchaseCurrencyId` is null (the client's field is nullable) until a currency exists.
+ * `ImageName` is the item's own thumbnail for a player-made shirt; a first-party item has
+ * none at the item level, so the first save's thumbnail stands in.
  */
 export function toUgcPurchasable(item: CustomAvatarItem, roomId: number): UgcPurchasableItem {
 	return {
@@ -207,7 +262,7 @@ export function toUgcPurchasable(item: CustomAvatarItem, roomId: number): UgcPur
 		ItemId: item.CustomAvatarItemId,
 		Name: item.Name,
 		Description: item.Description,
-		ImageName: item.ThumbnailImageFilename,
+		ImageName: item.ThumbnailImageFilename ?? item.CurrentSaves[0]?.ThumbnailFileName ?? '',
 		RoomId: roomId,
 		Price: item.Price,
 		PurchaseCurrencyId: null,
@@ -224,10 +279,10 @@ export async function getCustomAvatarItems(
 	if (ids.length === 0) return []
 	const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT * FROM custom_avatar_item WHERE custom_avatar_item_id IN (${placeholders})`)
+		.prepare(`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (${placeholders})`)
 		.bind(...ids)
 		.all<Row>()
-	const byId = new Map(results.map((r) => [r.custom_avatar_item_id, toDto(r)]))
+	const byId = new Map(results.map(toDto).map((item) => [item.CustomAvatarItemId, item]))
 	return ids.flatMap((id) => byId.get(id) ?? [])
 }
 
@@ -243,7 +298,7 @@ export async function listFeaturedCustomAvatarItems(
 ): Promise<CustomAvatarItem[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT * FROM custom_avatar_item WHERE is_featured = 1 AND accessibility != 0
+			`SELECT data FROM custom_avatar_item WHERE is_featured = 1 AND accessibility != 0
 			 ORDER BY created_at DESC, custom_avatar_item_id LIMIT ?1`
 		)
 		.bind(limit)
@@ -263,7 +318,7 @@ export async function listHotCustomAvatarItems(
 ): Promise<CustomAvatarItem[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT * FROM custom_avatar_item WHERE accessibility != 0
+			`SELECT data FROM custom_avatar_item WHERE accessibility != 0
 			 ORDER BY created_at DESC, custom_avatar_item_id LIMIT ?1`
 		)
 		.bind(limit)
@@ -314,10 +369,10 @@ export const SEARCH_MAX_TAKE = 200
  * surface everyone shares, so an unpublished item must not appear here even to its creator (who
  * has `fromCreator` for that).
  *
- * `searchQuery` matches an item's NAME or its DESCRIPTION, case-insensitively, as a substring.
- * Both sides are lowered rather than relying on `LIKE`, which folds case for ASCII only and
- * would miss half of what players type. `%` and `_` in the needle are escaped, so searching for
- * a literal one finds it instead of matching everything.
+ * `searchQuery` matches an item's NAME or its DESCRIPTION, case-insensitively, as a substring,
+ * or its `CustomAvatarItemId` whole. Both sides are lowered rather than relying on `LIKE`, which
+ * folds case for ASCII only and would miss half of what players type. `%` and `_` in the needle
+ * are escaped, so searching for a literal one finds it instead of matching everything.
  *
  * `outfitTypes` is a WHITELIST when non-empty and no filter when empty, which is the opposite of
  * how an empty IN () clause reads in SQL: the client sends every type it can render, so treating
@@ -351,8 +406,13 @@ export async function searchCustomAvatarItems(
 		// Escaped so a needle of LIKE metacharacters matches them literally rather than everything.
 		const escaped = needle.toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`)
 		const pattern = bind(`%${escaped}%`)
+		// `name_lower`/`description_lower` are generated columns, lowered once at the row rather
+		// than per query. An id typed in whole finds its item too, since the client searches by
+		// `CustomAvatarItemId` as well as by text.
+		const exact = bind(needle.toLowerCase())
 		where.push(
-			`(lower(name) LIKE ${pattern} ESCAPE '\\' OR lower(description) LIKE ${pattern} ESCAPE '\\')`
+			`(name_lower LIKE ${pattern} ESCAPE '\\' OR description_lower LIKE ${pattern} ESCAPE '\\'` +
+				` OR lower(custom_avatar_item_id) = ${exact})`
 		)
 	}
 
@@ -372,7 +432,7 @@ export async function searchCustomAvatarItems(
 	const offset = bind(skip)
 	const { results } = await db
 		.prepare(
-			`SELECT * FROM custom_avatar_item WHERE ${where.join(' AND ')}
+			`SELECT data FROM custom_avatar_item WHERE ${where.join(' AND ')}
 			 ORDER BY created_at DESC, custom_avatar_item_id
 			 LIMIT ${limit} OFFSET ${offset}`
 		)
@@ -395,7 +455,7 @@ export async function listCustomAvatarItemsByCreator(
 ): Promise<{ Results: CustomAvatarItem[]; TotalResults: number }> {
 	const { results } = await db
 		.prepare(
-			`SELECT * FROM custom_avatar_item
+			`SELECT data FROM custom_avatar_item
 			 WHERE creator_account_id = ?1 AND (accessibility != 0 OR ?2)
 			 ORDER BY created_at DESC, custom_avatar_item_id`
 		)
@@ -414,8 +474,9 @@ export interface UpdateCustomAvatarItemInput {
 }
 
 /**
- * Applies a partial edit to one item, bumping `modified_at`. Fields the caller leaves
- * null keep their value (the client sends every field, nulling the untouched ones).
+ * Applies a partial edit to one item in place with `json_set`, bumping `ModifiedAt`. Fields
+ * the caller leaves null keep their value (the client sends every field, nulling the
+ * untouched ones).
  * Returns the updated item, or null when no row has that id.
  */
 export async function updateCustomAvatarItem(
@@ -426,14 +487,14 @@ export async function updateCustomAvatarItem(
 ): Promise<CustomAvatarItem | null> {
 	const row = await db
 		.prepare(
-			`UPDATE custom_avatar_item SET
-				name = COALESCE(?2, name),
-				description = COALESCE(?3, description),
-				price = COALESCE(?4, price),
-				accessibility = COALESCE(?5, accessibility),
-				modified_at = ?6
+			`UPDATE custom_avatar_item SET data = json_set(data,
+				'$.Name', coalesce(?2, json_extract(data, '$.Name')),
+				'$.Description', coalesce(?3, json_extract(data, '$.Description')),
+				'$.Price', coalesce(?4, json_extract(data, '$.Price')),
+				'$.Accessibility', coalesce(?5, json_extract(data, '$.Accessibility')),
+				'$.ModifiedAt', ?6)
 			 WHERE custom_avatar_item_id = ?1
-			 RETURNING *`
+			 RETURNING data`
 		)
 		.bind(
 			id,
@@ -453,7 +514,7 @@ export async function deleteCustomAvatarItem(
 	id: string
 ): Promise<CustomAvatarItem | null> {
 	const row = await db
-		.prepare('DELETE FROM custom_avatar_item WHERE custom_avatar_item_id = ?1 RETURNING *')
+		.prepare('DELETE FROM custom_avatar_item WHERE custom_avatar_item_id = ?1 RETURNING data')
 		.bind(id)
 		.first<Row>()
 	return row ? toDto(row) : null
@@ -465,7 +526,7 @@ export async function getCustomAvatarItem(
 	id: string
 ): Promise<CustomAvatarItem | null> {
 	const row = await db
-		.prepare('SELECT * FROM custom_avatar_item WHERE custom_avatar_item_id = ?1')
+		.prepare('SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id = ?1')
 		.bind(id)
 		.first<Row>()
 	return row ? toDto(row) : null

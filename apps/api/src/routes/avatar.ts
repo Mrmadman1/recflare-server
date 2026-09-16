@@ -639,8 +639,13 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 
 			const item = await deleteCustomAvatarItem(c.env.DB, itemId)
 			if (!item) return fail(404, 'No such item')
-			// The row is gone; the objects follow. A missing key is a no-op for R2.
-			await c.env.IMAGES.delete([item.ThumbnailImageFilename, item.DesignFilename])
+			// The row is gone; the objects follow. A missing key is a no-op for R2. A first-party
+			// item has neither (it is rendered from its saves' assetbundles), so there is nothing
+			// to delete for one.
+			const keys = [item.ThumbnailImageFilename, item.DesignFilename].filter(
+				(k): k is string => k !== null
+			)
+			if (keys.length > 0) await c.env.IMAGES.delete(keys)
 			return c.json({ Value: item, Success: true, Error: null, error_id: null })
 		}
 	)
