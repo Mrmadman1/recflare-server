@@ -14,6 +14,7 @@ import {
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+import { COACH_ACCOUNT_ID } from '../../api/src/custom-avatar-items-load'
 import { CatalogKind, UNSELLABLE_RARITIES } from '../../econ/src/catalog-load'
 import { placeholderCuratedList, resolveCuratedList, serializeCuratedList } from './curated-lists'
 import {
@@ -375,12 +376,102 @@ async function randomCatalogIds(c: Context<App>, rule: StoreRowRule): Promise<nu
 }
 
 /**
- * A GENERIC row's entities: the same store items, under the `0.` PurchasableItem prefix that
- * a Generic row's composite ids require.
+ * `RecRoom.Avatars.OutfitType`, the slot a custom avatar item is worn in — the members a store
+ * row filters on. The full enum is documented beside the `custom_avatar_item` schema in `api`
+ * (`custom-avatar-items-db.ts`); the Roomie slots start at 500.
  */
-async function genericRowEntities(c: Context<App>): Promise<ListEntity[]> {
-	const ids = await randomCatalogIds(c, DEFAULT_STORE_ROW_RULE)
-	return entities(ids.map((id) => `${GENERIC_ID_PREFIX.PurchasableItem}.${id}`))
+const OutfitType = {
+	Hat: 0,
+	Hair: 2,
+	Ear: 3,
+	Eye: 10,
+	Beard: 20,
+	Shoulder: 100,
+	Shirt: 101,
+	Waist: 102,
+	Neck: 103,
+	TeamJersey: 104,
+	Wrist: 200,
+	TeamWrist: 203,
+	Legs: 300,
+	Feet: 301,
+} as const
+
+/** Where the Roomie's slots start. A Roomie's items are not something a player wears. */
+const ROOMIE_OUTFIT_TYPE_BASE = 500
+
+/**
+ * What each GENERIC store row draws from `custom_avatar_item`, as the slots it takes. Keyed by
+ * the discovery section's `sourceMetadata` slug, like {@link STORE_ROW_RULES}; a slug not named
+ * here draws every player slot.
+ *
+ * Unlike the catalog, a custom avatar item records its slot (`OutfitType`), so these are real
+ * categories rather than a guess from the name, and no item sits in two rows.
+ */
+const CUSTOM_ITEM_ROW_OUTFIT_TYPES: Record<string, number[]> = {
+	headwearitems: [OutfitType.Hat],
+	topsitems: [OutfitType.Shirt, OutfitType.TeamJersey],
+	handsitems: [OutfitType.Wrist, OutfitType.TeamWrist],
+	hairitems: [OutfitType.Hair],
+	facialhairitems: [OutfitType.Beard],
+	waistitems: [OutfitType.Waist],
+	accessoriesitems: [OutfitType.Ear, OutfitType.Eye, OutfitType.Neck],
+	footwearitems: [OutfitType.Feet],
+	bottomsitems: [OutfitType.Legs],
+	shoulderitems: [OutfitType.Shoulder],
+}
+
+/**
+ * A random handful of custom avatar item GUIDs for one store row, read live from the
+ * `custom_avatar_item` table (owned by the `api` worker, on this same `recflare` database).
+ * Random for the reason {@link randomCatalogIds} is: nothing here ranks store items yet.
+ *
+ * Only what the store can actually SELL: first-party items (the Coach's — a player's own shirt
+ * is not stock), published (`Accessibility` 0 is a draft, which the bag refuses), and priced. A
+ * price of 0 would sell the item for nothing, so an unpriced item stays out of the store rather
+ * than turning up free.
+ *
+ * Empty when the table was never loaded (`just cai-load`), for the reason an empty catalog
+ * draw is: a fallback would hide that behind a row that looks fine.
+ */
+async function randomCustomAvatarItemIds(c: Context<App>, key: string): Promise<string[]> {
+	const binds: Array<string | number> = []
+	/** Bind a value and get its placeholder, so the numbering can't drift as clauses are added. */
+	const bind = (v: string | number): string => `?${binds.push(v)}`
+
+	const where = [
+		`creator_account_id = ${bind(COACH_ACCOUNT_ID)}`,
+		'accessibility <> 0',
+		'price > 0',
+	]
+	const slots = CUSTOM_ITEM_ROW_OUTFIT_TYPES[key]
+	where.push(
+		slots === undefined
+			? `outfit_type < ${bind(ROOMIE_OUTFIT_TYPE_BASE)}`
+			: `outfit_type IN (${slots.map((t) => bind(t)).join(', ')})`
+	)
+
+	const { results } = await c.env.DB.prepare(
+		`SELECT custom_avatar_item_id FROM custom_avatar_item WHERE ${where.join(' AND ')}
+		 ORDER BY RANDOM() LIMIT ${bind(GENERIC_ROW_SIZE)}`
+	)
+		.bind(...binds)
+		.all<{ custom_avatar_item_id: string }>()
+	return results.map((r) => r.custom_avatar_item_id)
+}
+
+/**
+ * A GENERIC row's entities: first-party custom avatar items under the `1.` CustomAvatarItem
+ * prefix that a Generic row's composite ids require. The store's `UnifiedAlgorithmicList`
+ * sections are what ask for these, by slug.
+ *
+ * Every entity is a custom avatar item today, but the row is one that CAN mix sorts — a
+ * `0.<catalog_id>` purchasable item beside a `1.<guid>` — so the prefix goes on each id rather
+ * than being implied by the row.
+ */
+async function genericRowEntities(c: Context<App>, key: string): Promise<ListEntity[]> {
+	const ids = await randomCustomAvatarItemIds(c, key)
+	return entities(ids.map((id) => `${GENERIC_ID_PREFIX.CustomAvatarItem}.${id}`))
 }
 
 /**
@@ -417,8 +508,8 @@ const STATIC_ROW_ENTITIES: Record<string, ListEntity[]> = {
 	// Empty. The store carousels that lived here —
 	// `summerpartycarousel` (the Featured page's "Medieval Masterpieces from the Community")
 	// and `newitems` (the Clothing page's "New") — are asked for with `?type=5`, and Generic is
-	// answered by the TYPE from the catalog table now, so a static entry for either was already
-	// unreachable. See {@link genericRowEntities}.
+	// answered by the TYPE from the custom avatar item table now, so a static entry for either
+	// was already unreachable. See {@link genericRowEntities}.
 	//
 	// The table stays because it is the right home for a row somebody picks by hand, and the
 	// handler still consults it; nothing is hand-picked at the moment.
@@ -749,11 +840,16 @@ const app = new Hono<App>()
 				'`?type=5` (Generic) is answered by the TYPE rather than by the slug, because a Generic',
 				'row’s ids are `<prefix>.<id>` composites — exactly one dot, `0.<int>` a purchasable',
 				'item and `1.<guid>` a custom avatar item — that the client resolves one at a time.',
-				'It serves a random draw of sellable purchasable items from the `catalog` table, since',
-				'nothing here ranks store items yet; the number in each id is the `catalog_id`, which',
-				'is the same `PurchasableItemId` the generated storefront carries.',
-				'`?type=4` (PurchasableItems) is answered by the type too, from the same draw, but',
-				'with BARE ids: a typed row’s `Type` already says what its ids are, so only a Generic',
+				'It serves a random draw of `1.<guid>` first-party custom avatar items from the',
+				'`custom_avatar_item` table (the Coach’s, published, with a price above 0), since',
+				'nothing here ranks store items yet. The store’s `UnifiedAlgorithmicList` sections ask',
+				'for these, and the SLUG picks the slot by `OutfitType`: `headwearitems` hats,',
+				'`topsitems` shirts and team jerseys, `handsitems` wrists, `hairitems` hair,',
+				'`facialhairitems` beards, `waistitems` waist, `accessoriesitems` ears/eyes/neck,',
+				'`footwearitems` feet, `bottomsitems` legs, `shoulderitems` shoulders. Any other slug',
+				'draws every slot but the Roomie’s.',
+				'`?type=4` (PurchasableItems) serves the `catalog` table instead, with BARE',
+				'`catalog_id`s: a typed row’s `Type` already says what its ids are, so only a Generic',
 				'row needs the prefix. There the SLUG picks what is drawn: `skinsitems` returns',
 				'equipment skins, and `headwearitems` / `topsitems` / `handsitems` / `hairitems` /',
 				'`facialhairitems` / `waistitems` / `accessoriesitems` / `footwearitems` /',
@@ -783,10 +879,11 @@ const app = new Hono<App>()
 			// serves bare ids of one sort — room ids, item ids — and it is `Type` that tells the
 			// client which service to resolve them against; a Generic row instead carries the sort
 			// inside each id (see `GENERIC_ID_PREFIX`), so a caller asking for 5 cannot be served
-			// a ranking of bare room ids no matter which slug it named. A random draw from the
-			// item catalog until something here ranks store items.
+			// a ranking of bare room ids no matter which slug it named. A random draw of
+			// first-party custom avatar items until something here ranks store items; the slug
+			// picks the slot, as it picks the category of a PurchasableItems row.
 			if (echoed === ListEntityType.Generic) {
-				return c.json({ Type: echoed, Entities: await genericRowEntities(c) })
+				return c.json({ Type: echoed, Entities: await genericRowEntities(c, key) })
 			}
 
 			// PURCHASABLE ITEMS is answered by the type as well, and from the same catalogue draw —

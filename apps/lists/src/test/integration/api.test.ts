@@ -9,6 +9,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
 import { CATALOG_ID_BASE } from '../../../../econ/src/catalog-load'
 import curatedLists from '../../../static/curated-lists.json'
@@ -89,6 +90,45 @@ const CATALOG_SKIN_ID = 90_002
 /** Seeded skins: more than a row holds, so its LIMIT and randomness are both exercised. */
 const CATALOG_SKINS_SEEDED = 70
 
+/**
+ * First-party custom avatar items the GENERIC rows draw, as `[name, OutfitType]`. More shirts
+ * than a row holds, so the LIMIT and the randomness are exercised on the unfiltered draw; one
+ * or two in each other slot the category rows take.
+ */
+const CUSTOM_ITEM_SEEDS: Array<[name: string, outfitType: number]> = [
+	...Array.from({ length: 60 }, (_, i): [string, number] => [`Seeded Shirt ${i}`, 101]),
+	['Top Hat', 0],
+	['Angled Bob Hair', 2],
+	['Round Earrings', 3],
+	['3D Glasses', 10],
+	['Wizard Beard', 20],
+	['Archer Quiver', 100],
+	['Treasure Hunter Belt', 102],
+	['Bow Tie', 103],
+	['Team Jersey', 104],
+	['Karate Wrist Wrap', 200],
+	['Barista Pants', 300],
+	['Flower Sandals', 301],
+]
+
+/**
+ * Custom avatar items a store row must NEVER offer, each missing exactly one thing the draw
+ * requires. All are shirts, so the unfiltered and `topsitems` draws would take them otherwise.
+ */
+const CUSTOM_ITEM_EXCLUDED = {
+	/** `Accessibility` 0 — a draft, which the bag refuses to sell. */
+	draft: 'dddddddd-0000-4000-8000-000000000001',
+	/** `Price` 0 — would sell for nothing. */
+	free: 'dddddddd-0000-4000-8000-000000000002',
+	/** Made by a player, not the Coach: not stock. */
+	playerMade: 'dddddddd-0000-4000-8000-000000000003',
+	/** A Roomie's slot (500): not something a player wears. Excluded from the unfiltered draw. */
+	roomie: 'dddddddd-0000-4000-8000-000000000004',
+} as const
+
+/** The GUID a seeded custom avatar item gets, by its index in {@link CUSTOM_ITEM_SEEDS}. */
+const customItemId = (i: number): string => `cccccccc-0000-4000-8000-${String(i).padStart(12, '0')}`
+
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
@@ -144,6 +184,35 @@ beforeAll(async () => {
 			.bind(`seed-skin-guid-${i}`, CATALOG_SKIN_ID + i, `Seeded Skin ${i}`)
 			.run()
 	}
+
+	// Custom avatar items (owned by `api`, on this same database), which the GENERIC store rows
+	// draw. A row is the record as JSON; only the fields the draw filters on matter here.
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	const seedCustomItem = async (
+		id: string,
+		name: string,
+		outfitType: number,
+		{ creator = 1, accessibility = 1, price = 3000 } = {}
+	) => {
+		const record = {
+			CustomAvatarItemId: id,
+			CreatorAccountId: creator,
+			Name: name,
+			Accessibility: accessibility,
+			OutfitType: outfitType,
+			Price: price,
+		}
+		await env.DB.prepare('INSERT INTO custom_avatar_item (data) VALUES (?1)')
+			.bind(JSON.stringify(record))
+			.run()
+	}
+	for (const [i, [name, outfitType]] of CUSTOM_ITEM_SEEDS.entries()) {
+		await seedCustomItem(customItemId(i), name, outfitType)
+	}
+	await seedCustomItem(CUSTOM_ITEM_EXCLUDED.draft, 'Draft Shirt', 101, { accessibility: 0 })
+	await seedCustomItem(CUSTOM_ITEM_EXCLUDED.free, 'Free Shirt', 101, { price: 0 })
+	await seedCustomItem(CUSTOM_ITEM_EXCLUDED.playerMade, 'Player Shirt', 101, { creator: 5 })
+	await seedCustomItem(CUSTOM_ITEM_EXCLUDED.roomie, "Roomie's Cape", 501)
 
 	// Creation order and publish order are deliberately near-REVERSES of each other, so the
 	// `new` row and the `recentlyupdated` row can't both be passing on the same ordering.
@@ -809,85 +878,109 @@ it('serves a discovery row from /algorithmiclists', async () => {
 	expect(await res.json()).toEqual({ Type: 1, Entities: [] })
 })
 
-it('fills a GENERIC (type=5) row with random purchasable items from the catalog', async () => {
-	// The store's "Medieval Masterpieces from the Community" carousel, which the client asks
-	// for by the section's `sourceMetadata` slug and with `?type=5` (Generic). Nothing here
-	// RANKS store items, so the row is a random draw from the catalog rather than a ranking or
-	// a hand-picked list pretending to be one.
+/** A GENERIC (type=5) row's ids, checking the envelope every such row shares. */
+async function readGenericRow(slug: string): Promise<string[]> {
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/${slug}?type=5`)
+	expect(res.status, slug).toBe(200)
+	const body = (await res.json()) as {
+		Type: number
+		Entities: Array<{ Id: string; Context: null }>
+	}
+	expect(body.Type, slug).toBe(5)
+	// Bare object, no `{ success, error, value }` envelope — the client parses the list itself.
+	expect(Object.keys(body).sort(), slug).toEqual(['Entities', 'Type'])
+	expect(
+		body.Entities.every((e) => e.Context === null),
+		slug
+	).toBe(true)
+	return body.Entities.map((e) => e.Id)
+}
+
+/** A GENERIC row's ids with the `1.` prefix checked and stripped: the GUIDs it names. */
+async function readGenericGuids(slug: string): Promise<string[]> {
+	return (await readGenericRow(slug)).map((id) => {
+		// `1.<guid>` — exactly one dot (a GUID has none), `1` for a custom avatar item.
+		const parts = id.split('.')
+		expect(parts, id).toHaveLength(2)
+		expect(parts[0], id).toBe('1')
+		expect(parts[1], id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+		return parts[1] as string
+	})
+}
+
+it('fills a GENERIC (type=5) row with random first-party custom avatar items', async () => {
+	// The store's `UnifiedAlgorithmicList` sections ask for their rows by `sourceMetadata` slug
+	// and with `?type=5` (Generic). Nothing here RANKS store items, so the row is a random draw
+	// from `custom_avatar_item` rather than a ranking or a hand-picked list pretending to be one.
 	//
 	// A Generic row's ids are `<prefix>.<id>` composites: the client splits each on `.` and
 	// needs EXACTLY two halves, reading `0` as a purchasable item and `1` as a custom avatar
-	// item. A bare `257` has no dot and is dropped, which is why these are not plain numbers
-	// like every other row's.
-	const read = async (slug: string): Promise<string[]> => {
-		const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/${slug}?type=5`)
-		expect(res.status, slug).toBe(200)
-		const body = (await res.json()) as {
-			Type: number
-			Entities: Array<{ Id: string; Context: null }>
-		}
-		expect(body.Type, slug).toBe(5)
-		// Bare object, no `{ success, error, value }` envelope — the client parses the list itself.
-		expect(Object.keys(body).sort(), slug).toEqual(['Entities', 'Type'])
-		expect(
-			body.Entities.every((e) => e.Context === null),
-			slug
-		).toBe(true)
-		return body.Entities.map((e) => e.Id)
-	}
+	// item. A bare GUID has no dot and is dropped.
+	const guids = await readGenericGuids('summerpartycarousel')
 
-	const ids = await read('summerpartycarousel')
-
-	// Capped at the row size even though the catalog holds more, and full rather than a
-	// handful: a row that quietly served three items would still pass a "not empty" check.
-	expect(ids).toHaveLength(GENERIC_ROW_SIZE)
-
-	// Every id is `0.<PurchasableItemId>` — exactly one dot, an integer after it. `0.1.2` or a
-	// bare `257` resolves to nothing.
-	const numbers = ids.map((id) => {
-		const parts = id.split('.')
-		expect(parts, id).toHaveLength(2)
-		expect(parts[0], id).toBe('0')
-		expect(parts[1], id).toMatch(/^\d+$/)
-		return Number(parts[1])
-	})
-
-	// The number is the `catalog_id`, which is exactly what the generated storefront lists the
-	// item under as its `PurchasableItemId` — one number, no arithmetic between them. Catalog ids
-	// start at 10000 so they cannot be mistaken for a captured storefront's own.
-	expect(numbers.every((n) => n >= CATALOG_ID_BASE)).toBe(true)
+	// Capped at the row size even though the table holds more, and full rather than a handful:
+	// a row that quietly served three items would still pass a "not empty" check.
+	expect(guids).toHaveLength(GENERIC_ROW_SIZE)
 
 	// No duplicates: one draw must not offer the same item twice.
-	expect(new Set(numbers).size).toBe(numbers.length)
+	expect(new Set(guids).size).toBe(guids.length)
 
-	// Only SELLABLE avatar items. The catalog also holds a rarity -1 developer row and a skin,
-	// and neither is in a storefront — an id no storefront sells renders as nothing, which
-	// looks exactly like an id the client failed to parse.
-	expect(numbers).not.toContain(CATALOG_UNSELLABLE_ID)
-	expect(numbers.some((n) => n >= CATALOG_SKIN_ID)).toBe(false)
-	expect(numbers.every(isSeededAvatarItem)).toBe(true)
+	// Only what the store can SELL: none of the draft, the free item, the player's own shirt or
+	// the Roomie's cape, each of which is otherwise a perfectly good row.
+	const seeded = new Set(CUSTOM_ITEM_SEEDS.map((_, i) => customItemId(i)))
+	expect(guids.every((g) => seeded.has(g))).toBe(true)
+	for (const excluded of Object.values(CUSTOM_ITEM_EXCLUDED)) {
+		expect(guids).not.toContain(excluded)
+	}
 
-	// Actually RANDOM, not a fixed slice: two reads of 50 from 120 rows agree only by a
+	// Actually RANDOM, not a fixed slice: two reads of 50 from 72 rows agree only by a
 	// vanishing coincidence, so identical draws mean the ORDER BY RANDOM() was lost.
-	expect(await read('summerpartycarousel')).not.toEqual(ids)
+	expect(await readGenericGuids('summerpartycarousel')).not.toEqual(guids)
 
-	// Looked up folded, like every other row key: the casing is the reference's, not ours. And
-	// Generic is answered by the TYPE, not the slug — an unknown row, and a row with a live
-	// RANKING behind it, both answer store items rather than bare room ids the client can't
-	// split. All four draw from the same pool, so all four are the same shape.
+	// Looked up folded, like every other row key. And Generic is answered by the TYPE, not the
+	// slug — an unknown row, and a row with a live RANKING behind it, both answer store items
+	// rather than bare room ids the client can't split.
 	for (const slug of [
 		'SummerPartyCarousel',
 		'newitems',
 		'Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
 		'HotList',
 	]) {
-		const other = await read(slug)
-		expect(other, slug).toHaveLength(GENERIC_ROW_SIZE)
-		expect(
-			other.every((id) => /^0\.\d+$/.test(id)),
-			slug
-		).toBe(true)
+		expect(await readGenericGuids(slug), slug).toHaveLength(GENERIC_ROW_SIZE)
 	}
+})
+
+it('filters the GENERIC store category rows by OutfitType', async () => {
+	// The `StoreCategories` sections. A custom avatar item records its slot, so each row is a
+	// real category rather than a guess from the name — and no item lands in two rows.
+	const names = async (slug: string): Promise<string[]> => {
+		const guids = await readGenericGuids(slug)
+		const rows = await env.DB.prepare(
+			`SELECT json_extract(data, '$.Name') AS name FROM custom_avatar_item
+			 WHERE custom_avatar_item_id IN (${guids.map(() => '?').join(', ')})`
+		)
+			.bind(...guids)
+			.all<{ name: string }>()
+		return rows.results.map((r) => r.name).sort()
+	}
+
+	expect(await names('headwearitems')).toEqual(['Top Hat'])
+	expect(await names('hairitems')).toEqual(['Angled Bob Hair'])
+	expect(await names('facialhairitems')).toEqual(['Wizard Beard'])
+	expect(await names('accessoriesitems')).toEqual(['3D Glasses', 'Bow Tie', 'Round Earrings'])
+	expect(await names('shoulderitems')).toEqual(['Archer Quiver'])
+	expect(await names('waistitems')).toEqual(['Treasure Hunter Belt'])
+	expect(await names('handsitems')).toEqual(['Karate Wrist Wrap'])
+	expect(await names('bottomsitems')).toEqual(['Barista Pants'])
+	expect(await names('footwearitems')).toEqual(['Flower Sandals'])
+	expect(await names('HeadwearItems')).toEqual(['Top Hat'])
+
+	// Tops are shirts AND team jerseys, still under the row size and still without the draft,
+	// free and player-made shirts.
+	const tops = await names('topsitems')
+	expect(tops).toContain('Team Jersey')
+	expect(tops).toHaveLength(GENERIC_ROW_SIZE)
+	expect(tops.every((n) => n === 'Team Jersey' || n.startsWith('Seeded Shirt'))).toBe(true)
 })
 
 it('fills a PURCHASABLE ITEMS (type=4) row with the same draw, but BARE ids', async () => {
@@ -941,12 +1034,10 @@ it('fills a PURCHASABLE ITEMS (type=4) row with the same draw, but BARE ids', as
 		).toBe(true)
 	}
 
-	// The two types stay distinct: asking the SAME slug as 5 gets prefixed ids back.
-	const generic = await SELF.fetch(`${ORIGIN}/algorithmiclists/clothingitems?type=5`)
-	const genericIds = ((await generic.json()) as { Entities: Array<{ Id: string }> }).Entities.map(
-		(e) => e.Id
-	)
-	expect(genericIds.every((id) => /^0\.\d+$/.test(id))).toBe(true)
+	// The two types stay distinct: asking the SAME slug as 5 gets `1.<guid>` custom avatar items.
+	const genericIds = await readGenericRow('clothingitems')
+	expect(genericIds.length).toBeGreaterThan(0)
+	expect(genericIds.every((id) => id.startsWith('1.'))).toBe(true)
 })
 
 it('fills the skinsitems (type=4) row with equipment skins, not avatar items', async () => {
@@ -994,15 +1085,11 @@ it('fills the skinsitems (type=4) row with equipment skins, not avatar items', a
 		expect(others.every(isSeededAvatarItem), slug).toBe(true)
 	}
 
-	// `skinsitems` asked for as GENERIC still draws avatar items under the `0.` prefix: the
-	// slug picks the kind only where the type leaves it open, and a Generic row's ids say what
-	// they are for themselves.
-	const generic = await SELF.fetch(`${ORIGIN}/algorithmiclists/skinsitems?type=5`)
-	const genericIds = ((await generic.json()) as { Entities: Array<{ Id: string }> }).Entities.map(
-		(e) => e.Id
-	)
-	expect(genericIds.every((id) => /^0\.\d+$/.test(id))).toBe(true)
-	expect(genericIds.every((id) => Number(id.slice(2)) < CATALOG_SKIN_ID)).toBe(true)
+	// `skinsitems` asked for as GENERIC draws custom avatar items instead: a skin is not one,
+	// so the Generic rows have no skins row, and the slug draws every player slot.
+	const genericIds = await readGenericRow('skinsitems')
+	expect(genericIds).toHaveLength(GENERIC_ROW_SIZE)
+	expect(genericIds.every((id) => id.startsWith('1.'))).toBe(true)
 })
 
 it('filters the category rows by name', async () => {
