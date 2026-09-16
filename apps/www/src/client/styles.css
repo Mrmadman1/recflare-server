@@ -769,6 +769,20 @@ h2 {
 	background: var(--surface-hi);
 }
 
+/* The picture and the form that replaces it share the narrow column, so the control sits
+   under the thing it changes. The form drops the blob-upload's top margin for the
+   picture's own gap and keeps its border, which is what marks it as a control on a page
+   whose other room fields are read-only. */
+.room-hero-media {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.room-image-upload {
+	margin-top: 0;
+}
+
 .room-hero-name {
 	font-family: var(--display);
 	font-weight: 700;

@@ -192,6 +192,13 @@ async function fetchMyRooms(): Promise<OwnedRoom[]> {
 const FILE_TYPE_ROOM_SAVE = '1'
 
 /**
+ * The `UploadFileType` a picture is posted under. `storage` files it under `image/`,
+ * which is where the `img` worker resolves an extensionless key — so the name it hands
+ * back is exactly what a room's `ImageName` holds, and what the hero draws.
+ */
+const FILE_TYPE_IMAGE = '3'
+
+/**
  * The game build this server targets, as `YYYY-MM-DD` — read from the same `GAME_VERSION`
  * the auth token and presence carry rather than written out again here, so upgrading the
  * client moves this line with it instead of leaving a stale date on the upload form.
@@ -212,8 +219,18 @@ const CLIENT_BUILD_DATE = `${GAME_VERSION.slice(0, 4)}-${GAME_VERSION.slice(4, 6
  * honest validation available is whether the game can load it afterwards.
  */
 async function uploadRoomBlob(file: File): Promise<string> {
+	return uploadToStorage(file, FILE_TYPE_ROOM_SAVE)
+}
+
+/**
+ * Post a file to `storage` under one `UploadFileType` and return the generated
+ * `<date>/<uuid>` key. The type decides the bucket folder, and so which worker can serve
+ * the file back: a scene blob is only reachable through `cdn`, a picture only through
+ * `img`, so a caller has to name the right one for the key to mean anything later.
+ */
+async function uploadToStorage(file: File, fileType: string): Promise<string> {
 	const form = new FormData()
-	form.set('FileType', FILE_TYPE_ROOM_SAVE)
+	form.set('FileType', fileType)
 	form.set('File', file)
 	const { filename } = await call<{ filename?: string }>(`${where().storage}/upload`, {
 		method: 'POST',
@@ -222,6 +239,26 @@ async function uploadRoomBlob(file: File): Promise<string> {
 	})
 	if (!filename) throw new Error('The storage worker accepted the file but returned no name.')
 	return filename
+}
+
+/**
+ * Point a room at an already-uploaded picture — `PUT /rooms/{id}/image`, the call the
+ * game makes after a player picks a photo for the room.
+ *
+ * Owner-only on the server, which is one rule stricter than the scene-data save (a
+ * co-owner may save, but not change the image). The reply is the PascalCase
+ * `{ Success, Error }` envelope at HTTP 200 with a null `Value` — it does NOT carry the
+ * room, so the page patches `ImageName` onto the room it already has rather than
+ * re-fetching. That's the same thing the game does on the `RoomUpdate` this pushes.
+ */
+async function setRoomImage(roomId: number, imageName: string): Promise<void> {
+	const res = await call<{ Success?: boolean; Error?: string | null }>(
+		`${where().rooms}/rooms/${roomId}/image`,
+		{ method: 'PUT', authed: true, form: { imageName } }
+	)
+	if (res.Success !== true) {
+		throw new Error(res.Error || 'The rooms worker refused the image.')
+	}
 }
 
 /**
@@ -1337,9 +1374,10 @@ function platformList(room: OwnedRoom): string[] {
 
 /**
  * A room's settings and its subrooms. Its own fields are read-only — rooms are edited in
- * game — with one exception: a subroom's scene data can be replaced from here, which is
- * the one thing the game gives an owner no way to do (it can only save what it just
- * built, never restore a file they kept).
+ * game — with two exceptions, both things the game gives an owner no way to do: a
+ * subroom's scene data can be replaced from here (the game can only save what it just
+ * built, never restore a file they kept), and so can the room's image (the game can only
+ * set it to a photo taken inside the room).
  */
 function RoomDetail({
 	room,
@@ -1359,9 +1397,15 @@ function RoomDetail({
 	return (
 		<>
 			<section className="card room-hero">
-				{/* 512 rather than the list's 256: this one is displayed large. Both are sizes
-				    the img worker allows, so each is a cached variant. */}
-				<img className="room-hero-img" src={`${imgHost}/${room.ImageName}?width=512`} alt="" />
+				<div className="room-hero-media">
+					{/* 512 rather than the list's 256: this one is displayed large. Both are sizes
+					    the img worker allows, so each is a cached variant. */}
+					<img className="room-hero-img" src={`${imgHost}/${room.ImageName}?width=512`} alt="" />
+					<RoomImageUpload
+						roomId={room.RoomId}
+						onImageChange={(imageName) => onRoomChange({ ...room, ImageName: imageName })}
+					/>
+				</div>
 				<div className="room-hero-body">
 					<div className="room-head">
 						<h1 className="room-hero-name">^{room.Name}</h1>
@@ -1601,6 +1645,83 @@ function BlobUpload({
 			{done && <p className="ok">{done}</p>}
 			<button type="submit" disabled={pending || file === null}>
 				{pending ? 'Uploading…' : 'Upload scene data'}
+			</button>
+		</form>
+	)
+}
+
+/**
+ * Picture types the room thumbnail accepts. The `img` worker decodes whatever it serves
+ * with Photon to resize it, and these two are the ones the game itself produces (a photo
+ * is a JPEG; a PNG keeps its alpha through the resize). Checked on the type the browser
+ * reports rather than the extension, and the server's own check still stands behind it.
+ */
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png'])
+
+/**
+ * Replace a room's thumbnail with a picture from disk.
+ *
+ * Same two steps as the scene-data upload, with a different `FileType`: the bytes go to
+ * `storage` under the Image type, and the key it hands back is put to the room's
+ * `…/image` route as `imageName`. In game the only way to set this is to take a photo in
+ * the room, so this is how an owner gets a picture they made elsewhere onto the room.
+ *
+ * Unlike the scene-data form there is no publish step: the image is live the moment the
+ * route answers, for everyone browsing rooms. The hero above redraws from the new
+ * `ImageName` straight away — `img` caches by key and the key is new, so nothing stale
+ * can be served.
+ */
+function RoomImageUpload({
+	roomId,
+	onImageChange,
+}: {
+	roomId: number
+	onImageChange: (imageName: string) => void
+}) {
+	const [file, setFile] = useState<File | null>(null)
+	const input = useRef<HTMLInputElement>(null)
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<form
+			className="blob-upload room-image-upload"
+			onSubmit={(e) => {
+				e.preventDefault()
+				if (!file) return
+				void run(async () => {
+					if (!IMAGE_TYPES.has(file.type)) {
+						throw new Error('Choose a JPEG or PNG image.')
+					}
+					const imageName = await uploadToStorage(file, FILE_TYPE_IMAGE)
+					await setRoomImage(roomId, imageName)
+					onImageChange(imageName)
+					setFile(null)
+					if (input.current) input.current.value = ''
+					return 'Image replaced — it shows in game now.'
+				})
+			}}
+		>
+			<p className="blob-upload-head">
+				<span className="blob-upload-title">Replace image</span>
+			</p>
+			<p className="muted blob-upload-caveat">
+				A JPEG or PNG, landscape (3:2) like a photo taken in game. It goes live as soon as it
+				uploads.
+			</p>
+			<label className="blob-upload-file">
+				Image file
+				<input
+					ref={input}
+					type="file"
+					accept="image/jpeg,image/png"
+					onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+					required
+				/>
+			</label>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+			<button type="submit" disabled={pending || file === null}>
+				{pending ? 'Uploading…' : 'Upload image'}
 			</button>
 		</form>
 	)
