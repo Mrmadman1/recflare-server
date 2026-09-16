@@ -3,12 +3,17 @@ import { Command } from '@commander-js/extra-typings'
 import Table from 'cli-table3'
 
 import {
+	customAvatarItemUpsertStatements,
+	readCustomAvatarItemExport,
+} from '../../../../apps/api/src/custom-avatar-items-load'
+import {
 	DEFAULT_STARTING_TOKENS,
 	PLUS_MEMBERS_SQL,
 	plusReloadSql,
 } from '../../../../apps/econ/src/currency'
-import { execSql, readRootEnv, resolveRemote, sqlStr, target } from '../d1'
+import { execSql, execSqlFile, readRootEnv, resolveRemote, sqlStr, target } from '../d1'
 import { hashPassword } from '../password'
+import { getRepoRoot } from '../path'
 
 import type { D1ExecResult } from '../d1'
 
@@ -25,6 +30,7 @@ import type { D1ExecResult } from '../d1'
  *   runx admin grant-developer --account 1 [--revoke] [--remote]
  *   runx admin grant-plus      --username alice [--revoke] [--remote]
  *   runx admin reload-plus     <amount> [--dry-run] [--remote]
+ *   runx admin cai-load        [--file <export.json>] [--dry-run] [--remote]
  */
 
 /**
@@ -256,6 +262,109 @@ const reloadPlus = new Command('reload-plus')
 		console.log(chalk.green(`✓ ${amount} tokens added to ${credited.length} account(s)`))
 	})
 
+/** The export `cai-load` reads when no `--file` is given. */
+const CUSTOM_AVATAR_ITEM_EXPORT = 'apps/econ/static/db/2025-1-cai.json'
+
+/**
+ * Load the first-party custom avatar items into `custom_avatar_item` (owned by the `api`
+ * worker). Like `runx catalog load`: the table's STRUCTURE is a migration, its first-party
+ * CONTENTS are not, and this is the reload. Each record lands as the row's JSON with its
+ * `CreatorAccountId` forced to the Coach account (1) — what makes it stock content here — (the
+ * statements come from api's `custom-avatar-items-load.ts`, the same ones the migration
+ * generator writes), an id already present is REPLACED, and nothing is deleted — the players'
+ * own shirts share the table and an export never mentions them. Re-running is always safe.
+ */
+const caiLoad = new Command('cai-load')
+	.description('Load first-party custom avatar items from an export JSON (merges; never deletes)')
+	.option(
+		'--file <path>',
+		'The export to load, relative to the repo root',
+		CUSTOM_AVATAR_ITEM_EXPORT
+	)
+	.option(
+		'--dry-run',
+		'Read and validate the export, print what would be written, change nothing',
+		false
+	)
+	.option('--local', 'Target the local dev database (the default).', false)
+	.option('--remote', 'Target the deployed database instead of the local dev database.', false)
+	.action(async (opts) => {
+		const remote = resolveRemote(opts)
+		const full = path.isAbsolute(opts.file) ? opts.file : path.join(getRepoRoot(), opts.file)
+		if (!(await fs.pathExists(full))) throw new Error(`no export at ${opts.file}`)
+		// Tolerate the BOM a .NET export carries (`JSON.parse` rejects U+FEFF).
+		const text = (await fs.readFile(full, 'utf8')).replace(/^\uFEFF/, '')
+		const records = readCustomAvatarItemExport(JSON.parse(text) as unknown)
+		if (records.length === 0)
+			throw new Error('the export holds no records — refusing to call that a load')
+		const statements = customAvatarItemUpsertStatements(records)
+		const sql = statements.join('\n')
+
+		console.log(
+			`Merging ${records.length} custom avatar items from ${opts.file} into ${target(remote)}`
+		)
+		if (opts.dryRun) {
+			console.log(
+				chalk.cyan(
+					`--dry-run: built ${statements.length} statements (${(sql.length / 1024).toFixed(0)} KB); nothing was written.`
+				)
+			)
+			return
+		}
+
+		const count = async (): Promise<number> =>
+			Number(
+				(await execSql('SELECT COUNT(*) AS n FROM custom_avatar_item', remote, 'api')).results[0]
+					?.n ?? 0
+			)
+		const before = await count()
+
+		// Written to a temp file rather than passed as `--command`: a multi-megabyte argv is not
+		// something to rely on, and `--file` is the path wrangler batches (or, remotely, imports).
+		const file = path.join(os.tmpdir(), `recflare-cai-${Date.now()}.sql`)
+		await fs.writeFile(file, sql)
+		try {
+			await execSqlFile(file, remote, 'api')
+		} finally {
+			await fs.remove(file)
+		}
+
+		// Prove the load landed rather than trusting the exit: wrangler's meta carries no usable
+		// row count, and a file that fails partway leaves a partial load rather than an error.
+		// A merge only adds, so the table must hold at least what was written; then spot-check
+		// ids from across the export, the last one mattering most.
+		const after = await count()
+		if (after < records.length) {
+			throw new Error(
+				`load did not land: expected at least ${records.length} rows, the table holds ${after}. Re-run it.`
+			)
+		}
+		const probes = [
+			records[0],
+			records[Math.floor(records.length / 2)],
+			records[records.length - 1],
+		].map((r) => `'${sqlStr(r.CustomAvatarItemId)}'`)
+		const found = Number(
+			(
+				await execSql(
+					`SELECT COUNT(*) AS n FROM custom_avatar_item WHERE custom_avatar_item_id IN (${probes.join(', ')})`,
+					remote,
+					'api'
+				)
+			).results[0]?.n ?? 0
+		)
+		if (found !== probes.length) {
+			throw new Error(
+				`load did not land: ${probes.length - found} of ${probes.length} probe rows are missing. Re-run it.`
+			)
+		}
+		const added = after - before
+		console.log(
+			`${added} new, ${records.length - added} replaced in place, 0 removed (${after} rows now)`
+		)
+		console.log(chalk.green(`✓ custom avatar items loaded into ${target(remote)}`))
+	})
+
 const lookup = new Command('lookup')
 	.description('Print an account by id or username')
 	.option('--account <id>', 'Account id to look up')
@@ -308,6 +417,7 @@ export const adminCmd = new Command('admin')
 	.addCommand(grantModerator)
 	.addCommand(grantPlus)
 	.addCommand(reloadPlus)
+	.addCommand(caiLoad)
 	.addCommand(lookup)
 	.addHelpText(
 		'after',
@@ -325,5 +435,7 @@ Examples:
   $ runx admin grant-plus --username alice          # Rec Room Plus; takes effect next login
   $ runx admin reload-plus 1000 --remote            # +1000 tokens to every Plus subscriber
   $ runx admin reload-plus 1000 --dry-run           # just list them
+  $ runx admin cai-load                             # merge the first-party custom items (local)
+  $ runx admin cai-load --remote --file path/to/export.json
   $ runx admin lookup --username alice --remote`
 	)

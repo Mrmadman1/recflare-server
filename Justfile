@@ -124,3 +124,12 @@ admin *args:
 [no-cd]
 reload-plus *args:
   bun runx admin reload-plus "$@"
+
+# Load the first-party custom avatar items (apps/econ/static/db/2025-1-cai.json by default)
+# into the custom_avatar_item table. Merges: existing ids are replaced, nothing is deleted.
+# Defaults to --local; pass --remote for production, --dry-run to only validate. See CLI.md.
+[group('4. utility')]
+[positional-arguments]
+[no-cd]
+cai-load *args:
+  bun runx admin cai-load "$@"

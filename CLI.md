@@ -76,6 +76,28 @@ This command targets the `balance` table, so it runs under `apps/econ`'s wrangle
 with `--local` that is econ's dev D1 state, which needs both `balance` and a migrated
 `account` table in it.
 
+### `cai-load` — load the first-party custom avatar items
+
+```sh
+bun runx admin cai-load                      # apps/econ/static/db/2025-1-cai.json → local
+bun runx admin cai-load --remote
+bun runx admin cai-load --file path/to/export.json --dry-run
+just cai-load --remote                       # the same, as a recipe
+```
+
+Loads an export of `CustomAvatarItem` records (a JSON array, a `{ Results }` page, or one
+record) into the `custom_avatar_item` table, each stored as the row's JSON with its
+`CreatorAccountId` forced to 1, the Coach account, whatever the export said: that is what
+files it as stock content (the storefront tab searches by creator) and what a purchase
+pays. It MERGES: an id already in the table has its row replaced, and nothing is deleted, so the
+players' own shirts, which share the table, are untouched. Re-running is safe. The load is
+verified by counting rows and probing ids from across the export; it fails loudly rather
+than report a partial load. `--dry-run` reads and validates the export and prints the
+statement count without writing.
+
+The saves in an export name assetbundles and thumbnails by bare filename; the load stores
+the names only.
+
 ### `lookup` — print an account
 
 ```sh
@@ -90,7 +112,7 @@ the account has a password, the developer role, and the moderator role.
 
 ### Selecting an account
 
-Every command except `reload-plus` targets exactly one account, by **either**:
+Every command except `reload-plus` and `cai-load` targets exactly one account, by **either**:
 
 - `--account <id>` — numeric account id
 - `--username <name>` — username (case-insensitive)

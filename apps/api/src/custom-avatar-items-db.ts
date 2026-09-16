@@ -27,6 +27,8 @@
  * as JSON by 0022_custom_avatar_item_json.sql, applied under its own `migrations_table`).
  */
 
+import { COACH_ACCOUNT_ID } from './custom-avatar-items-load'
+
 /** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS custom_avatar_item (
@@ -336,9 +338,10 @@ export async function listHotCustomAvatarItems(
 
 /**
  * The "Coach" system account — this server's stock content is authored by it, the same id the
- * `econ` worker attributes a self-buy or an anonymous gift to.
+ * `econ` worker attributes a self-buy or an anonymous gift to. Lives in the loader module so
+ * the CLI can name it without Workers types; re-exported here for the worker-side callers.
  */
-export const COACH_ACCOUNT_ID = 1
+export { COACH_ACCOUNT_ID }
 
 /** What `GET /api/customAvatarItems/v1/search` narrows the catalog by. */
 export interface CustomAvatarItemSearch {
