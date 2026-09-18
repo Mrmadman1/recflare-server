@@ -2,7 +2,7 @@ import { adminSecretsStore, env, runInDurableObject } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
-import { NOTIFICATION_SCHEMA_DDL } from '@repo/domain'
+import { AUDIT_LOG_SCHEMA_DDL, NOTIFICATION_SCHEMA_DDL } from '@repo/domain'
 
 import '../../notify.app'
 
@@ -55,6 +55,9 @@ beforeAll(async () => {
 	// The notification store a targeted coach message writes to. Owned by the `api` worker's
 	// migrations, which don't run here, so build it from the mirrored DDL.
 	for (const ddl of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(ddl).run()
+	// The audit trail every /internal/* call is filed on. Owned by `api` too, so likewise
+	// built from the mirrored DDL.
+	for (const ddl of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(ddl).run()
 })
 
 /** Who `connect` is by default — kept clear of the player ids the tests notify. */
@@ -799,5 +802,121 @@ describe('CORS', () => {
 		)
 		expect(res.status).toBe(401)
 		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	})
+})
+
+// Every /internal/* call is recorded on the `audit_log` table, against the account that
+// made it. These endpoints are the operator's remote control over every connected client
+// and most of what they do leaves no other trace on the database — a maintenance broadcast
+// is a WebSocket frame and then nothing — so the row is the only lasting answer to "who
+// sent that".
+describe('audit log', () => {
+	interface AuditRow {
+		player_id: number
+		action: string
+		data: string | null
+		date: string
+	}
+
+	/** Everything recorded against one actor, oldest first. */
+	const auditRows = async (playerId: number): Promise<AuditRow[]> => {
+		const { results } = await env.DB.prepare(
+			'SELECT player_id, action, data, date FROM audit_log WHERE player_id = ?1 ORDER BY audit_log_id'
+		)
+			.bind(playerId)
+			.all<AuditRow>()
+		return results
+	}
+
+	const auditData = (row: AuditRow): Record<string, unknown> =>
+		JSON.parse(row.data ?? '{}') as Record<string, unknown>
+
+	// A distinct actor per test: the rest of the file drives these endpoints as account 1,
+	// so filtering on the caller is what keeps each assertion about its own call.
+	test('records a successful call against the caller, with what was asked for', async () => {
+		const actor = 4242
+		const res = await post(
+			'/internal/coach-message',
+			{ playerId: 9500, messageContent: 'audited' },
+			await bearer(String(actor), ['moderator'])
+		)
+		expect(res.status).toBe(200)
+
+		const rows = await auditRows(actor)
+		expect(rows).toHaveLength(1)
+		// The action is the path after `/internal/`, as a snake_case verb.
+		expect(rows[0].action).toBe('coach_message')
+		expect(Number.isNaN(Date.parse(rows[0].date))).toBe(false)
+		expect(auditData(rows[0])).toMatchObject({
+			method: 'POST',
+			path: '/internal/coach-message',
+			status: 200,
+			// The message and its recipient exist nowhere else once the frame has gone out.
+			body: { playerId: 9500, messageContent: 'audited' },
+		})
+	})
+
+	// A refused call is still a call someone made, and here — unlike the 401 below — we know
+	// who made it. A signed-in account reaching for an admin endpoint is close to the whole
+	// point of keeping the trail.
+	test('records a call the role gate refused, with the status that refused it', async () => {
+		const actor = 4243
+		const res = await post(
+			'/internal/broadcast',
+			{ notificationType: 1 },
+			await bearer(String(actor), ['gameClient'])
+		)
+		expect(res.status).toBe(403)
+
+		const rows = await auditRows(actor)
+		expect(rows).toHaveLength(1)
+		expect(rows[0].action).toBe('broadcast')
+		expect(auditData(rows[0]).status).toBe(403)
+	})
+
+	test('records a rejected body as the attempt it was', async () => {
+		const actor = 4244
+		const res = await post(
+			'/internal/coach-message',
+			{ playerId: 9501 },
+			await bearer(String(actor), ['moderator'])
+		)
+		expect(res.status).toBe(400)
+
+		const rows = await auditRows(actor)
+		expect(rows).toHaveLength(1)
+		expect(auditData(rows[0])).toMatchObject({ status: 400, body: { playerId: 9501 } })
+	})
+
+	// The reads are recorded too, and a call that carries its arguments in the query string
+	// rather than a body records those instead.
+	test('records a read, with its query string', async () => {
+		const actor = 4245
+		const res = await exports.default.fetch(`${ORIGIN}/internal/hub-state/pending?all=true`, {
+			method: 'DELETE',
+			headers: await bearer(String(actor), ['developer']),
+		})
+		expect(res.status).toBe(200)
+
+		const rows = await auditRows(actor)
+		expect(rows).toHaveLength(1)
+		expect(rows[0].action).toBe('hub_state_pending')
+		expect(auditData(rows[0])).toMatchObject({ method: 'DELETE', query: { all: 'true' } })
+	})
+
+	// Nothing to file it under: `player_id` is the actor, and a request with no valid token
+	// names nobody. The 401 is the record of that one, in the worker log.
+	test('records nothing for a call with no valid token', async () => {
+		const count = async () =>
+			(await env.DB.prepare('SELECT COUNT(*) AS n FROM audit_log').first<{ n: number }>())!.n
+
+		const before = await count()
+		const res = await exports.default.fetch(`${ORIGIN}/internal/broadcast`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ notificationType: 1 }),
+		})
+		expect(res.status).toBe(401)
+		expect(await count()).toBe(before)
 	})
 })

@@ -21,6 +21,7 @@ import {
 	subRoomDataBlob,
 	updateAccount,
 	verifyPassword,
+	writeAuditLog,
 } from '@repo/domain'
 import {
 	intVar,
@@ -1120,6 +1121,58 @@ const app = new Hono<App>()
 			// Issue a fresh, persisted refresh token (single-use; the client redeems it via
 			// grant_type=refresh_token). A refresh grant thus rotates its token.
 			const refreshToken = await issueRefreshToken(c.env.DB, Number(accountId))
+
+			// A STAFF sign-in is an audit event in its own right. What these accounts then do is
+			// recorded against them on the `audit_log` table (`notify` files every `/internal/*`
+			// call there); this is the row saying the session those actions came from began — and
+			// from what device, build and IP, which is the first thing anyone asks when an action
+			// further down the log looks wrong. The flags themselves are the trigger, so an account
+			// granted the role between logins starts being recorded the next time it signs in.
+			//
+			// A real sign-in only: `refresh_token` renews the SAME session every TOKEN_TTL_SECONDS,
+			// and recording those would bury the logins under hourly repeats that say nothing new
+			// about who came in or from where.
+			//
+			// Written after the token is minted, so the row means a login that actually happened,
+			// and caught rather than awaited into the response: a failed audit insert must not turn
+			// a staffer's successful sign-in into a 500. It leaves a loud line in the worker log
+			// instead — the one thing a gap in an audit trail should never do quietly.
+			const staffRoles =
+				roleAccount && grantType !== 'refresh_token'
+					? (['developer', 'moderator'] as const).filter((role) => holdsRole(roleAccount, role))
+					: []
+			if (staffRoles.length > 0) {
+				try {
+					await writeAuditLog(c.env.DB, {
+						playerId: Number(accountId),
+						action: 'staff_login',
+						// The IP leads: it is the first thing anyone asks of a staff sign-in, and the one
+						// field here that says WHERE the session came from rather than what it could do.
+						// Empty outside the Cloudflare edge — recorded as the empty string it is rather
+						// than omitted, so a row can't be read as "we didn't record one".
+						//
+						// Then: which powers the session carries, HOW they signed in, and the same
+						// unverified-but-recorded device/build context the account row keeps — kept here
+						// too so the row stands on its own months later, after the account's
+						// `lastLoginIp` and device have been overwritten by every login since.
+						data: {
+							ip: clientIp,
+							roles: staffRoles,
+							grantType,
+							username: roleAccount?.username ?? null,
+							deviceId,
+							deviceClass,
+							version: version ?? null,
+						},
+					})
+				} catch (err) {
+					logger.error('could not write a staff_login audit log row', {
+						accountId,
+						grantType,
+						error: err instanceof Error ? err.message : String(err),
+					})
+				}
+			}
 
 			return c.json({
 				access_token: accessToken,

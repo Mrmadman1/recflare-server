@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test } from 'vitest'
 import '../../auth.app'
 
 import {
+	AUDIT_LOG_SCHEMA_DDL,
 	GAME_VERSION,
 	getAccountsByDeviceId,
 	hashPassword,
@@ -70,6 +71,9 @@ beforeAll(async () => {
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (owned by the rooms worker) — signup seeds the Orientation row.
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The audit trail a staff sign-in is recorded on. Owned by the `api` worker, whose
+	// migrations don't run here, so build it from the mirrored DDL.
+	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Seed the accounts the credential-login tests use, each with LOGIN_PASSWORD set.
 	const hash = await hashPassword(LOGIN_PASSWORD)
@@ -1778,5 +1782,122 @@ describe('ban evasion at the token endpoint', () => {
 		} finally {
 			env.BAN_EVASION_MATCH = original
 		}
+	})
+})
+
+// A staff sign-in is recorded on the `audit_log` table — the same table `notify` files
+// every `/internal/*` call on. What those accounts then do is attributed to them; this is
+// the row that says the session it came from began, and from what device, build and IP.
+describe('staff login audit', () => {
+	interface AuditRow {
+		player_id: number
+		action: string
+		data: string | null
+		date: string
+	}
+
+	const staffLogins = async (accountId: number): Promise<AuditRow[]> => {
+		const { results } = await env.DB.prepare(
+			`SELECT player_id, action, data, date FROM audit_log
+			 WHERE player_id = ?1 AND action = 'staff_login' ORDER BY audit_log_id`
+		)
+			.bind(accountId)
+			.all<AuditRow>()
+		return results
+	}
+
+	/** Seed an account with the given flags and a known password. */
+	const seedAccount = async (accountId: number, data: Record<string, unknown>) =>
+		env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId,
+					username: `Staff${accountId}`,
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					...data,
+				})
+			)
+			.run()
+
+	test('a login by an isModerator account is recorded, with the context of the sign-in', async () => {
+		await seedAccount(9601, { username: 'ModPlayer', isModerator: true })
+		const res = await postToken(
+			`grant_type=password&account_id=9601&password=${LOGIN_PASSWORD}` +
+				'&device_id=dev-mod&device_class=2&ver=20230414',
+			'203.0.113.9'
+		)
+		expect(res.status).toBe(200)
+
+		const rows = await staffLogins(9601)
+		expect(rows).toHaveLength(1)
+		expect(Number.isNaN(Date.parse(rows[0].date))).toBe(false)
+		const data = JSON.parse(rows[0].data!) as Record<string, unknown>
+		expect(data).toMatchObject({
+			ip: '203.0.113.9',
+			roles: ['moderator'],
+			grantType: 'password',
+			username: 'ModPlayer',
+			deviceId: 'dev-mod',
+			deviceClass: 2,
+			version: '20230414',
+		})
+		// The IP LEADS the payload: it is the first thing anyone asks of a staff sign-in, and
+		// the reader of a raw row should not have to hunt for it.
+		expect(Object.keys(data)[0]).toBe('ip')
+	})
+
+	// Both flags on one account record both — the row says which powers the session carries,
+	// not merely that it carries some.
+	test('an account holding both flags records both roles', async () => {
+		await seedAccount(9602, { isDeveloper: true, isModerator: true })
+		expect((await postToken(`account_id=9602&password=${LOGIN_PASSWORD}`)).status).toBe(200)
+
+		const rows = await staffLogins(9602)
+		expect(rows).toHaveLength(1)
+		expect((JSON.parse(rows[0].data!) as { roles: string[] }).roles).toEqual([
+			'developer',
+			'moderator',
+		])
+	})
+
+	// The flags are the whole trigger. An ordinary player signing in is not an audit event,
+	// and recording every login would bury the ones that are.
+	test('an ordinary login records nothing', async () => {
+		await seedAccount(9603, {})
+		expect((await postToken(`account_id=9603&password=${LOGIN_PASSWORD}`)).status).toBe(200)
+		expect(await staffLogins(9603)).toHaveLength(0)
+	})
+
+	// A refresh renews the SAME session every TOKEN_TTL_SECONDS. Recording those would bury
+	// the actual sign-ins under hourly repeats saying nothing new about who came in or from
+	// where — so the login is recorded once, and the refreshes after it are not.
+	test('a refresh_token grant is not a login and is not recorded', async () => {
+		await seedAccount(9604, { isDeveloper: true })
+		const first = await postToken(`account_id=9604&password=${LOGIN_PASSWORD}`)
+		expect(first.status).toBe(200)
+		expect(await staffLogins(9604)).toHaveLength(1)
+
+		const refreshed = await postToken(
+			`grant_type=refresh_token&refresh_token=${first.json.refresh_token as string}`
+		)
+		expect(refreshed.status).toBe(200)
+		expect(await staffLogins(9604)).toHaveLength(1)
+	})
+
+	// The flag is read at LOGIN, exactly as `rn.plus` and the token's `role` claim are, so
+	// granting the role starts the trail at their next sign-in rather than retroactively.
+	test('an account granted the role starts being recorded on its next login', async () => {
+		await seedAccount(9605, {})
+		expect((await postToken(`account_id=9605&password=${LOGIN_PASSWORD}`)).status).toBe(200)
+		expect(await staffLogins(9605)).toHaveLength(0)
+
+		await env.DB.prepare(
+			`UPDATE account SET data = json_set(data, '$.isModerator', json('true')) WHERE account_id = ?1`
+		)
+			.bind(9605)
+			.run()
+
+		expect((await postToken(`account_id=9605&password=${LOGIN_PASSWORD}`)).status).toBe(200)
+		expect(await staffLogins(9605)).toHaveLength(1)
 	})
 })

@@ -9,6 +9,11 @@
 	// history separate from the rooms worker's migrations on the same database. The
 	// "local" placeholder is replaced with the real id from RECFLARE_D1 (see .env) at
 	// deploy time.
+	//
+	// It also WRITES one table it doesn't own: a sign-in by an account holding the
+	// isDeveloper/isModerator flag is recorded on `audit_log` as a `staff_login`
+	// (apps/api/migrations/0024_audit_log.sql, owned by the `api` worker). That is the row
+	// saying the session every later audited action came from began, and from what IP.
 	"d1_databases": [
 		{
 			"binding": "DB",

@@ -7,6 +7,7 @@ export {
 	MatchmakingErrorCode,
 } from './enums'
 export * from './accounts-db'
+export * from './audit-db'
 export * from './clubs-db'
 export * from './d1-binds'
 export * from './images-db'

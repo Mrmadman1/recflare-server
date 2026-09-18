@@ -8,14 +8,21 @@
 		"bindings": [{ "name": "RECFLARE_NOTIFICATIONS_HUB", "class_name": "NotificationsHub" }]
 	},
 	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["NotificationsHub"] }],
-	// The shared `recflare` D1 database, for the message store behind
-	// `GET /api/messages/v2/get`: a coach message to ONE player is a durable message and is
-	// written here before it is pushed. No `migrations_dir` — the `api` worker owns this
-	// schema (apps/api/migrations/0019_message.sql); notify only writes rows.
+	// The shared `recflare` D1 database. Two tables, both owned (and migrated) by the `api`
+	// worker — no `migrations_dir` here; notify only writes rows:
 	//
-	// The coach BROADCAST is deliberately not stored: it reaches everyone online at once, so
-	// persisting it would write a row per player — thousands per maintenance notice, for
-	// something nobody needs to re-read.
+	//  - `notification` (apps/api/migrations/0019_notification.sql), the message store behind
+	//    `GET /api/messages/v2/get`: a coach message to ONE player is a durable message and is
+	//    written there before it is pushed.
+	//  - `audit_log` (apps/api/migrations/0024_audit_log.sql), where EVERY `/internal/*` call
+	//    is recorded against the staff account that made it. These endpoints are the
+	//    operator's remote control over every connected client and most of what they do leaves
+	//    no other trace, so the row is the only lasting answer to "who sent that".
+	//
+	// The coach BROADCAST is deliberately not stored as a notification: it reaches everyone
+	// online at once, so persisting it would write a row per player — thousands per
+	// maintenance notice, for something nobody needs to re-read. Its audit row is one row
+	// either way, which is part of why that trail is worth keeping.
 	"d1_databases": [
 		{
 			"binding": "DB",

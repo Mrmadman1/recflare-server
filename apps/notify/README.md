@@ -23,6 +23,15 @@ instance holds the shared hub state (one process across all connections).
   `MessageReceived` to every connected client (online-only; not persisted). Same
   admin-role gate.
 
+Every `/internal/*` call — including one the role gate refuses, and one that 404s — is
+recorded on the shared database's `audit_log` table, against the account that made it:
+`player_id` is the caller, `action` is the path as a snake_case verb (`coach_message`),
+and `data` carries the request body or query string plus the response status. The write
+happens in the admin gate, so a new `/internal/*` endpoint is audited the day it is added.
+A token carrying an admin role but no usable `sub` is refused (401) rather than let through
+unattributable. A failed audit write never fails the call; it leaves an error in the worker
+log. The table is owned by the `api` worker (`apps/api/migrations/0024_audit_log.sql`).
+
 ## Hub protocol
 
 1. Client `POST /hub/v1/negotiate`, then opens a WebSocket to `/hub/v1?id=<token>`.

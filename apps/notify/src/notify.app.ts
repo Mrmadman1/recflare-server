@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { createNotification } from '@repo/domain'
+import { createNotification, writeAuditLog } from '@repo/domain'
 import { logger, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
@@ -120,15 +120,99 @@ async function connectionOwner(c: Context<App>): Promise<number | null> {
 }
 
 /**
+ * The `action` an `/internal/<path>` call is recorded under — the path after the prefix as a
+ * stable snake_case verb, so `/internal/coach-message` files under `coach_message`.
+ *
+ * Derived rather than mapped, so the audit trail can't fall behind the routes: a new
+ * `/internal/*` endpoint is logged the day it is added, with no second list to keep in sync.
+ * The cost is that the value comes from the request, so it is squeezed down to `[a-z0-9_]`
+ * and capped — this middleware also runs for `/internal/` paths that match no route at all
+ * (they 404 just after it), and an admin token reaching for one is still worth a row.
+ */
+function auditAction(path: string): string {
+	const slug = path
+		.replace(/^\/internal\/?/, '')
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '')
+		.slice(0, 64)
+	return slug === '' ? 'unknown' : slug
+}
+
+/**
+ * Record one `/internal/*` call against the account that made it.
+ *
+ * What is kept is what was ASKED FOR plus how it was answered: the request body (or the
+ * query string, for the reads) is the substance of the action — a coach message's text and
+ * recipient exist nowhere else once the frame has gone out, and a broadcast is a WebSocket
+ * frame and then nothing — and the status says whether it happened. Reading the body here
+ * costs nothing: Hono caches a parsed body on the request, so this is the same object the
+ * handler parsed rather than a second read of a consumed stream.
+ *
+ * Never throws. By the time this runs the action has usually already taken place, so a
+ * failed insert must not turn a delivered coach message into an error for the caller — it
+ * leaves a loud line in the worker log instead, which is the one thing a gap in an audit
+ * trail should never do quietly.
+ */
+async function recordInternalCall(c: Context<App>, playerId: number, status: number) {
+	const action = auditAction(c.req.path)
+	const data: Record<string, unknown> = { method: c.req.method, path: c.req.path, status }
+
+	// A GET carries no body by definition; everything else may, and a request whose body
+	// isn't JSON (or is empty, as the DELETE's is) simply records none.
+	const body = c.req.method === 'GET' ? null : await c.req.json().catch(() => null)
+	if (body !== null) data.body = body
+	const query = c.req.query()
+	if (Object.keys(query).length > 0) data.query = query
+
+	try {
+		await writeAuditLog(c.env.DB, { playerId, action, data })
+	} catch (err) {
+		logger.error('could not write an audit log row', {
+			action,
+			playerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
  * Gates the `/internal/*` endpoints on a valid Bearer token that carries one of the
  * {@link ADMIN_ROLES} in its `role` claim. 401 for a missing/invalid token, 403 for a
  * valid token that lacks an admin role.
+ *
+ * Also where every call through here is AUDITED (see {@link recordInternalCall}). It sits in
+ * the gate rather than in each handler for the same reason the gate does: these endpoints
+ * are the operator's remote control over every connected client, and a record of who used
+ * it should not be something a new endpoint can forget to add.
  */
 const requireAdmin: MiddlewareHandler<App> = async (c, next) => {
-	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	const secret = await c.env.JWT_SECRET.get()
+	const roles = await validateAndGetRoles(c.req.raw, secret)
 	if (roles === null) return c.json({ error: 'Unauthorized' }, 401)
-	if (!roles.some((role) => ADMIN_ROLES.has(role))) return c.json({ error: 'Forbidden' }, 403)
-	await next()
+
+	// Every call is filed under the account that made it, so a token with an admin role but
+	// no usable `sub` is refused rather than let through unattributable. One minted by `auth`
+	// always has one, so this costs a real caller nothing.
+	const accountId = await validateAndGetAccountId(c.req.raw, secret)
+	if (accountId === null) return c.json({ error: 'Unauthorized' }, 401)
+
+	if (!roles.some((role) => ADMIN_ROLES.has(role))) {
+		// Recorded like any other call: a signed-in account reaching for an admin endpoint is
+		// exactly what an audit trail is kept for, and unlike the 401 above we know who it was.
+		await recordInternalCall(c, accountId, 403)
+		return c.json({ error: 'Forbidden' }, 403)
+	}
+
+	// Recorded AFTER the handler so the row can carry the outcome, and from a `finally` so a
+	// handler that throws is recorded too — as the 500 `onError` is about to answer with.
+	let status = 500
+	try {
+		await next()
+		status = c.res.status
+	} finally {
+		await recordInternalCall(c, accountId, status)
+	}
 }
 
 const app = new Hono<App>()
