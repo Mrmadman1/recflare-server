@@ -65,6 +65,7 @@ import {
 	spendCheerCredit,
 } from '../../reputation-db'
 import { charadesWordsFor } from '../../routes/gameplay'
+import { SCHEMA_DDL as VOTES_SCHEMA_DDL } from '../../votes-db'
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { SavedImage } from '@repo/domain'
@@ -170,6 +171,8 @@ beforeAll(async () => {
 
 	// Reports table (owned by the api worker) — player reports are recorded here.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Vote-to-kick ballots (owned by the api worker) — one row per vote cast.
+	for (const stmt of VOTES_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Platform identity links (owned by the auth worker) — the sharp arm of the
 	// ban-evasion resolution matches on them.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -4541,6 +4544,24 @@ describe('instant kick', () => {
 			.bind(accountId)
 			.first<{ n: number }>())!.n === 1
 
+	// A kick no longer deletes presence — it moves the player into their own dorm — so
+	// "kicked" is "no longer standing in that session", not "gone".
+	const inSession = async (accountId: number, roomInstanceId: number) =>
+		(await env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM presence
+				 WHERE account_id = ?1 AND json_extract(data, '$.roomInstance.roomInstanceId') = ?2`
+		)
+			.bind(accountId, roomInstanceId)
+			.first<{ n: number }>())!.n === 1
+
+	/** The instance a player's presence says they are standing in. */
+	const presenceInstance = async (accountId: number) =>
+		JSON.parse(
+			(await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
+				.bind(accountId)
+				.first<{ data: string }>())!.data
+		).roomInstance as { roomInstanceId: number; roomInstanceType: number; isPrivate: boolean }
+
 	const isFull = async (roomInstanceId: number) =>
 		(await env.DB.prepare('SELECT is_full AS full FROM room_instance WHERE id = ?1')
 			.bind(roomInstanceId)
@@ -4572,9 +4593,19 @@ describe('instant kick', () => {
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ success: true, error: '' })
 
-		// Presence is deleted, so they read offline at once — and only theirs is.
-		expect(await isPresent(205)).toBe(false)
-		expect(await isPresent(206)).toBe(true)
+		// Out of the session — and into their own DORM, rather than having their presence
+		// deleted: with nothing to read the client lands not knowing where it is and loads the
+		// dorm a second time. 206 is untouched.
+		expect(await inSession(205, SESSION)).toBe(false)
+		expect(await isPresent(205)).toBe(true)
+		const dorm = await presenceInstance(205)
+		// The OFFLINE dorm: the sentinel instance id, not a `room_instance` row. A kicked player
+		// is not joining a session, and minting one per kick would put live dorm sessions on the
+		// books that nothing ever joins.
+		expect(dorm.roomInstanceId).toBe(-2)
+		expect(dorm.roomInstanceType).toBe(2) // RoomInstanceType.Dormroom
+		expect(dorm.isPrivate).toBe(true)
+		expect(await inSession(206, SESSION)).toBe(true)
 		// The instance lost a player, so it is no longer full.
 		expect(await isFull(SESSION)).toBe(false)
 
@@ -4624,7 +4655,7 @@ describe('instant kick', () => {
 
 		// 43 holds Moderator (20) on the room.
 		expect((await kick({ GameSessionId: SESSION, PlayerIds: [209] }, '43')).status).toBe(200)
-		expect(await isPresent(209)).toBe(false)
+		expect(await inSession(209, SESSION)).toBe(false)
 
 		await standIn(209, SESSION)
 		// 44 is only a Host (10), and 99 holds nothing at all.
@@ -4633,7 +4664,7 @@ describe('instant kick', () => {
 			expect(res.status, sub).toBe(403)
 			expect(await res.json()).toEqual({ success: false, error: 'Forbidden' })
 		}
-		expect(await isPresent(209)).toBe(true)
+		expect(await inSession(209, SESSION)).toBe(true)
 
 		const anon = await exports.default.fetch(`${ORIGIN}/api/PlayerReporting/v1/instantKick`, {
 			method: 'POST',
@@ -4653,8 +4684,8 @@ describe('instant kick', () => {
 		// 43 (a moderator) names the creator, a fellow moderator and themselves.
 		const res = await kick({ GameSessionId: SESSION, PlayerIds: [42, 43] }, '43')
 		expect(res.status).toBe(200)
-		expect(await isPresent(42)).toBe(true)
-		expect(await isPresent(43)).toBe(true)
+		expect(await inSession(42, SESSION)).toBe(true)
+		expect(await inSession(43, SESSION)).toBe(true)
 		expect(await frames()).toEqual([])
 	})
 
@@ -4731,10 +4762,23 @@ describe('room mod kick', () => {
 			)
 			.run()
 
-	const isPresent = async (accountId: number) =>
-		(await env.DB.prepare('SELECT COUNT(*) AS n FROM presence WHERE account_id = ?1')
-			.bind(accountId)
+	// A kick no longer deletes presence — it moves the player into their own dorm — so
+	// "kicked" is "no longer standing in that session", not "gone".
+	const inSession = async (accountId: number, roomInstanceId: number) =>
+		(await env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM presence
+				 WHERE account_id = ?1 AND json_extract(data, '$.roomInstance.roomInstanceId') = ?2`
+		)
+			.bind(accountId, roomInstanceId)
 			.first<{ n: number }>())!.n === 1
+
+	/** The instance a player's presence says they are standing in. */
+	const presenceInstance = async (accountId: number) =>
+		JSON.parse(
+			(await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
+				.bind(accountId)
+				.first<{ data: string }>())!.data
+		).roomInstance as { roomInstanceId: number; roomInstanceType: number; isPrivate: boolean }
 
 	// The client's form body.
 	const modKick = async (fields: Record<string, string>, sub = '42', roles?: string[]) =>
@@ -4765,7 +4809,11 @@ describe('room mod kick', () => {
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ success: true, error: '' })
 
-		expect(await isPresent(205)).toBe(false)
+		// Out of the session and into their own dorm — not deleted.
+		expect(await inSession(205, SESSION)).toBe(false)
+		const kickedTo = await presenceInstance(205)
+		expect(kickedTo.roomInstanceId).toBe(-2) // the offline dorm sentinel
+		expect(kickedTo.roomInstanceType).toBe(2) // Dormroom
 		const full = await env.DB.prepare('SELECT is_full AS f FROM room_instance WHERE id = ?1')
 			.bind(SESSION)
 			.first<{ f: number }>()
@@ -4805,8 +4853,8 @@ describe('room mod kick', () => {
 				error: 'That player is not in this game session!',
 			})
 		}
-		expect(await isPresent(206)).toBe(true)
-		expect(await isPresent(207)).toBe(true)
+		expect(await inSession(206, SAME_ROOM_SESSION)).toBe(true)
+		expect(await inSession(207, OTHER_ROOM_SESSION)).toBe(true)
 
 		// Naming the OTHER room's session instead doesn't help: 42 has no authority there.
 		const cross = await modKick(
@@ -4814,7 +4862,7 @@ describe('room mod kick', () => {
 			'42'
 		)
 		expect(cross.status).toBe(403)
-		expect(await isPresent(207)).toBe(true)
+		expect(await inSession(207, OTHER_ROOM_SESSION)).toBe(true)
 		expect(await frames()).toEqual([])
 	})
 
@@ -4826,7 +4874,7 @@ describe('room mod kick', () => {
 		expect(
 			await (await modKick({ PlayerId: '209', GameSessionId: String(SESSION) }, '45')).json()
 		).toEqual({ success: true, error: '' })
-		expect(await isPresent(209)).toBe(false)
+		expect(await inSession(209, SESSION)).toBe(false)
 
 		// 999 has no role on the room but carries the staff `moderator` role — and is not the
 		// host, so the frame says so.
@@ -4837,7 +4885,7 @@ describe('room mod kick', () => {
 			'moderator',
 		])
 		expect(await staff.json()).toEqual({ success: true, error: '' })
-		expect(await isPresent(209)).toBe(false)
+		expect(await inSession(209, SESSION)).toBe(false)
 		expect((await frames())[0].data).toMatchObject({ IsHostKick: false, PlayerIdReporter: 999 })
 
 		// 43 is the room's Moderator (20) — enough for instantKick, not for this. 44 is a Host,
@@ -4848,7 +4896,7 @@ describe('room mod kick', () => {
 			expect(res.status, sub).toBe(403)
 			expect(await res.json()).toEqual({ success: false, error: 'Forbidden' })
 		}
-		expect(await isPresent(209)).toBe(true)
+		expect(await inSession(209, SESSION)).toBe(true)
 
 		const anon = await exports.default.fetch(`${ORIGIN}/api/PlayerReporting/v1/roomModKick`, {
 			method: 'POST',
@@ -4875,8 +4923,8 @@ describe('room mod kick', () => {
 				await modKick({ PlayerId: '45', GameSessionId: String(SESSION) }, '999', ['moderator'])
 			).json()
 		).toEqual({ success: false, error: 'You cannot kick an owner of this room!' })
-		expect(await isPresent(42)).toBe(true)
-		expect(await isPresent(45)).toBe(true)
+		expect(await inSession(42, SESSION)).toBe(true)
+		expect(await inSession(45, SESSION)).toBe(true)
 	})
 
 	test('an unknown session 404s, and the body must name a session and a player', async () => {
@@ -4901,9 +4949,15 @@ describe('room mod kick', () => {
 
 describe('vote to kick', () => {
 	// Two live sessions, so a vote called in one can be checked against a player in the
-	// other. Nothing reads `room_instance` here — the gate is presence alone.
+	// other. The gate is presence alone; `room_instance` is read only to name the room in a
+	// carried vote's kick frame.
 	const SESSION = 1014079
 	const OTHER_SESSION = 1014080
+	// The tally tests get sessions of their own: ballots are appended and never pruned, so
+	// votes cast by the tests above would otherwise be counted into theirs.
+	const TALLY_SESSION = 1014081
+	const REVOTE_SESSION = 1014082
+	const TIE_SESSION = 1014083
 
 	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
 
@@ -4922,6 +4976,34 @@ describe('vote to kick', () => {
 				})
 			)
 			.run()
+
+	const isPresent = async (accountId: number) =>
+		(await env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM presence WHERE json_extract(data, '$.accountId') = ?1"
+		)
+			.bind(accountId)
+			.first<{ n: number }>())!.n === 1
+
+	// A carried vote moves the player into their own dorm rather than deleting their presence,
+	// so "kicked" is "no longer standing in that session".
+	const inSession = async (accountId: number, roomInstanceId: number) =>
+		(await env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM presence
+				 WHERE json_extract(data, '$.accountId') = ?1
+					 AND json_extract(data, '$.roomInstance.roomInstanceId') = ?2`
+		)
+			.bind(accountId, roomInstanceId)
+			.first<{ n: number }>())!.n === 1
+
+	/** Every ballot cast against one player in one session, oldest first. */
+	const ballots = async (gameSessionId: number, playerId: number) =>
+		(
+			await env.DB.prepare(
+				'SELECT * FROM room_vote WHERE game_session_id = ?1 AND player_id = ?2 ORDER BY id'
+			)
+				.bind(gameSessionId, playerId)
+				.all<{ voter_id: number; response: number; player_id: number; voted_at: string }>()
+		).results
 
 	// The body the client posts: `PlayerId=205&Response=True&Reason=…&GameSessionId=…`.
 	const vote = async (fields: Record<string, string>, sub = '42') =>
@@ -4960,17 +5042,20 @@ describe('vote to kick', () => {
 
 		// One frame each for 205 and 206 — the player voted on gets it too (the vote is
 		// called in front of them), the caller does not, and 207 is in another session.
-		// `Data` is an ESCAPED JSON STRING, not a nested object: an object there fails the
-		// client's decoder (`expected:'String Begin Token', actual:'{'`) and takes the whole
-		// notification with it. `PlayerId` inside it is a STRING, as the reference relays it,
-		// and `Response` is empty because the frame is the question, not an answer.
+		//
+		// `FromPlayerId` is the player being VOTED ON (205), NOT the caller (42): the client
+		// raises its prompt about whoever that names, so the caller there asks the room to kick
+		// the wrong player. `Data` is the REASON as plain text — it is what the prompt shows,
+		// and it used to be a JSON blob of the ids, which players saw printed on the prompt. It
+		// is still a string on the wire: an object fails the client's decoder
+		// (`expected:'String Begin Token', actual:'{'`) and takes the whole notification with it.
 		const message = {
 			ephemeral: true,
 			notificationType: 2, // NotificationType.MessageReceived
 			data: {
-				FromPlayerId: 42,
+				FromPlayerId: 205,
 				Type: MessageType.VoteToKick,
-				Data: `{"PlayerId":"205","Response":"","GameSessionId":${SESSION}}`,
+				Data: 'Inactive in games (AFK)',
 			},
 		}
 		const sent = await frames()
@@ -4985,6 +5070,109 @@ describe('vote to kick', () => {
 			playerId: 206,
 			data: { ...message.data, ToPlayerId: 206 },
 		})
+	})
+
+	test('a vote with no reason still goes out, with an empty Data', async () => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		await standIn(42, SESSION)
+		await standIn(205, SESSION)
+		await standIn(206, SESSION)
+
+		const { Reason: _reason, ...noReason } = FIELDS
+		expect((await vote(noReason)).status).toBe(200)
+		const sent = await frames()
+		expect(sent).toHaveLength(2)
+		expect(sent.every((f) => f.data.Data === '')).toBe(true)
+		// Still about the player voted on, reason or no reason.
+		expect(sent.every((f) => f.data.FromPlayerId === 205)).toBe(true)
+	})
+
+	// A vote is recorded whether or not it carries — the row is the record of who asked.
+	test('the caller’s ballot is recorded', async () => {
+		await standIn(42, SESSION)
+		await standIn(205, SESSION)
+		await standIn(206, SESSION)
+		const before = await ballots(SESSION, 205)
+
+		expect((await vote(FIELDS)).status).toBe(200)
+		const after = await ballots(SESSION, 205)
+		expect(after).toHaveLength(before.length + 1)
+		expect(after.at(-1)).toMatchObject({ voter_id: 42, response: 1, player_id: 205 })
+		expect(typeof after.at(-1)!.voted_at).toBe('string')
+
+		// `Response=False` is recorded as a no rather than dropped.
+		expect((await vote({ ...FIELDS, Response: 'False' }, '206')).status).toBe(200)
+		expect((await ballots(SESSION, 205)).at(-1)).toMatchObject({ voter_id: 206, response: 0 })
+	})
+
+	// The point of the tally: enough of the room says yes and the player goes, without any
+	// moderator being involved.
+	test('a majority of the room carries the vote and kicks the player', async () => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		// Three in the session: 42 calls it on 210, 211 is the other voter.
+		for (const id of [42, 210, 211]) await standIn(id, TALLY_SESSION)
+		const fields = { ...FIELDS, PlayerId: '210', GameSessionId: String(TALLY_SESSION) }
+
+		// One yes of three is not a majority — the room is asked instead.
+		expect((await vote(fields)).status).toBe(200)
+		expect(await inSession(210, TALLY_SESSION)).toBe(true)
+		expect((await frames()).every((f) => f.notificationType === 2)).toBe(true)
+
+		// The second yes carries it: 2 of 3 is strictly more than half.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect((await vote(fields, '211')).status).toBe(200)
+
+		// Kicked exactly as a staff kick does it — out of the session and into their own dorm,
+		// their presence rewritten rather than deleted...
+		expect(await inSession(210, TALLY_SESSION)).toBe(false)
+		expect(await isPresent(210)).toBe(true)
+		expect(await inSession(210, -2)).toBe(true) // the offline dorm sentinel
+		// ...and ONE ephemeral ModerationKick, no vote prompt: the question is answered.
+		const sent = await frames()
+		expect(sent).toHaveLength(1)
+		expect(sent[0]).toMatchObject({
+			playerIds: [210],
+			ephemeral: true,
+			notificationType: 22, // NotificationType.ModerationKick
+			data: {
+				ReportCategory: 10, // KickReportCategory.VoteKick — the ROOM removed them
+				IsHostKick: false,
+				IsBan: false, // nothing stops them coming back
+				Duration: 0,
+				GameSessionId: TALLY_SESSION,
+				PlayerIdReporter: 211, // whose ballot carried it
+				VoteKickReason: 'Inactive in games (AFK)',
+			},
+		})
+	})
+
+	// Otherwise one player could carry a vote alone by posting it repeatedly.
+	test('re-posting a vote cannot carry it, and a voter may change their mind', async () => {
+		for (const id of [42, 212, 213]) await standIn(id, REVOTE_SESSION)
+		const fields = { ...FIELDS, PlayerId: '212', GameSessionId: String(REVOTE_SESSION) }
+
+		// Three yes votes from one voter is still one voter.
+		for (let i = 0; i < 3; i++) expect((await vote(fields)).status).toBe(200)
+		expect(await ballots(REVOTE_SESSION, 212)).toHaveLength(3)
+		expect(await inSession(212, REVOTE_SESSION)).toBe(true)
+
+		// 213 says yes — 2 of 3 — and it carries.
+		expect((await vote(fields, '213')).status).toBe(200)
+		expect(await inSession(212, REVOTE_SESSION)).toBe(false)
+	})
+
+	test('a tie is not a majority', async () => {
+		// Four in the session, so two yes votes are exactly half.
+		for (const id of [42, 214, 215, 216]) await standIn(id, TIE_SESSION)
+		const fields = { ...FIELDS, PlayerId: '214', GameSessionId: String(TIE_SESSION) }
+
+		expect((await vote(fields)).status).toBe(200)
+		expect((await vote(fields, '215')).status).toBe(200)
+		expect(await inSession(214, TIE_SESSION)).toBe(true)
+
+		// The third yes is more than half, and carries.
+		expect((await vote(fields, '216')).status).toBe(200)
+		expect(await inSession(214, TIE_SESSION)).toBe(false)
 	})
 
 	test('both players have to be standing in the session', async () => {

@@ -9,6 +9,9 @@ import {
 	setPresence,
 } from '@repo/domain/src/presence-db'
 import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
+// Banning a player moves them into their own dorm, which is a room (created on demand) with
+// a subroom — so those tables have to be here, as they are on the shared database.
+import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
 import { generateToken } from '@repo/jwt'
 
 import {
@@ -87,6 +90,8 @@ beforeAll(async () => {
 	for (const stmt of REPORT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of WARNING_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -947,12 +952,15 @@ it('throws a banned player out of the instance they are standing in', async () =
 		Duration: 3 * 86_400,
 	})
 
-	// And their presence row is gone, so they read offline at once and the instance frees
-	// a slot.
+	// And they are out of that instance — moved into their own DORM, not deleted: `match`
+	// lets a banned player matchmake there and nowhere else, so it is where they read the
+	// block screen, and with no presence at all the client loads the dorm a second time.
 	const presence = await env.DB.prepare(
-		"SELECT COUNT(*) AS n FROM presence WHERE json_extract(data, '$.accountId') = 8190"
-	).first<{ n: number }>()
-	expect(presence?.n).toBe(0)
+		"SELECT json_extract(data, '$.roomInstance.roomInstanceId') AS instance FROM presence WHERE json_extract(data, '$.accountId') = 8190"
+	).first<{ instance: number | null }>()
+	expect(presence).not.toBeNull()
+	// The OFFLINE dorm sentinel — a room the client loads locally, with no session behind it.
+	expect(presence?.instance).toBe(-2)
 })
 
 // Online but not standing in any room — in a menu — is still banned from the game, and is

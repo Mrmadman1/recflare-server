@@ -187,9 +187,15 @@ inconsistency here without checking the client first.
   with structure to it goes in ESCAPED — `"Data": "{\"PlayerId\":\"205\"}"`, never a nested
   object. An object there does not degrade: the client's decoder rejects it outright
   (`expected:'String Begin Token', actual:'{'`) and loses the whole notification, not just
-  the field. Bites the vote-to-kick message (`api`: `POST /api/PlayerReporting/v3/voteToKick`,
-  whose `Data` carries `{ PlayerId, Response, GameSessionId }` — `PlayerId` a string inside
-  it, as the reference relays it) and, the same way, a chat message's `Contents`.
+  the field. Bites a chat message's `Contents` the same way.
+- The vote-to-kick frame (`api`: `POST /api/PlayerReporting/v3/voteToKick`) carries the player
+  being VOTED ON as the Message's `FromPlayerId` — not the caller, whom nothing on the frame
+  names — because the client raises its prompt about whoever that field names. Sending the
+  voter asks the room to kick the player who called the vote. Its `Data` is the posted
+  `Reason` as PLAIN TEXT (`Inactive in games (AFK)`), which is the text the prompt shows: it
+  once carried an escaped `{ PlayerId, Response, GameSessionId }`, and players saw that JSON
+  printed where the reason belongs. `Data` is still a string on the wire — that part of the
+  rule above holds; a reason simply needs no escaping to satisfy it.
 - Leaderboard `Rank` (`leaderboard`: `GetRanks`, `GetNearbyScores`, `GetPlayerRank`) is
   0-BASED — the client adds one before it draws, so a `Rank` of 1 shows in game as second
   place and the top of a board must be 0. Its own slice says the same: it asks for the first

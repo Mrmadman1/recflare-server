@@ -2552,11 +2552,14 @@ describe('rooms endpoints', () => {
 		expect(rebanned.value).toMatchObject({ Reason: null, ExpiresAt: null })
 	})
 
-	it('POST /rooms/:id/bans deletes the banned player’s presence in that room', async () => {
+	it('POST /rooms/:id/bans moves the banned player out of that room, into their dorm', async () => {
 		const presenceOf = (accountId: number) =>
-			env.DB.prepare('SELECT room_id FROM presence WHERE account_id = ?1')
+			env.DB.prepare(
+				`SELECT room_id, json_extract(data, '$.roomInstance.roomInstanceId') AS instance
+				 FROM presence WHERE account_id = ?1`
+			)
 				.bind(accountId)
-				.first<{ room_id: number }>()
+				.first<{ room_id: number; instance: number }>()
 		const instanceId = 1000002 // what `putInRoom` puts room 2's players in
 		const isFull = async () =>
 			(
@@ -2582,13 +2585,19 @@ describe('rooms endpoints', () => {
 		await putInRoom(321, 4)
 
 		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '320' }, '1')).status).toBe(200)
-		// Gone from the room they were banned from, and the seat they held is free again.
-		expect(await presenceOf(320)).toBeNull()
+		// Out of the room they were banned from, and the seat they held is free again. Their
+		// presence is REWRITTEN to their own dorm rather than deleted: with none to read, the
+		// client arrives at the dorm not knowing where it is and loads it a second time.
+		const moved = await presenceOf(320)
+		expect(moved).not.toBeNull()
+		expect(moved!.room_id).not.toBe(2)
+		// The OFFLINE dorm sentinel, not a live dorm session minted per ban.
+		expect(moved!.instance).toBe(-2)
 		expect(await isFull()).toBe(0)
 
 		// A ban from room 2 does not knock someone offline from room 4.
 		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '321' }, '1')).status).toBe(200)
-		expect(await presenceOf(321)).toEqual({ room_id: 4 })
+		expect((await presenceOf(321))?.room_id).toBe(4)
 
 		await clearPresence(321)
 		await env.DB.prepare('DELETE FROM room_instance WHERE id = ?1').bind(instanceId).run()

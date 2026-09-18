@@ -4,14 +4,14 @@ import { describeRoute } from 'hono-openapi'
 import {
 	canManageRoom,
 	canModerateRoom,
-	deletePresence,
+	countPlayersInInstance,
 	getPlayerIdsInInstance,
 	getPresence,
 	getPresences,
 	getRoomById,
 	getStoredRoomInstance,
 	MessageType,
-	refreshInstanceFullness,
+	movePlayerToDorm,
 } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 
@@ -39,6 +39,7 @@ import {
 	VoteToKickRequest,
 } from '../openapi'
 import { banBlockDetails, createReport, getActiveBan, NOT_BLOCKED } from '../reports-db'
+import { countKickVotes, isKickMajority, recordRoomVote } from '../votes-db'
 import { createWarning } from '../warnings-db'
 
 import type { Context } from 'hono'
@@ -66,6 +67,15 @@ function formField(
 	if (typeof raw === 'string' && raw !== '') return raw
 	return c.req.query(name) || undefined
 }
+
+/**
+ * Whether a posted `Response` is a YES. The client sends `True`/`False`; `1`/`0` are accepted
+ * beside them because the same field is an int elsewhere in this controller. Anything else —
+ * absent included — is a no, which is the safe way round: an unreadable answer must not count
+ * toward removing somebody.
+ */
+const isYesVote = (value: string | undefined): boolean =>
+	value !== undefined && ['true', '1', 'yes'].includes(value.trim().toLowerCase())
 
 /** Parse a field as an integer, or null when absent / not a number. */
 const asInt = (v: string | undefined): number | null => {
@@ -167,27 +177,23 @@ async function pushInstantKick(
 }
 
 /**
- * What a vote-to-kick Message's `Data` says, BEFORE it is serialized. It reaches the
- * client as an escaped JSON string, never as a nested object — a Message's `Data` is a
- * string on the wire like every other Message's, and the client's decoder rejects an
- * object outright: `expected:'String Begin Token', actual:'{'`, which aborts the whole
- * notification rather than dropping the field. Serialize it with {@link voteToKickData}.
+ * What a vote-to-kick Message carries, and it is not what this once sent.
  *
- * `PlayerId` is the account id as a STRING — the reference passes the posted form field
- * straight through, and this mirrors it verbatim.
+ * `FromPlayerId` is the player being VOTED ON, not the one who called the vote. The client
+ * raises its prompt about whoever that names, so sending the caller put the voter's own name
+ * on the prompt — "kick 153?" when 153 was the one asking to kick 187. Nothing on the frame
+ * identifies the caller, and nothing needs to: the prompt is about the accused.
  *
- * `Response` is the empty string even though the caller posted their own vote: the frame
- * is the PROMPT put to everyone else, so it carries no answer yet. The caller's `Response`
- * is theirs alone and is not relayed.
+ * `Data` is the REASON, as plain text (`Inactive in games (AFK)`) — the label the client
+ * offered in `voteToKickReasons` and posted back. It used to be an escaped JSON object of
+ * `{ PlayerId, Response, GameSessionId }`, which reached players as that JSON printed on the
+ * prompt where the reason belongs.
+ *
+ * It is still a STRING on the wire, which is the part that has not changed: a Message's `Data`
+ * is a string like every other Message's, and an object there fails the client's decoder
+ * outright (`expected:'String Begin Token', actual:'{'`), aborting the whole notification
+ * rather than dropping the field. A reason is text, so it needs no escaping to satisfy that.
  */
-interface VoteToKickData {
-	PlayerId: string
-	Response: string
-	GameSessionId: number
-}
-
-/** Serialize a {@link VoteToKickData} into the escaped JSON string `Data` carries. */
-const voteToKickData = (data: VoteToKickData): string => JSON.stringify(data)
 
 /**
  * The Message a vote-to-kick frame carries — the same four fields as every other Message
@@ -226,6 +232,64 @@ async function pushVoteToKick(c: Context<App>, message: VoteToKickMessage): Prom
 			error: err instanceof Error ? err.message : String(err),
 		})
 		return false
+	}
+}
+
+/**
+ * Carry out a vote-to-kick that has passed: the player is moved into their own dorm and gets a
+ * `ModerationKick` frame (id 22), exactly as the staff kicks in this controller do.
+ *
+ * It differs from those in who it says did it. `ReportCategory` is `VoteKick` (10) and
+ * `IsHostKick` is false — the ROOM removed them, not its host — and `PlayerIdReporter` is the
+ * player whose vote carried it rather than a moderator. `IsBan` is false: a vote-kick ends the
+ * session they are in and nothing more, so they may walk straight back in, and a room that
+ * wants them gone for good bans them.
+ *
+ * `VoteKickReason` carries the reason the vote was called on, which is the field the client
+ * has for it — unlike the staff kicks, which leave it empty and put their text in `Message`.
+ *
+ * Best-effort, and deliberately after the ballot is recorded: the vote happened and was
+ * counted whatever the hub does next.
+ */
+async function applyVoteKick(
+	c: Context<App>,
+	playerId: number,
+	gameSessionId: number,
+	reason: string,
+	carriedByAccountId: number
+): Promise<void> {
+	try {
+		// Into their own dorm, not out of existence — see the note in `instantKick`.
+		await movePlayerToDorm(c.env.DB, playerId)
+
+		const instance = await getStoredRoomInstance(c.env.DB, gameSessionId)
+		const room = instance && (await getRoomById(c.env.DB, instance.roomId))
+		const roomName = typeof room?.Name === 'string' ? room.Name : 'this room'
+
+		const frame: ModerationKickPayload = {
+			ReportCategory: KickReportCategory.VoteKick,
+			Duration: 0,
+			GameSessionId: gameSessionId,
+			IsHostKick: false,
+			Message: `You have been kicked from ${roomName}.`,
+			PlayerIdReporter: carriedByAccountId,
+			IsBan: false,
+			IsVoiceModAutoban: false,
+			IsWarning: false,
+			VoteKickReason: reason,
+			TimeoutStartedAt: null,
+		}
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+			[playerId],
+			NotificationType.ModerationKick,
+			{ ...frame }
+		)
+	} catch (err) {
+		logger.error('failed to carry out a vote kick', {
+			playerId,
+			gameSessionId,
+			error: err instanceof Error ? err.message : String(err),
+		})
 	}
 }
 
@@ -443,17 +507,28 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				'vote is called in front of them — gets a `MessageReceived` frame carrying a ' +
 				'Message of type 5 (`VoteToKick`). The caller is left out: they have voted ' +
 				'already, and their own `Response` is what they posted.\n\n' +
-				'`Data` is an ESCAPED JSON STRING — `"{\\"PlayerId\\":\\"205\\",…}"`, not a nested ' +
-				'object. A Message’s `Data` is a string on the wire, and an object there fails the ' +
-				"client’s decoder outright (`expected:'String Begin Token', actual:'{'`), " +
-				'aborting the notification rather than dropping the field. Inside it, `PlayerId` ' +
-				'is the account id as a STRING, as the reference relays it, and `Response` is ' +
-				'empty — the frame is the question, not an answer.\n\n' +
+				'`FromPlayerId` on that Message is the player being VOTED ON, not the caller — the ' +
+				'client raises its prompt about whoever it names, so the caller there asks the room ' +
+				'to kick the wrong player. `Data` is the `Reason` as PLAIN TEXT (`Inactive in games ' +
+				'(AFK)`), which is what the prompt shows; it is still a string on the wire, because ' +
+				"an object there fails the client’s decoder (`expected:'String Begin Token', " +
+				"actual:'{'`) and aborts the whole notification.\n\n" +
 				'The frames are EPHEMERAL: a vote belongs to the moment it was called, so an ' +
 				'offline player gets nothing rather than a prompt about a dead session on their ' +
 				'next connect.\n\n' +
-				'Nothing is stored — no tally, no report row, and `Reason` is accepted and ' +
-				'unused. Answers the same lowercase `{ success, error }` envelope as the report ' +
+				'Every call RECORDS a ballot in `room_vote` — the session, the player voted on, the ' +
+				'voter and their answer — and then tallies. A vote CARRIES when the yes votes are ' +
+				'strictly more than half the players standing in the session right now (a tie is not ' +
+				'a majority, and the count is of the room as it is, since players leave mid-vote). ' +
+				'The tally counts DISTINCT voters and reads only each one’s latest ballot, so ' +
+				're-posting a vote cannot carry one and a voter may change their mind.\n\n' +
+				'When it carries, the player is kicked exactly as a staff kick does it — moved into ' +
+				'their own dorm, the instance they left freed, an ephemeral `ModerationKick` (id 22) — ' +
+				'but with `ReportCategory` `VoteKick` (10), `IsHostKick` false (the ROOM removed ' +
+				'them), `PlayerIdReporter` the voter whose ballot carried it, and the reason in ' +
+				'`VoteKickReason`. `IsBan` is false: nothing stops them rejoining. No prompt goes ' +
+				'out in that case — the room is not asked a question that is already answered.\n\n' +
+				'`Response` is the caller’s own vote, recorded but never relayed. Answers the same lowercase `{ success, error }` envelope as the ' +
 				'write; a hub failure for any recipient is reported honestly as a 500, since ' +
 				'with nothing behind it the frame is the whole delivery.',
 			security: AUTHED,
@@ -471,8 +546,6 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 			if (voterId === null) return unauthorized(c)
 
 			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
-			// Kept as posted for the frame — `Data.PlayerId` goes out as the string the
-			// reference relays — but parsed here to check it against presence.
 			const playerIdField = formField(body, c, 'PlayerId')
 			const playerId = asInt(playerIdField)
 			if (playerIdField === undefined || playerId === null) {
@@ -482,6 +555,10 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 			if (gameSessionId === null) {
 				return c.json({ success: false, error: 'GameSessionId is required' }, 400)
 			}
+
+			// The prompt's own text. Absent is an empty string rather than a refusal: a vote with
+			// no reason given is still a vote, and the client picks from a fixed list anyway.
+			const reason = formField(body, c, 'Reason') ?? ''
 
 			// One read for both players. A vote may only be called by someone standing in the
 			// session, about someone standing in the same one — the session is read from live
@@ -506,20 +583,45 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				(id) => id !== voterId
 			)
 
+			// The caller's own ballot, recorded before the room is asked: they have voted, and a
+			// vote in a session holding only them and the player they called it on should carry on
+			// its own rather than waiting for an answer that can never come.
+			await recordRoomVote(c.env.DB, {
+				gameSessionId,
+				playerId,
+				voterId: voterId,
+				response: isYesVote(formField(body, c, 'Response')),
+			})
+
+			// Counted against who is standing there RIGHT NOW: a majority is of the room as it is,
+			// not of the room as it was when the vote was called, and players leave mid-vote.
+			const yesVotes = await countKickVotes(c.env.DB, gameSessionId, playerId)
+			const playerCount = await countPlayersInInstance(c.env.DB, gameSessionId)
+			if (isKickMajority(yesVotes, playerCount)) {
+				logger.info('vote to kick carried', {
+					playerId,
+					gameSessionId,
+					yesVotes,
+					playerCount,
+					carriedBy: voterId,
+				})
+				await applyVoteKick(c, playerId, gameSessionId, reason, voterId)
+				// The room is not asked a question that has already been answered.
+				return c.json({ success: true, error: '' })
+			}
+
 			// Every recipient is attempted even if an earlier one fails, so the reachable
 			// players still get the vote.
 			const results = await Promise.all(
 				audience.map((toPlayerId) =>
 					pushVoteToKick(c, {
-						FromPlayerId: voterId,
+						// The player being VOTED ON — the client raises its prompt about this id, so
+						// the caller's own id here asks the room to kick the wrong player.
+						FromPlayerId: playerId,
 						ToPlayerId: toPlayerId,
 						Type: MessageType.VoteToKick,
-						// An escaped JSON STRING, not a nested object — see VoteToKickData.
-						Data: voteToKickData({
-							PlayerId: playerIdField,
-							Response: '',
-							GameSessionId: gameSessionId,
-						}),
+						// The reason as plain text; see the note above the Message type.
+						Data: reason,
 					})
 				)
 			)
@@ -553,8 +655,10 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				'instance. Anyone else named — offline, or standing in another room — is skipped ' +
 				'in silence, so naming an account id cannot reach into a session the caller has ' +
 				'no authority over.\n\n' +
-				'Each kicked player loses their presence row (they read offline at once and the ' +
-				'instance frees a slot) and gets a `ModerationKick` frame (id 22) — the frame the ' +
+				'Each kicked player is moved into their own DORM — presence rewritten, not deleted, ' +
+				'so their client lands where it already is instead of loading the dorm a second ' +
+				'time — and the instance they left frees a slot. They also get a `ModerationKick` ' +
+				'frame (id 22) — the frame the ' +
 				'client acts on to leave. It is the same frame a room ban sends, but `IsBan` is ' +
 				'false: this only removes them from the session they are in, and nothing stops ' +
 				'them rejoining. The frame is EPHEMERAL — a kick is true of the moment it ' +
@@ -614,14 +718,15 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				// moderator could throw the creator out of it. Nor is the caller themselves.
 				if (playerId === moderatorId || canModerateRoom(room, playerId)) continue
 				if (presences.get(playerId)?.roomInstance?.roomInstanceId !== gameSessionId) continue
-				await deletePresence(c.env.DB, playerId)
+				// Moved to their own dorm rather than having their presence deleted: the client
+				// goes to the dorm either way, and with no presence to read it arrives not knowing
+				// where it is and loads the dorm a second time. `movePlayerToDorm` recomputes the
+				// fullness of the instance they left, so this one no longer has to.
+				await movePlayerToDorm(c.env.DB, playerId)
 				kicked.push(playerId)
 			}
 
 			if (kicked.length > 0) {
-				// The instance just lost players — recompute its fullness so a full room opens
-				// back up, exactly as the `match` worker does when someone logs out.
-				await refreshInstanceFullness(c.env.DB, gameSessionId)
 				const roomName = typeof room.Name === 'string' ? room.Name : 'this room'
 				await pushInstantKick(c, kicked, gameSessionId, roomName, moderatorId)
 			}
@@ -657,8 +762,9 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				'account id cannot reach into a session in another room, or another instance of this ' +
 				'one. The caller need not be in the instance themselves. The caller cannot kick ' +
 				'themselves, and nobody can kick the room’s owner or a co-owner.\n\n' +
-				'A kick deletes the player’s presence row (they read offline at once and the instance ' +
-				'frees a slot, its fullness recomputed) and sends them an EPHEMERAL `ModerationKick` ' +
+				'A kick moves the player into their own DORM — presence rewritten rather than deleted, ' +
+				'so their client does not load the dorm twice — frees the slot they held, and sends ' +
+				'them an EPHEMERAL `ModerationKick` ' +
 				'frame (id 22) with `IsBan: false` — nothing stops them rejoining. `IsHostKick` is ' +
 				'true when the caller runs the room, false for a staff account acting in a room it ' +
 				'does not.\n\n' +
@@ -719,8 +825,8 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				return c.json({ success: false, error: 'That player is not in this game session!' })
 			}
 
-			await deletePresence(c.env.DB, playerId)
-			await refreshInstanceFullness(c.env.DB, gameSessionId)
+			// Into their own dorm, not out of existence — see the note in `instantKick`.
+			await movePlayerToDorm(c.env.DB, playerId)
 			const roomName = typeof room.Name === 'string' ? room.Name : 'this room'
 			await pushInstantKick(c, [playerId], gameSessionId, roomName, moderatorId, {
 				reason,

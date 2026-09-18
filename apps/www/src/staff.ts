@@ -1,4 +1,4 @@
-import { deletePresence, getPresences, refreshInstanceFullness } from '@repo/domain'
+import { getPresences, movePlayerToDorm } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
@@ -173,8 +173,11 @@ function banExpiry(
  * none. EPHEMERAL, because an offline player needs no frame — they meet the same screen at
  * `moderationBlockDetails` when they next sign in — and a queued one would fire again then.
  *
- * Their presence row is deleted (they read offline at once), and the instance they were in,
- * if any, has its fullness recomputed so a full room frees a slot.
+ * They are moved into their own DORM rather than having their presence deleted — the same move
+ * every kick makes, and the one place a banned player is still allowed to be: `match` lets them
+ * matchmake there and nowhere else, which is how they reach this screen at all. Deleting the row
+ * instead left the client arriving at the dorm not knowing where it was, loading it a second
+ * time. The instance they were in, if any, frees a slot.
  *
  * Entirely best-effort. The ban row is already committed by the time this runs; a hub hiccup
  * or a missing presence must not fail a ban that has been handed down.
@@ -188,9 +191,10 @@ async function kickBannedPlayer(c: Context<App>, report: ReportRow, moderatorId:
 		// Offline: nothing to eject and nobody to tell. The sign-in check has them.
 		if (!presence) return
 
-		await deletePresence(c.env.DB, playerId)
+		// Read before the move, so the frame names the session they were thrown out of rather
+		// than the dorm they landed in. `movePlayerToDorm` recomputes that instance's fullness.
 		const gameSessionId = presence.roomInstance?.roomInstanceId
-		if (gameSessionId !== undefined) await refreshInstanceFullness(c.env.DB, gameSessionId)
+		await movePlayerToDorm(c.env.DB, playerId)
 
 		const block = banBlockDetails(report)
 		const frame: ModerationKickPayload = {

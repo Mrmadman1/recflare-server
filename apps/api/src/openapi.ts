@@ -1457,12 +1457,18 @@ export const CreateWarningRequest = z.object({
  * body — it's the bearer token's subject.
  */
 export const VoteToKickRequest = z.object({
-	PlayerId: z.string().describe('Account id of the player being voted on'),
-	Response: z.string().describe('The caller’s own vote, e.g. `True`'),
+	PlayerId: z
+		.string()
+		.describe(
+			'Account id of the player being voted on — relayed as the frame’s `FromPlayerId`, which is what the client’s prompt names'
+		),
+	Response: z.string().describe('The caller’s own vote, e.g. `True`. Not relayed'),
 	Reason: z
 		.string()
 		.optional()
-		.describe('A `voteToKickReasons` label, e.g. `Inactive in games (AFK)`'),
+		.describe(
+			'A `voteToKickReasons` label, e.g. `Inactive in games (AFK)` — relayed verbatim as the frame’s `Data`, which is the text the prompt shows. Empty when absent'
+		),
 	GameSessionId: z.string().describe('The room instance both players are standing in'),
 })
 

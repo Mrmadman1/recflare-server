@@ -15,7 +15,6 @@ import {
 	countRoomsByCreator,
 	createNotification,
 	createSubRoom,
-	deletePresence,
 	deleteRoom,
 	deleteRoomLeaderboard,
 	deleteSubRoom,
@@ -49,8 +48,8 @@ import {
 	isRoomOwner,
 	MessageType,
 	modifySubRoom,
+	movePlayerToDorm,
 	publishSubRoomSave,
-	refreshInstanceFullness,
 	removeCheer,
 	removeFavorite,
 	removeRoomRole,
@@ -621,18 +620,19 @@ async function pushRoleInvite(
 const REPORT_CATEGORY_MODERATOR = -1
 
 /**
- * Take a freshly banned player out of the room's LIVE PRESENCE, so the ban takes effect on
- * everything that reads presence right now rather than when their row next expires. The kick
- * push ejects their client, but until the row goes they still count toward the instance's
- * player total (keeping a full room full), still show as standing in the room to friends, and
- * still pass the presence-based grants — reading the room's staged saves among them.
+ * Move a freshly banned player out of the room and into their own DORM, so the ban takes
+ * effect on everything that reads presence right now rather than when their row next expires.
+ * The kick push ejects their client, but until presence moves they still count toward the
+ * instance's player total (keeping a full room full), still show as standing in the room to
+ * friends, and still pass the presence-based grants — reading the room's staged saves among
+ * them.
  *
  * Only when their presence puts them in THIS room. A player banned from a room they are not
  * standing in keeps their presence: a ban here is no reason to knock them offline from wherever
  * they actually are. The same rule the instant kick in `api` applies to its instance.
  *
- * The instance they left gets its fullness recomputed, as every other presence removal does, so
- * a room they were filling opens back up. Best-effort like the push: the ban row is already
+ * The instance they left gets its fullness recomputed, as every other departure does, so a room
+ * they were filling opens back up. Best-effort like the push: the ban row is already
  * committed, and a failure here must not turn a ban that happened into an error response.
  *
  * Returns the instance they were removed from, or null when they were not standing in the
@@ -642,10 +642,11 @@ async function evictBannedPlayer(c: Context<App>, ban: RoomBan): Promise<number 
 	try {
 		const instance = (await getPresence<PresenceView>(c.env.DB, ban.BannedPlayerId))?.roomInstance
 		if (instance?.roomId !== ban.RoomId) return null
-		await deletePresence(c.env.DB, ban.BannedPlayerId)
-		if (instance.roomInstanceId == null) return null
-		await refreshInstanceFullness(c.env.DB, instance.roomInstanceId)
-		return instance.roomInstanceId
+		// Moved to their own dorm rather than deleted: the client goes there either way, and with
+		// no presence to read it arrives not knowing where it is and loads the dorm a second
+		// time. This also recomputes the fullness of the instance they left.
+		await movePlayerToDorm(c.env.DB, ban.BannedPlayerId)
+		return instance.roomInstanceId ?? null
 	} catch (err) {
 		logger.error('failed to clear a banned player’s presence', {
 			playerId: ban.BannedPlayerId,
@@ -2593,9 +2594,10 @@ const app = new Hono<App>()
 				'the ban list — without anyone lifting it. Re-banning REPLACES the reason and',
 				'duration and restarts the clock; it does not extend the remaining time.',
 				'',
-				'If the banned player’s live presence puts them in THIS room, that presence row is',
-				'deleted and the instance’s fullness recomputed, so they stop counting as standing in',
-				'the room immediately. Presence in some other room is left alone.',
+				'If the banned player’s live presence puts them in THIS room, they are moved into their',
+				'own DORM — presence rewritten rather than deleted, so their client does not load the',
+				'dorm twice — and the instance they left frees a slot. Presence in some other room is',
+				'left alone.',
 				'',
 				'A banned player standing in the room also gets a `ModerationKick` frame (id 22),',
 				'the frame the client acts on to leave, with `gameSessionId` the instance they were',
