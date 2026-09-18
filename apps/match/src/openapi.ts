@@ -216,8 +216,9 @@ export const ConnectionExperiments = z.object({
  * and `photonRoomId`, the Photon room of the instance their presence says they're in
  * — the same name every other player in that instance is handed. The voice fields name
  * the Tachyon server that instance was assigned out of the `TACHYON_HOST_PORT` pool —
- * likewise the same for everyone in the session — and are empty when the pool is unset
- * or the caller is in no instance. `photonRegion` matches the one stamped
+ * likewise the same for everyone in the session, except that a caller holding the
+ * DEVELOPER role is sent to that host's port 7778 as `dev` — and are empty when the pool
+ * is unset or the caller is in no instance. `photonRegion` matches the one stamped
  * on every room instance, so the two can't disagree.
  */
 export const ConnectionInfo = z.object({
@@ -229,10 +230,14 @@ export const ConnectionInfo = z.object({
 	photonRoomId: z.string().describe('The caller’s current instance; empty when they’re in none'),
 	voiceConnectionInfo: z
 		.string()
-		.describe('The instance’s Tachyon server, `host:port`; empty when none is configured'),
+		.describe(
+			'The instance’s Tachyon server, `host:port` (port 7778 for a developer); empty when none is configured'
+		),
 	voiceServerId: z
 		.string()
-		.describe('That server’s generated id (`tachyon-1`, …); cosmetic, empty when there is none'),
+		.describe(
+			'That server’s generated id (`tachyon-1`, …; `dev` for a developer); cosmetic, empty when there is none'
+		),
 	experiments: ConnectionExperiments,
 })
 

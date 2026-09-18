@@ -1491,6 +1491,64 @@ describe('auth-gated endpoints', () => {
 		}
 	})
 
+	test('a developer is sent to the same Tachyon host on the dev port', async () => {
+		// Developers run against a Tachyon build listening on 7778 beside the live one, so
+		// only the host carries over from the instance's assignment — the dev build is not an
+		// entry in the pool, so it is named `dev` rather than borrowing that entry's
+		// positional `tachyon-N`.
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 974, username: 'Devver', isDeveloper: true }))
+			.run()
+		const original = env.TACHYON_HOST_PORT
+		try {
+			// One entry, so the assignment can't happen to land on 7778 by itself.
+			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
+
+			const voiceFor = async (player: string, roomInstanceId: number) => {
+				const res = await exports.default.fetch(
+					`${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
+					{ headers: await bearer(player) }
+				)
+				const body = (await res.json()) as {
+					value: { voiceConnectionInfo: string; voiceServerId: string }
+				}
+				return {
+					voiceConnectionInfo: body.value.voiceConnectionInfo,
+					voiceServerId: body.value.voiceServerId,
+				}
+			}
+
+			const instance = await createRoomInstance(env.DB, {
+				ownerAccountId: 974,
+				roomId: 2,
+				photonRoomId: 'tachyon-instance-dev',
+				maxCapacity: 12,
+			})
+			expect(await voiceFor('974', instance.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7778',
+				voiceServerId: 'dev',
+			})
+			// Everyone else in that instance keeps the pool entry's own port and id.
+			expect(await voiceFor('975', instance.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+
+			// In no instance there is no server to move the port of: a bare ':7778' would be
+			// an address that answers nothing, named `dev`.
+			const none = await exports.default.fetch(`${ORIGIN}/player/connection-info`, {
+				headers: await bearer('974'),
+			})
+			const body = (await none.json()) as {
+				value: { voiceConnectionInfo: string; voiceServerId: string }
+			}
+			expect(body.value.voiceConnectionInfo).toBe('')
+			expect(body.value.voiceServerId).toBe('')
+		} finally {
+			env.TACHYON_HOST_PORT = original
+		}
+	})
+
 	test('re-matchmaking into your current room returns a different instance (id must change)', async () => {
 		// The client keys the room transition off a changing roomInstanceId; handing back
 		// the instance the player is already in hangs their join. RecCenter (cap 12) so
