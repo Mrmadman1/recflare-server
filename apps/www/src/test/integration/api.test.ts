@@ -12,6 +12,7 @@ import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
 import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
+import { recordStat, STAT_SCHEMA_DDL } from '@repo/domain/src/stats-db'
 import { generateToken } from '@repo/jwt'
 
 import {
@@ -92,6 +93,8 @@ beforeAll(async () => {
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// `stat` is written by the `match` presence cron; www only reads it, for `/stats`.
+	for (const stmt of STAT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -328,6 +331,50 @@ it('serves a public head-count of the players actually online', async () => {
 	// Readable from any origin — it's meant to be embedded elsewhere.
 	expect(res.headers.get('access-control-allow-origin')).toBe('*')
 	expect(await res.json()).toEqual({ status: 'online', players: 2 })
+})
+
+// The series behind `/stats`. What's pinned: samples fold into the range's bucket as its
+// PEAK, the average is over the raw samples (not over the buckets), samples outside the
+// window and other stat types stay out, and the range is a closed list.
+it('serves the online series bucketed by range, peak per bucket', async () => {
+	await env.DB.prepare('DELETE FROM stat').run()
+	// Anchored to the start of the previous hour so the three samples provably share one
+	// hourly bucket, whenever the test runs.
+	const hour = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000
+	await recordStat(env.DB, 'online', 4, new Date(hour))
+	await recordStat(env.DB, 'online', 9, new Date(hour + 5 * 60_000))
+	await recordStat(env.DB, 'online', 2, new Date(hour + 10 * 60_000))
+	await recordStat(env.DB, 'online', 50, new Date(hour - 8 * 86_400_000)) // before the 7d window
+	await recordStat(env.DB, 'rooms', 99, new Date(hour)) // another series entirely
+
+	let res = await SELF.fetch('https://example.com/api/stats/online?range=7d')
+	expect(res.status).toBe(200)
+	const week = await res.json<{
+		bucketSeconds: number
+		from: number
+		to: number
+		peak: number
+		average: number
+		points: Array<{ t: number; players: number }>
+	}>()
+	expect(week.bucketSeconds).toBe(3600)
+	expect(week.to - week.from).toBe(7 * 86_400)
+	expect(week.points).toEqual([{ t: hour / 1000, players: 9 }])
+	expect(week.peak).toBe(9)
+	expect(week.average).toBe(5)
+
+	// The default range is the raw five-minute series: one point per sample.
+	res = await SELF.fetch('https://example.com/api/stats/online')
+	const day = await res.json<{ range: string; points: Array<{ players: number }> }>()
+	expect(day.range).toBe('24h')
+	expect(day.points.map((p) => p.players)).toEqual([4, 9, 2])
+
+	// The 30-day window reaches the old sample the week didn't.
+	res = await SELF.fetch('https://example.com/api/stats/online?range=30d')
+	expect((await res.json<{ peak: number }>()).peak).toBe(50)
+
+	res = await SELF.fetch('https://example.com/api/stats/online?range=forever')
+	expect(res.status).toBe(400)
 })
 
 it('serves the aggregated docs page with a source per documented service', async () => {

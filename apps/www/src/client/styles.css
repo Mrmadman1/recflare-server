@@ -1097,6 +1097,253 @@ button[type='submit']:disabled {
 	color: var(--ok);
 }
 
+/* ---- Stats ---------------------------------------------------------------- */
+
+/*
+ * `/stats`: the head-count and its history. The line wears `--live`, the same green as the
+ * homepage's "online" dot, because it IS that signal drawn over time — and not the
+ * orange, which this page keeps for things you can press. Everything that isn't data
+ * (grid, ticks, the table) stays in `--line`/`--muted` so the line is the only loud thing.
+ */
+.shell.stats {
+	padding-top: 40px;
+}
+
+.stats-head h1 {
+	margin-bottom: 4px;
+}
+
+.stats-head p {
+	margin: 0 0 22px;
+}
+
+/* One control, four positions — the auth card's `.tabs`, but hugging its labels instead
+   of filling the row: a full-width bar over a chart reads as a heading. */
+.stats-ranges {
+	display: inline-flex;
+	gap: 4px;
+	margin-bottom: 18px;
+	padding: 4px;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+}
+
+.stats-ranges button {
+	background: transparent;
+	border: none;
+	color: var(--muted);
+	padding: 7px 14px;
+	border-radius: 6px;
+	cursor: pointer;
+	font-family: var(--body);
+	font-size: 0.9rem;
+}
+
+.stats-ranges button:hover {
+	color: var(--text);
+}
+
+.stats-ranges button.active {
+	background: var(--surface-hi);
+	color: var(--text);
+	font-weight: 600;
+}
+
+/* The last range's numbers, held while the next one loads. */
+.stats-body {
+	transition: opacity 0.15s;
+}
+
+.stats-body.stale {
+	opacity: 0.5;
+}
+
+.stat-tiles {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 16px;
+	margin: 0 0 16px;
+}
+
+.stat-tile {
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	padding: 16px 20px;
+}
+
+.stat-tile dt {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 0.875rem;
+	color: var(--muted);
+}
+
+.stat-tile dd {
+	margin: 2px 0 0;
+	font-weight: 600;
+	font-size: 1.7rem;
+	line-height: 1.25;
+	letter-spacing: -0.01em;
+}
+
+/* The one number the page leads with. */
+.stat-tile dd.hero {
+	font-size: 3rem;
+	line-height: 1.1;
+}
+
+.stat-live-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--live);
+	box-shadow: 0 0 0 4px color-mix(in srgb, var(--live) 22%, transparent);
+}
+
+.stats-card h2 {
+	margin-bottom: 2px;
+}
+
+.stats-card > .muted {
+	margin: 0 0 14px;
+}
+
+.stats-empty {
+	padding: 60px 0;
+	text-align: center;
+}
+
+.stats-chart {
+	position: relative;
+	border-radius: 6px;
+	/* A finger dragging along the line reads it; it shouldn't also scroll the page sideways. */
+	touch-action: pan-y;
+}
+
+.stats-chart svg {
+	display: block;
+	cursor: crosshair;
+}
+
+.stats-chart .grid {
+	stroke: var(--line);
+	stroke-width: 1;
+}
+
+.stats-chart .tick {
+	fill: var(--muted);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+}
+
+.stats-chart .series {
+	fill: none;
+	stroke: var(--live);
+	stroke-width: 2;
+	stroke-linejoin: round;
+	stroke-linecap: round;
+}
+
+.stats-chart .series-dot {
+	fill: var(--live);
+}
+
+.stats-chart .area {
+	fill: var(--live);
+	opacity: 0.1;
+}
+
+.stats-chart .crosshair {
+	stroke: var(--muted);
+	stroke-width: 1;
+}
+
+/* Ringed in the surface colour so it stays legible where it sits on the line. */
+.stats-chart .marker {
+	fill: var(--live);
+	stroke: var(--surface);
+	stroke-width: 2;
+	pointer-events: none;
+}
+
+.stats-tip {
+	position: absolute;
+	top: 8px;
+	display: flex;
+	flex-direction: column;
+	padding: 8px 12px;
+	background: var(--surface-hi);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+	font-size: 0.8rem;
+	color: var(--muted);
+	white-space: nowrap;
+	pointer-events: none;
+}
+
+.stats-tip strong {
+	font-size: 0.95rem;
+	font-weight: 600;
+	color: var(--text);
+}
+
+.stats-table {
+	margin-top: 14px;
+	font-size: 0.875rem;
+}
+
+.stats-table summary {
+	color: var(--muted);
+	cursor: pointer;
+	width: fit-content;
+}
+
+.stats-table summary:hover {
+	color: var(--text);
+}
+
+.stats-table-scroll {
+	max-height: 320px;
+	margin-top: 10px;
+	overflow-y: auto;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+}
+
+.stats-table table {
+	width: 100%;
+	border-collapse: collapse;
+}
+
+.stats-table th,
+.stats-table td {
+	padding: 7px 14px;
+	text-align: left;
+	border-bottom: 1px solid var(--line);
+}
+
+.stats-table th {
+	position: sticky;
+	top: 0;
+	background: var(--surface-hi);
+	font-weight: 600;
+	color: var(--muted);
+}
+
+.stats-table tr:last-child td {
+	border-bottom: none;
+}
+
+.stats-table th:last-child,
+.stats-table td:last-child {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
 /* ---- Responsive --------------------------------------------------------- */
 
 @media (max-width: 860px) {
@@ -1130,6 +1377,29 @@ button[type='submit']:disabled {
 
 	.workspace {
 		grid-template-columns: 1fr;
+	}
+
+	/* Now leads on its own row; the two range figures share the one under it. */
+	.stat-tiles {
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+	}
+
+	.stat-tile:first-child {
+		grid-column: 1 / -1;
+	}
+
+	.stats-ranges {
+		display: flex;
+	}
+
+	.stats-ranges button {
+		flex: 1;
+		padding: 7px 4px;
+	}
+
+	.stats-card {
+		padding: 16px 12px;
 	}
 
 	.vtabs {

@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { getAccount, updateAccount } from '@repo/domain/src/accounts-db'
 import { PlatformType } from '@repo/domain/src/enums'
 import { countOnlinePlayers } from '@repo/domain/src/presence-db'
+import { getStatSeries } from '@repo/domain/src/stats-db'
 import { logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
@@ -117,6 +118,20 @@ function authorizeUrl(request: Request, clientId: string): string {
 	return url.toString()
 }
 
+/**
+ * The windows `/api/stats/online` serves, each with the bucket its samples are folded
+ * into. The `match` cron samples every five minutes, so `24h` is the raw series and the
+ * rest are sized to land between ~90 and ~290 points — what a chart the width of the page
+ * can actually draw. A closed list rather than a free `since`: every request scans the
+ * window it names, and this is a public route.
+ */
+const STAT_RANGES: Record<string, { seconds: number; bucketSeconds: number }> = {
+	'24h': { seconds: 86_400, bucketSeconds: 300 },
+	'7d': { seconds: 7 * 86_400, bucketSeconds: 3_600 },
+	'30d': { seconds: 30 * 86_400, bucketSeconds: 4 * 3_600 },
+	'90d': { seconds: 90 * 86_400, bucketSeconds: 86_400 },
+}
+
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -178,6 +193,44 @@ const app = new Hono<App>()
 			// Players sitting in the lobby count as online, same as anywhere else we read
 			// presence.
 			players: await countOnlinePlayers(c.env.DB),
+		})
+	})
+
+	// The history behind that head-count: the `online` series the `match` presence cron
+	// samples into `stat`, for the chart at `/stats`. Public and CORS-open on the same
+	// terms as `/server-status`.
+	//
+	// Each point is the PEAK of its bucket, not the mean — "how many were on" is a question
+	// about the busiest moment, and a mean over a four-hour bucket flattens an evening's
+	// spike into nothing. `average` is over the raw samples, not over the buckets, so a
+	// short bucket at the window's edge doesn't weigh the same as a full one. `online` is
+	// the live count rather than the last sample, which can be five minutes old.
+	.get('/api/stats/online', withDefaultCors(), async (c) => {
+		const range = c.req.query('range') ?? '24h'
+		const window = STAT_RANGES[range]
+		if (!window) return c.json({ error: 'Unknown range.' }, 400)
+
+		const now = Date.now()
+		const since = new Date(now - window.seconds * 1000)
+		const [online, buckets] = await Promise.all([
+			countOnlinePlayers(c.env.DB),
+			getStatSeries(c.env.DB, 'online', since, window.bucketSeconds),
+		])
+		const samples = buckets.reduce((n, b) => n + b.samples, 0)
+		// A new sample lands every five minutes, so a minute of browser cache costs nothing
+		// anyone can see and spares the scan when someone flips between ranges.
+		c.header('cache-control', 'public, max-age=60')
+		return c.json({
+			range,
+			bucketSeconds: window.bucketSeconds,
+			// The window itself, so the chart's x-axis spans what was ASKED for rather than
+			// what came back — a server with three days of history shows three days of line.
+			from: Math.floor(since.getTime() / 1000),
+			to: Math.floor(now / 1000),
+			online,
+			peak: buckets.reduce((max, b) => Math.max(max, b.peak), 0),
+			average: samples === 0 ? 0 : buckets.reduce((sum, b) => sum + b.sum, 0) / samples,
+			points: buckets.map((b) => ({ t: b.t, players: b.peak })),
 		})
 	})
 

@@ -43,3 +43,44 @@ export async function getStats(db: D1Database, statType: string, limit = 1000): 
 		.all<{ stat_type: string; value: number; datetime: string }>()
 	return results.map((r) => ({ statType: r.stat_type, value: r.value, datetime: r.datetime }))
 }
+
+/** One bucket of a {@link getStatSeries} result. */
+export interface StatPoint {
+	/** Start of the bucket, epoch seconds. */
+	t: number
+	/** Highest sample in the bucket. */
+	peak: number
+	/** Sum and count of the bucket's samples — kept apart so a caller can average ACROSS buckets. */
+	sum: number
+	samples: number
+}
+
+/**
+ * The `statType` series since `since`, folded into `bucketSeconds`-wide buckets, oldest
+ * first. The cron samples every five minutes, so a quarter of raw rows is ~26k points —
+ * far more than a chart has pixels for; bucketing in SQL keeps the response small and
+ * the peak exact. A bucket nothing was sampled in is simply absent, which is how a
+ * reader tells an outage from a quiet hour.
+ *
+ * The range filter compares `datetime` as a string (it is ISO-8601 UTC, so it sorts
+ * lexically) to stay on `idx_stat_type_datetime`; only the bucketing parses it.
+ */
+export async function getStatSeries(
+	db: D1Database,
+	statType: string,
+	since: Date,
+	bucketSeconds: number
+): Promise<StatPoint[]> {
+	const { results } = await db
+		.prepare(
+			// D1 binds a JS number as REAL, so the bucket width is cast back: without it the
+			// division is floating-point and every sample lands in a bucket of its own.
+			`SELECT (CAST(strftime('%s', datetime) AS INTEGER) / CAST(?3 AS INTEGER)) * CAST(?3 AS INTEGER) AS t,
+				MAX(value) AS peak, SUM(value) AS sum, COUNT(*) AS samples
+			FROM stat WHERE stat_type = ?1 AND datetime >= ?2
+			GROUP BY t ORDER BY t ASC`
+		)
+		.bind(statType, since.toISOString(), bucketSeconds)
+		.all<StatPoint>()
+	return results
+}
