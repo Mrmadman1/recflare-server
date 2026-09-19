@@ -8,9 +8,9 @@
  *
  * The `api` worker owns this schema/migration (migrations/0004_report.sql,
  * 0009_report_ban.sql, 0011_report_event.sql, 0016_report_invention.sql,
- * 0017_report_custom_avatar_item.sql and 0020_report_ban_audit.sql, applied under its own
- * `migrations_table` so it doesn't clash with the other workers' migrations that share the
- * database).
+ * 0017_report_custom_avatar_item.sql, 0020_report_ban_audit.sql and
+ * 0025_report_chat_message.sql, applied under its own `migrations_table` so it doesn't clash
+ * with the other workers' migrations that share the database).
  *
  * The moderation-side READS here — `searchReports`, `getTopReported`, `getBansInForce` —
  * are not called by any endpoint on this worker. They back the staff panel served by
@@ -22,9 +22,11 @@
  * table of its own: same fields, same moderation life. Such a row carries `event_id`,
  * `invention_id` or `custom_avatar_item_id`, and its `reported_player_id` is that thing's
  * CREATOR — see `POST /api/playerevents/v1/report`, `POST /api/inventions/v1/report` and
- * `POST /api/customAvatarItems/v1/{id}/report`. The three id columns are mutually exclusive;
- * a row with none of them is an ordinary player report. They are three columns rather than
- * one polymorphic id because the keys differ in TYPE: two numbers and a guid.
+ * `POST /api/customAvatarItems/v1/{id}/report`. A reported CHAT MESSAGE is the fourth kind:
+ * `chat_message_id`, with the message's SENDER as the reported player — see
+ * `POST /api/chatreport/createChatReport`. The four id columns are mutually exclusive; a row
+ * with none of them is an ordinary player report. They are separate columns rather than one
+ * polymorphic id because the keys differ in TYPE (numbers and a guid) and in what they key.
  *
  * A report is also where an ACCOUNT-WIDE ban lives: acting on a report sets `banned`
  * on that same row (see `banFromReport`), so the ban carries the evidence for it. It is
@@ -40,10 +42,10 @@
 /**
  * Schema DDL (mirror of migrations/0004_report.sql + 0009_report_ban.sql +
  * 0011_report_event.sql + 0016_report_invention.sql + 0017_report_custom_avatar_item.sql +
- * 0020_report_ban_audit.sql).
+ * 0020_report_ban_audit.sql + 0025_report_chat_message.sql).
  *
- * None of `event_id`, `invention_id` or `custom_avatar_item_id` is indexed: each is written
- * on every report of its kind and read by nothing — no query here filters on any of them,
+ * None of `event_id`, `invention_id`, `custom_avatar_item_id` or `chat_message_id` is
+ * indexed: each is written on every report of its kind and read by nothing — no query here filters on any of them,
  * and the reads that do exist go by player or by the ban flag. 0011's partial index over
  * `event_id` was dropped in 0016 rather than mirrored. Add one back alongside the query that
  * needs it.
@@ -66,7 +68,8 @@ export const SCHEMA_DDL: string[] = [
 		invention_id INTEGER,
 		custom_avatar_item_id TEXT,
 		banned_by_player_id INTEGER,
-		banned_at TEXT
+		banned_at TEXT,
+		chat_message_id INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reported ON report (reported_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reporter ON report (reporter_player_id)`,
@@ -125,6 +128,15 @@ export interface ReportRow {
 	 * 0020_report_ban_audit.sql carry NULL and fall back to `created_at`.
 	 */
 	banned_at: string | null
+	/**
+	 * The chat message this report is against, or NULL for any other kind — mutually
+	 * exclusive with `event_id`, `invention_id` and `custom_avatar_item_id`. See
+	 * `POST /api/chatreport/createChatReport`: `reported_player_id` is the message's SENDER,
+	 * read from the `message` table, because the body names no player. The thread the client
+	 * also posts is not kept — a message id is unique across threads, so it is the whole
+	 * reference.
+	 */
+	chat_message_id: number | null
 }
 
 /**
@@ -148,6 +160,8 @@ export interface NewReport {
 	inventionId?: number | null
 	/** Set only when reporting a CUSTOM AVATAR ITEM; never set alongside the two above. */
 	customAvatarItemId?: string | null
+	/** Set only when reporting a CHAT MESSAGE; never set alongside the three above. */
+	chatMessageId?: number | null
 }
 
 /** Record a submitted report, returning the stored row (with its assigned id). */
@@ -157,8 +171,8 @@ export async function createReport(db: D1Database, input: NewReport): Promise<Re
 			`INSERT INTO report (
 				reporter_player_id, reported_player_id, report_category, details,
 				height_reporter, height_reported, room_id, room_instance_type, created_at,
-				event_id, invention_id, custom_avatar_item_id
-			 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+				event_id, invention_id, custom_avatar_item_id, chat_message_id
+			 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
 			 RETURNING *`
 		)
 		.bind(
@@ -173,7 +187,8 @@ export async function createReport(db: D1Database, input: NewReport): Promise<Re
 			new Date().toISOString(),
 			input.eventId ?? null,
 			input.inventionId ?? null,
-			input.customAvatarItemId ?? null
+			input.customAvatarItemId ?? null,
+			input.chatMessageId ?? null
 		)
 		.first<ReportRow>()
 	// RETURNING always yields the inserted row; the non-null assert keeps the caller

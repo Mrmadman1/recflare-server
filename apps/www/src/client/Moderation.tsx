@@ -93,6 +93,7 @@ interface ReportRow {
 	custom_avatar_item_id: string | null
 	banned_by_player_id: number | null
 	banned_at: string | null
+	chat_message_id: number | null
 }
 
 /** A moderator-issued warning, as the `warning` table stores it. */
@@ -193,7 +194,7 @@ const expiryLabel = (report: ReportRow): string =>
 	report.banned !== 1 ? '—' : report.ban_expires === null ? 'Permanent' : when(report.ban_expires)
 
 /**
- * What kind of thing a report is against. The three id columns are mutually exclusive and
+ * What kind of thing a report is against. The four id columns are mutually exclusive and
  * a row with none of them is an ordinary player report (see reports-db) — which is the
  * only way to tell the kinds apart, so it is worth a column of its own.
  */
@@ -201,6 +202,7 @@ function reportKind(report: ReportRow): string {
 	if (report.event_id !== null) return 'Event'
 	if (report.invention_id !== null) return 'Invention'
 	if (report.custom_avatar_item_id !== null) return 'Avatar item'
+	if (report.chat_message_id !== null) return 'Chat message'
 	return 'Player'
 }
 

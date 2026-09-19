@@ -31,6 +31,13 @@ import {
 import '../../api.app'
 
 import { PLATFORM_SCHEMA_DDL } from '../../../../auth/src/platform-db'
+import { SCHEMA_DDL as MESSAGE_SCHEMA_DDL } from '../../../../chat/src/message-db'
+import {
+	createThread,
+	postMessage,
+	SYSTEM_SENDER_ID,
+	THREAD_SCHEMA_DDL,
+} from '../../../../chat/src/thread-db'
 import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	createCustomAvatarItem,
@@ -192,6 +199,11 @@ beforeAll(async () => {
 	// The message store (owned by the api worker) — the inbox reads it and every send
 	// writes to it.
 	for (const stmt of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Chat messages and thread membership (owned by the chat worker) — a chat report reads
+	// the reported player off the message, and gates on the reporter being in its thread.
+	for (const stmt of MESSAGE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of THREAD_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -3079,6 +3091,103 @@ describe('public endpoints', () => {
 			body: JSON.stringify({ InventionId: inventionId }),
 		})
 		expect(anon.status).toBe(401)
+	})
+
+	test('POST /api/chatreport/createChatReport files a report row against the message sender', async () => {
+		const url = `${ORIGIN}/api/chatreport/createChatReport`
+		const post = async (sub: string, fields: Record<string, string>) =>
+			exports.default.fetch(url, {
+				method: 'POST',
+				headers: await bearer(sub),
+				body: new URLSearchParams(fields),
+			})
+
+		// 5150 says something in a DM with 42; 42 reports it. The body names no player — the
+		// reported one is the message's sender.
+		const threadId = await createThread(env.DB, [42, 5150])
+		const message = await postMessage(env.DB, {
+			chatThreadId: threadId,
+			senderPlayerId: 5150,
+			contents: '{"Type":0,"Version":1,"Data":"something awful"}',
+		})
+		const id = String(message.chatMessageId)
+
+		// The body exactly as the client posts it: the category is a NAME, not a number.
+		const res = await post('42', {
+			ChatThreadId: String(threadId),
+			ChatMessageId: id,
+			ReportCategory: 'Discriminatory',
+			ReportDescription: 'details',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const row = await env.DB.prepare('SELECT * FROM report WHERE chat_message_id = ?1')
+			.bind(message.chatMessageId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 5150, // the message's sender
+			report_category: 102, // `Discriminatory` → CoCDiscrimination
+			details: 'details',
+			chat_message_id: message.chatMessageId,
+			event_id: null, // the id columns are mutually exclusive
+			invention_id: null,
+			custom_avatar_item_id: null,
+			room_id: null,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// The thread in the body is not what vouches for the message: a wrong one changes
+		// nothing, and a category the server can't place is filed as 0 with its name kept.
+		const odd = await post('42', {
+			ChatThreadId: '999999',
+			ChatMessageId: id,
+			ReportCategory: 'SomethingNew',
+			ReportDescription: 'why',
+		})
+		expect(odd.status).toBe(200)
+		const oddRow = await env.DB.prepare(
+			'SELECT report_category, details FROM report WHERE chat_message_id = ?1 ORDER BY id DESC'
+		)
+			.bind(message.chatMessageId)
+			.first()
+		expect(oddRow).toEqual({ report_category: 0, details: '[SomethingNew] why' })
+
+		// Someone outside the thread can't report a message they can't read — and is told
+		// exactly what they'd be told about a message that doesn't exist.
+		const outsider = await post('777', { ChatMessageId: id, ReportCategory: 'Discriminatory' })
+		expect(outsider.status).toBe(404)
+		expect(await outsider.json()).toEqual({ success: false, error: 'No such message' })
+		const unknown = await post('42', { ChatMessageId: '999999' })
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such message' })
+
+		// A system notice has no sender to file a report against.
+		const notice = await postMessage(env.DB, {
+			chatThreadId: threadId,
+			senderPlayerId: SYSTEM_SENDER_ID,
+			contents: '{"Type":1,"Version":1,"Data":"5150"}',
+		})
+		const system = await post('42', { ChatMessageId: String(notice.chatMessageId) })
+		expect(system.status).toBe(400)
+
+		const noId = await post('42', { ReportDescription: 'x' })
+		expect(noId.status).toBe(400)
+		expect(await noId.json()).toEqual({ success: false, error: 'ChatMessageId is required' })
+
+		// Auth-gated: the reporter comes from the token, so there's no filing one signed out.
+		const anon = await exports.default.fetch(url, {
+			method: 'POST',
+			body: new URLSearchParams({ ChatMessageId: id }),
+		})
+		expect(anon.status).toBe(401)
+
+		// Only the two accepted reports were filed.
+		const count = await env.DB.prepare(
+			'SELECT COUNT(*) AS n FROM report WHERE chat_message_id IS NOT NULL'
+		).first<{ n: number }>()
+		expect(count?.n).toBe(2)
 	})
 
 	test('POST /api/inventions/v6/save 401s without a bearer token', async () => {
@@ -8878,6 +8987,7 @@ describe('openapi', () => {
 			'POST /api/PlayerReporting/v3/voteToKick',
 			'POST /api/avatar/v1/lockeditems/bulk',
 			'POST /api/avatar/v2/gifts/generate',
+			'POST /api/chatreport/createChatReport',
 			'POST /api/customAvatarItems/GetCustomAvatarItemCurrentSavesForLegacyAvatarItems',
 			'POST /api/customAvatarItems/v1',
 			'POST /api/customAvatarItems/v1/bulk',

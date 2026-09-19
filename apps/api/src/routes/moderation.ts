@@ -15,6 +15,10 @@ import {
 } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 
+// The message being reported, and whether the reporter can see it — `chat` owns both tables
+// on the shared database, so its reads are used rather than restated here.
+import { getMessage } from '../../../chat/src/message-db'
+import { isThreadMember } from '../../../chat/src/thread-db'
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
 // value — the enum has no runtime dependencies.
 import { KickReportCategory } from '../../../notify/src/notification-payloads'
@@ -23,6 +27,7 @@ import { authedId, authedRoles, unauthorized } from '../http'
 import {
 	AUTHED,
 	BareBoolean,
+	CreateChatReportRequest,
 	CreateReportRequest,
 	CreateWarningRequest,
 	DeviceIdRequest,
@@ -89,6 +94,39 @@ const asFloat = (v: string | undefined): number | null => {
 	if (v === undefined) return null
 	const n = Number.parseFloat(v)
 	return Number.isNaN(n) ? null : n
+}
+
+/**
+ * Chat-report category names that are not a `KickReportCategory` member's own name. Only
+ * `Discriminatory` has been seen on the wire; add the others as the client is seen to send
+ * them, rather than guessing at an enum nobody here has a copy of.
+ */
+const CHAT_REPORT_CATEGORY_ALIASES: Record<string, KickReportCategory> = {
+	discriminatory: KickReportCategory.CoCDiscrimination,
+}
+
+/**
+ * The numeric category a chat report is filed under. The chat report sends its category as
+ * an enum NAME (`ReportCategory=Discriminatory`) where every other report sends a number,
+ * and `report.report_category` is numeric — it is what the staff panel labels rows from and
+ * what a ban's block screen names as the reason — so the name is mapped onto the same
+ * `KickReportCategory` codes the other reports carry. A number is taken as it comes.
+ *
+ * Null for a name that maps to nothing, which the caller files as `Unknown` with the name
+ * kept in the details: losing which box the reporter ticked would be worse than an odd-looking
+ * description.
+ */
+function chatReportCategory(raw: string | undefined): number | null {
+	if (raw === undefined) return KickReportCategory.Unknown
+	const name = raw.trim()
+	if (/^-?\d+$/.test(name)) return Number.parseInt(name, 10)
+	const key = name.toLowerCase()
+	const alias = CHAT_REPORT_CATEGORY_ALIASES[key]
+	if (alias !== undefined) return alias
+	for (const [member, value] of Object.entries(KickReportCategory)) {
+		if (typeof value === 'number' && member.toLowerCase() === key) return value
+	}
+	return null
 }
 
 /**
@@ -482,6 +520,86 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				heightReported: asFloat(formField(body, c, 'HeightReported')),
 				roomId: roomId !== null && roomId > 0 ? roomId : null,
 				roomInstanceType: formField(body, c, 'RoomInstanceType') ?? null,
+			})
+
+			return c.json({ success: true, error: '' })
+		}
+	)
+
+	// Report one chat message. Stored in the `report` table every other report uses — same
+	// fields, same moderation life — with `chat_message_id` set. See
+	// migrations/0025_report_chat_message.sql.
+	.post(
+		'/api/chatreport/createChatReport',
+		describeRoute({
+			tags: ['Moderation'],
+			summary: 'Report a chat message',
+			description:
+				'Files a report against one chat message. Stored as a row in the same `report` table ' +
+				'a player report goes to (`POST /api/PlayerReporting/v3/create`), beside the event, ' +
+				'invention and custom-avatar-item reports — the same submission with the same ' +
+				'moderation life, and a moderator converts any of them into a ban the same way. What ' +
+				'marks it as a chat report is `chat_message_id`; the row’s `reported_player_id` is ' +
+				'the message’s SENDER, read from the `message` table, since the body names no ' +
+				'player. `ChatThreadId` is accepted and unused: a message id is unique across ' +
+				'threads, so the message names its own thread and nothing stores a second copy.\n\n' +
+				'The reporter is the caller (from the bearer token) and must be a MEMBER of the ' +
+				'thread the message is in — the same gate reading the message sits behind. A ' +
+				'message the caller cannot see answers exactly as one that does not exist, so the ' +
+				'route cannot be used to probe message ids or to file reports citing conversations ' +
+				'the reporter was never in. A system notice (a join/leave line) has no sender to ' +
+				'report and is refused.\n\n' +
+				'`ReportCategory` arrives as an enum NAME (`Discriminatory`), unlike the numeric ' +
+				'one a player report sends, and is mapped onto the numeric category the table ' +
+				'stores (`Discriminatory` → 102). A number is stored as sent; a name that maps to ' +
+				'nothing is filed as 0 with the name kept at the front of the details. ' +
+				'`ReportDescription` is the details. Nothing dedupes the rows.\n\n' +
+				'Answers the `{ success, error }` envelope the other reports use, `error` an empty ' +
+				'string rather than null, on the rejected branches too.',
+			security: AUTHED,
+			requestBody: form(CreateChatReportRequest, 'The report'),
+			responses: {
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				400: json(SuccessErrorEnvelope, 'No usable `ChatMessageId`, or a system message'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: json(SuccessErrorEnvelope, 'No such message, or not one the caller can see'),
+			},
+		}),
+		async (c) => {
+			const reporterId = await authedId(c)
+			if (reporterId === null) return unauthorized(c)
+
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const chatMessageId = asInt(formField(body, c, 'ChatMessageId'))
+			if (chatMessageId === null) {
+				return c.json({ success: false, error: 'ChatMessageId is required' }, 400)
+			}
+
+			// The message supplies the reported player, and its OWN thread is the one the
+			// membership check runs against — not the body's `ChatThreadId`, which would let a
+			// caller vouch for a message by naming a thread they happen to be in.
+			const message = await getMessage(c.env.DB, chatMessageId)
+			if (message === null || !(await isThreadMember(c.env.DB, message.chatThreadId, reporterId))) {
+				return c.json({ success: false, error: 'No such message' }, 404)
+			}
+			// System notices are sent as a pseudo-player with a negative id (see `chat`'s
+			// SYSTEM_SENDER_ID); a report against one would be a report against nobody.
+			if (message.senderPlayerId <= 0) {
+				return c.json({ success: false, error: 'That message has no sender to report' }, 400)
+			}
+
+			const rawCategory = formField(body, c, 'ReportCategory')
+			const category = chatReportCategory(rawCategory)
+			const description = formField(body, c, 'ReportDescription') ?? null
+			await createReport(c.env.DB, {
+				reporterPlayerId: reporterId,
+				reportedPlayerId: message.senderPlayerId,
+				reportCategory: category ?? KickReportCategory.Unknown,
+				details:
+					category === null
+						? [`[${rawCategory?.trim()}]`, description].filter(Boolean).join(' ')
+						: description,
+				chatMessageId,
 			})
 
 			return c.json({ success: true, error: '' })

@@ -1433,6 +1433,27 @@ export const CreateReportRequest = z.object({
 })
 
 /**
+ * `POST /api/chatreport/createChatReport` form body — a report against one chat message.
+ * Form-encoded, so everything is a string; only `ChatMessageId` is required. Neither the
+ * reporter (the bearer token) nor the reported player (the message's sender) is in the body.
+ */
+export const CreateChatReportRequest = z.object({
+	ChatMessageId: z.string().describe('Id of the message being reported, e.g. `72`'),
+	ChatThreadId: z
+		.string()
+		.optional()
+		.describe('The thread the message is in. Accepted and unused — the message names its own'),
+	ReportCategory: z
+		.string()
+		.optional()
+		.describe(
+			'The reason picked in the report UI, sent as a NAME (`Discriminatory`) where the ' +
+				'player report sends a number. Mapped onto the numeric category the table stores'
+		),
+	ReportDescription: z.string().optional().describe('The free-text description the reporter typed'),
+})
+
+/**
  * `POST /api/playerwarnings` form body — a warning a moderator hands down. Everything
  * is a string on the wire (it's form-encoded); only `WarnedPlayerId` is required. The
  * moderator is NOT in the body — it's taken from the bearer token.
