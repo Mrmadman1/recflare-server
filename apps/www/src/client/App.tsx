@@ -1709,15 +1709,13 @@ function RoomDetail({
 	return (
 		<>
 			<section className="card room-hero">
-				<div className="room-hero-media">
-					{/* 512 rather than the list's 256: this one is displayed large. Both are sizes
-					    the img worker allows, so each is a cached variant. */}
-					<img className="room-hero-img" src={`${imgHost}/${room.ImageName}?width=512`} alt="" />
-					<RoomImageUpload
-						roomId={room.RoomId}
-						onImageChange={(imageName) => onRoomChange({ ...room, ImageName: imageName })}
-					/>
-				</div>
+				{/* 512 rather than the list's 256: this one is displayed large. Both are sizes
+				    the img worker allows, so each is a cached variant. */}
+				<RoomImageUpload
+					roomId={room.RoomId}
+					src={`${imgHost}/${room.ImageName}?width=512`}
+					onImageChange={(imageName) => onRoomChange({ ...room, ImageName: imageName })}
+				/>
 				<div className="room-hero-body">
 					<div className="room-head">
 						<h1 className="room-hero-name">^{room.Name}</h1>
@@ -2005,71 +2003,68 @@ function BlobUpload({
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png'])
 
 /**
- * Replace a room's thumbnail with a picture from disk.
+ * The room's thumbnail, which is also the control that replaces it: clicking the picture
+ * opens the file picker, and the picked file uploads straight away.
  *
  * Same two steps as the scene-data upload, with a different `FileType`: the bytes go to
  * `storage` under the Image type, and the key it hands back is put to the room's
  * `…/image` route as `imageName`. In game the only way to set this is to take a photo in
  * the room, so this is how an owner gets a picture they made elsewhere onto the room.
  *
- * Unlike the scene-data form there is no publish step: the image is live the moment the
- * route answers, for everyone browsing rooms. The hero above redraws from the new
+ * There is no submit step because there is no publish step: the image is live the moment
+ * the route answers, for everyone browsing rooms. The picture redraws from the new
  * `ImageName` straight away — `img` caches by key and the key is new, so nothing stale
  * can be served.
  */
 function RoomImageUpload({
 	roomId,
+	src,
 	onImageChange,
 }: {
 	roomId: number
+	src: string
 	onImageChange: (imageName: string) => void
 }) {
-	const [file, setFile] = useState<File | null>(null)
-	const input = useRef<HTMLInputElement>(null)
 	const { pending, error, done, run } = useAction()
 
 	return (
-		<form
-			className="blob-upload room-image-upload"
-			onSubmit={(e) => {
-				e.preventDefault()
-				if (!file) return
-				void run(async () => {
-					if (!IMAGE_TYPES.has(file.type)) {
-						throw new Error('Choose a JPEG or PNG image.')
-					}
-					const imageName = await uploadToStorage(file, FILE_TYPE_IMAGE)
-					await setRoomImage(roomId, imageName)
-					onImageChange(imageName)
-					setFile(null)
-					if (input.current) input.current.value = ''
-					return 'Image replaced — it shows in game now.'
-				})
-			}}
-		>
-			<p className="blob-upload-head">
-				<span className="blob-upload-title">Replace image</span>
-			</p>
-			<p className="muted blob-upload-caveat">
-				A JPEG or PNG, landscape (3:2) like a photo taken in game. It goes live as soon as it
-				uploads.
-			</p>
-			<label className="blob-upload-file">
-				Image file
+		<div className="room-hero-media">
+			{/* A label, so the whole picture is the file input's click target. The input is
+			    hidden visually rather than with `display: none`, which keeps it in the tab
+			    order — the focus ring is drawn on the label around it. */}
+			<label className="room-image-upload" aria-busy={pending}>
+				<img className="room-hero-img" src={src} alt="" />
+				<span className="room-image-upload-hint">
+					{pending ? 'Uploading…' : 'Click to upload image'}
+				</span>
 				<input
-					ref={input}
 					type="file"
 					accept="image/jpeg,image/png"
-					onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-					required
+					disabled={pending}
+					onChange={(e) => {
+						const input = e.target
+						const file = input.files?.[0]
+						if (!file) return
+						void run(async () => {
+							try {
+								if (!IMAGE_TYPES.has(file.type)) {
+									throw new Error('Choose a JPEG or PNG image.')
+								}
+								const imageName = await uploadToStorage(file, FILE_TYPE_IMAGE)
+								await setRoomImage(roomId, imageName)
+								onImageChange(imageName)
+								return 'Image replaced — it shows in game now.'
+							} finally {
+								// Cleared either way, so picking the same file again still fires a change.
+								input.value = ''
+							}
+						})
+					}}
 				/>
 			</label>
 			{error && <p className="error">{error}</p>}
 			{done && <p className="ok">{done}</p>}
-			<button type="submit" disabled={pending || file === null}>
-				{pending ? 'Uploading…' : 'Upload image'}
-			</button>
-		</form>
+		</div>
 	)
 }
 

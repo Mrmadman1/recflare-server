@@ -769,18 +769,67 @@ h2 {
 	background: var(--surface-hi);
 }
 
-/* The picture and the form that replaces it share the narrow column, so the control sits
-   under the thing it changes. The form drops the blob-upload's top margin for the
-   picture's own gap and keeps its border, which is what marks it as a control on a page
-   whose other room fields are read-only. */
+/* The picture is its own upload control: a label around the image and a visually hidden
+   file input, so a click anywhere on it opens the picker. The hint is always drawn, not
+   only on hover — a touch screen has no hover, and nothing else says the picture can be
+   changed. */
 .room-hero-media {
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
 }
 
+.room-hero-media .error,
+.room-hero-media .ok {
+	margin: 0;
+}
+
 .room-image-upload {
-	margin-top: 0;
+	position: relative;
+	display: block;
+	border-radius: 8px;
+	overflow: hidden;
+	cursor: pointer;
+}
+
+.room-image-upload[aria-busy='true'] {
+	cursor: progress;
+}
+
+.room-image-upload .room-hero-img {
+	display: block;
+}
+
+.room-image-upload-hint {
+	position: absolute;
+	inset: auto 0 0;
+	padding: 6px 8px;
+	font-size: 0.8125rem;
+	text-align: center;
+	color: #fff;
+	background: rgb(0 0 0 / 0.6);
+	transition: background 120ms;
+}
+
+.room-image-upload:hover .room-image-upload-hint,
+.room-image-upload:focus-within .room-image-upload-hint {
+	background: rgb(0 0 0 / 0.8);
+}
+
+/* Clipped to nothing rather than `display: none`, which would take it out of the tab
+   order; the ring is drawn on the label instead. */
+.room-image-upload input[type='file'] {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	opacity: 0;
+}
+
+.room-image-upload:has(input:focus-visible) {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
 }
 
 .room-hero-name {
