@@ -225,21 +225,31 @@ async function uploadRoomBlob(file: File): Promise<string> {
 }
 
 /**
- * The file that actually gets stored for a picked scene file. A `.binpb` is a scene taken
- * from a newer build, which the build this server runs can't parse as it stands, so it is
- * downgraded first (see `room-converter.ts`); anything else passes through untouched.
+ * The scene files the upload form takes, by extension: a `.room` is a save as this server
+ * stores it, a `.binpb` a scene taken from a newer build. Only checked in the browser —
+ * the blob is opaque to the server, which stores whatever it is given.
+ */
+const ROOM_BLOB_EXTENSIONS = ['.room', '.binpb']
+
+function isRoomBlobFile(filename: string): boolean {
+	const name = filename.toLowerCase()
+	return ROOM_BLOB_EXTENSIONS.some((ext) => name.endsWith(ext))
+}
+
+/**
+ * The file that actually gets stored for a picked scene file. A scene taken from a newer
+ * build can't be parsed by the build this server runs as it stands, so when the owner asks
+ * for it the file is downgraded first (see `room-converter.ts`); otherwise it passes
+ * through untouched.
  *
  * Done here in the browser, before either request, because the upload goes straight to
  * `storage` and the save's `Hash` has to describe the bytes that were stored — so both
  * the upload and `blobHash` must be given this file, not the one that was picked.
  */
-async function prepareRoomBlob(file: File): Promise<{ file: File; converted: boolean }> {
-	if (!needsDowngrade(file.name)) return { file, converted: false }
+async function prepareRoomBlob(file: File, downgrade: boolean): Promise<File> {
+	if (!downgrade) return file
 	const { data } = downgradeRoom(new Uint8Array(await file.arrayBuffer()))
-	return {
-		file: new File([data], file.name, { type: 'application/octet-stream' }),
-		converted: true,
-	}
+	return new File([data], file.name, { type: 'application/octet-stream' })
 }
 
 /**
@@ -1877,6 +1887,11 @@ function BlobUpload({
 	const [file, setFile] = useState<File | null>(null)
 	const [description, setDescription] = useState('')
 	const [publish, setPublish] = useState(true)
+	// Whether to convert the file for this build before storing it. Picking a file sets it
+	// from the extension — on for a `.binpb`, off for a `.room` — and the owner can overrule
+	// that either way: a `.binpb` that already loads shouldn't lose its circuits for nothing.
+	const [downgrade, setDowngrade] = useState(false)
+	const [fileError, setFileError] = useState('')
 	// The file input is uncontrolled — React can't set its value — so clearing the picked
 	// file after a save takes a handle on the element itself.
 	const input = useRef<HTMLInputElement>(null)
@@ -1889,7 +1904,7 @@ function BlobUpload({
 				e.preventDefault()
 				if (!file) return
 				void run(async () => {
-					const { file: blob, converted } = await prepareRoomBlob(file)
+					const blob = await prepareRoomBlob(file, downgrade)
 					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
 						await saveSubRoomBlob(roomId, subRoomId, {
@@ -1900,9 +1915,10 @@ function BlobUpload({
 						})
 					)
 					setFile(null)
+					setDowngrade(false)
 					setDescription('')
 					if (input.current) input.current.value = ''
-					const uploaded = converted ? 'Converted from .binpb, uploaded' : 'Uploaded'
+					const uploaded = downgrade ? 'Converted for this build, uploaded' : 'Uploaded'
 					return publish
 						? `${uploaded} and published — players load this scene now.`
 						: `${uploaded} and staged. Publish it in game to make it live.`
@@ -1919,19 +1935,35 @@ function BlobUpload({
 			<p className="muted blob-upload-caveat">
 				New and lightly tested. Nothing here checks the file — the server stores whatever it is and
 				the game finds out on load. This server runs the {CLIENT_BUILD_DATE} build, so scene data
-				from a room built on anything newer may not load at all. A <code>.binpb</code> file is
-				converted for this build before it is stored, which removes its circuits. Download the save
-				above and keep it before replacing it.
+				from a room built on anything newer may not load at all. Converting a file for this build
+				before it is stored gets around that, but removes its circuits. Download the save above and
+				keep it before replacing it.
 			</p>
 			<label className="blob-upload-file">
 				Scene data file
 				<input
 					ref={input}
 					type="file"
-					onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+					accept={ROOM_BLOB_EXTENSIONS.join(',')}
+					onChange={(e) => {
+						// `accept` only filters the picker — a file dropped on the input, or picked
+						// under "All files", still arrives here, so the extension is checked again.
+						const picked = e.target.files?.[0] ?? null
+						if (picked && !isRoomBlobFile(picked.name)) {
+							setFileError('Pick a .room or .binpb file.')
+							setFile(null)
+							setDowngrade(false)
+							e.target.value = ''
+							return
+						}
+						setFileError('')
+						setFile(picked)
+						setDowngrade(picked !== null && needsDowngrade(picked.name))
+					}}
 					required
 				/>
 			</label>
+			{fileError && <p className="error">{fileError}</p>}
 			<label className="blob-upload-note">
 				Save comment<span className="optional">optional</span>
 				<input
@@ -1945,6 +1977,15 @@ function BlobUpload({
 			<label className="check">
 				<input type="checkbox" checked={publish} onChange={(e) => setPublish(e.target.checked)} />
 				Publish it straight away
+			</label>
+			<label className="check">
+				<input
+					type="checkbox"
+					checked={downgrade}
+					disabled={file === null}
+					onChange={(e) => setDowngrade(e.target.checked)}
+				/>
+				Downgrade room for compatibility
 			</label>
 			{error && <p className="error">{error}</p>}
 			{done && <p className="ok">{done}</p>}

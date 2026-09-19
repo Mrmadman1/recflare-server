@@ -46,7 +46,10 @@ export interface DowngradeStats {
 	outputBytes: number
 }
 
-/** Whether an uploaded scene file is the newer format that needs downgrading first. */
+/**
+ * Whether a scene file is, by its name, the newer format. Only a default: the upload form
+ * ticks its convert box from this and the owner decides.
+ */
 export function needsDowngrade(filename: string): boolean {
 	return filename.toLowerCase().endsWith('.binpb')
 }
