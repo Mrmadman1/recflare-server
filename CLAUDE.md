@@ -229,6 +229,14 @@ inconsistency here without checking the client first.
   `GiftPackage` null — no box is minted. `GET /econ/customAvatarItems/v1/owned` is that table
   joined to the item record PLUS everything the caller created (drafts included): a creator
   owns their own through `CreatorAccountId`, and the bag refuses to sell it to them.
+- A chat report (`api`: `POST /api/chatreport/createChatReport`) is form-encoded and sends
+  `ReportCategory` as an enum NAME (`Discriminatory`), where every other report sends the
+  number. It names no player: the reported one is the message's sender, read from `message`.
+  The name is mapped onto the numeric `KickReportCategory` the `report` table stores
+  (`chatReportCategory`); only `Discriminatory` has been observed, so an unmapped name is
+  filed as 0 with the name kept in the details — extend the alias table as more are seen.
+  The reply is the `{ success, error: "" }` envelope the other reports use, which is an
+  ASSUMPTION here: what the client does with this response has not been observed.
 - A friend request is SHOWN to the target as a Message of type 4 `FriendInvite` (`api`:
   `/api/relationships/v2/sendfriendrequest`), and an acceptance to the requester as type 40
   `FriendRequestAccepted` (`acceptfriendrequest`, and the crossing-request auto-accept),

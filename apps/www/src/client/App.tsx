@@ -12,6 +12,7 @@ import {
 	QUEST_DOWNLOAD_URL,
 	SOURCE_REPO,
 } from '../links'
+import { downgradeRoom, needsDowngrade } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -215,12 +216,30 @@ const CLIENT_BUILD_DATE = `${GAME_VERSION.slice(0, 4)}-${GAME_VERSION.slice(4, 6
  * `<date>/<uuid>` name every `DataBlob` field holds.
  *
  * This is the same two-step the game does: the bytes go to `storage` first, and only its
- * generated name is handed to `rooms`. Nothing about the file is inspected here — a room
- * blob is an opaque Unity payload, and the server doesn't parse it either, so the only
- * honest validation available is whether the game can load it afterwards.
+ * generated name is handed to `rooms`. Nothing about the file is validated here — the
+ * server doesn't parse a room blob either, so the only honest validation available is
+ * whether the game can load it afterwards. Hand this the file `prepareRoomBlob` returned.
  */
 async function uploadRoomBlob(file: File): Promise<string> {
 	return uploadToStorage(file, FILE_TYPE_ROOM_SAVE)
+}
+
+/**
+ * The file that actually gets stored for a picked scene file. A `.binpb` is a scene taken
+ * from a newer build, which the build this server runs can't parse as it stands, so it is
+ * downgraded first (see `room-converter.ts`); anything else passes through untouched.
+ *
+ * Done here in the browser, before either request, because the upload goes straight to
+ * `storage` and the save's `Hash` has to describe the bytes that were stored — so both
+ * the upload and `blobHash` must be given this file, not the one that was picked.
+ */
+async function prepareRoomBlob(file: File): Promise<{ file: File; converted: boolean }> {
+	if (!needsDowngrade(file.name)) return { file, converted: false }
+	const { data } = downgradeRoom(new Uint8Array(await file.arrayBuffer()))
+	return {
+		file: new File([data], file.name, { type: 'application/octet-stream' }),
+		converted: true,
+	}
 }
 
 /**
@@ -1870,7 +1889,8 @@ function BlobUpload({
 				e.preventDefault()
 				if (!file) return
 				void run(async () => {
-					const [filename, hash] = await Promise.all([uploadRoomBlob(file), blobHash(file)])
+					const { file: blob, converted } = await prepareRoomBlob(file)
+					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
 						await saveSubRoomBlob(roomId, subRoomId, {
 							filename,
@@ -1882,9 +1902,10 @@ function BlobUpload({
 					setFile(null)
 					setDescription('')
 					if (input.current) input.current.value = ''
+					const uploaded = converted ? 'Converted from .binpb, uploaded' : 'Uploaded'
 					return publish
-						? 'Uploaded and published — players load this scene now.'
-						: 'Uploaded and staged. Publish it in game to make it live.'
+						? `${uploaded} and published — players load this scene now.`
+						: `${uploaded} and staged. Publish it in game to make it live.`
 				})
 			}}
 		>
@@ -1898,8 +1919,9 @@ function BlobUpload({
 			<p className="muted blob-upload-caveat">
 				New and lightly tested. Nothing here checks the file — the server stores whatever it is and
 				the game finds out on load. This server runs the {CLIENT_BUILD_DATE} build, so scene data
-				from a room built on anything newer may not load at all. Download the save above and keep it
-				before replacing it.
+				from a room built on anything newer may not load at all. A <code>.binpb</code> file is
+				converted for this build before it is stored, which removes its circuits. Download the save
+				above and keep it before replacing it.
 			</p>
 			<label className="blob-upload-file">
 				Scene data file
