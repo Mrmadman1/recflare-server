@@ -124,6 +124,12 @@ export interface Account {
 	 */
 	isModerator?: boolean
 	/**
+	 * Whether this account is a SANDBOX account — served out of the sandbox Tachyon pool
+	 * rather than the live one (`match` `GET /player/connection-info`). Operator-set only;
+	 * absent/false means the live pool.
+	 */
+	isSandbox?: boolean
+	/**
 	 * Whether this account has Rec Room Plus — the paid tier the client's API calls a
 	 * `CampusCard`. Nothing SELLS one here. Absent/false means no Plus.
 	 *

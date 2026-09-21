@@ -68,7 +68,8 @@
 	},
 	// The operator's knobs — the room substitutions (ROOM_REDIRECTS), the Photon app ids
 	// and region (PHOTON_REALTIME_APP_ID, PHOTON_VOICE_APP_ID, PHOTON_CHAT_APP_ID,
-	// PHOTON_REGION), and the Tachyon server pool (TACHYON_HOST_PORT) —
+	// PHOTON_REGION), and the Tachyon server pools (TACHYON_HOST_PORT,
+	// TACHYON_HOST_PORT_SANDBOX) —
 	// are deliberately NOT set here. They're injected at deploy time from
 	// the gitignored .env (RECFLARE_<VAR>, see .env.example), so swapping a room out or
 	// pointing at your own Photon apps never means editing a versioned file. Unset — the

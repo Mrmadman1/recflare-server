@@ -1491,22 +1491,23 @@ describe('auth-gated endpoints', () => {
 		}
 	})
 
-	test('a developer is sent to the same Tachyon host on the dev port', async () => {
-		// Developers run against a Tachyon build listening on 7778 beside the live one, so
-		// only the host carries over from the instance's assignment — the dev build is not an
-		// entry in the pool, so it is named `dev` rather than borrowing that entry's
-		// positional `tachyon-N`.
+	test('a sandbox account is served out of the sandbox Tachyon pool', async () => {
+		// Sandbox accounts run against their own Tachyon servers, so the whole pool is swapped
+		// for them; selection inside it is the same instance-id round-robin as the live pool.
 		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
-			.bind(JSON.stringify({ accountId: 974, username: 'Devver', isDeveloper: true }))
+			.bind(JSON.stringify({ accountId: 974, username: 'Sandboxer', isSandbox: true }))
 			.run()
 		const original = env.TACHYON_HOST_PORT
+		const originalSandbox = env.TACHYON_HOST_PORT_SANDBOX
 		try {
-			// One entry, so the assignment can't happen to land on 7778 by itself.
 			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
+			env.TACHYON_HOST_PORT_SANDBOX = '203.0.113.30:7777, 203.0.113.30:7778'
 
-			const voiceFor = async (player: string, roomInstanceId: number) => {
+			const voiceFor = async (player: string, roomInstanceId?: number) => {
 				const res = await exports.default.fetch(
-					`${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
+					roomInstanceId === undefined
+						? `${ORIGIN}/player/connection-info`
+						: `${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
 					{ headers: await bearer(player) }
 				)
 				const body = (await res.json()) as {
@@ -1518,34 +1519,45 @@ describe('auth-gated endpoints', () => {
 				}
 			}
 
+			const sandboxPool = [
+				{ voiceConnectionInfo: '203.0.113.30:7777', voiceServerId: 'dev-1' },
+				{ voiceConnectionInfo: '203.0.113.30:7778', voiceServerId: 'dev-2' },
+			]
+			for (const photonRoomId of ['tachyon-sandbox-a', 'tachyon-sandbox-b']) {
+				const instance = await createRoomInstance(env.DB, {
+					ownerAccountId: 974,
+					roomId: 2,
+					photonRoomId,
+					maxCapacity: 12,
+				})
+				expect(await voiceFor('974', instance.roomInstanceId)).toEqual(
+					sandboxPool[instance.roomInstanceId % sandboxPool.length]
+				)
+				// Everyone else in that instance keeps the live pool.
+				expect(await voiceFor('975', instance.roomInstanceId)).toEqual({
+					voiceConnectionInfo: '198.51.100.12:7777',
+					voiceServerId: 'tachyon-1',
+				})
+			}
+
+			// In no instance there is no server, sandbox or not.
+			expect(await voiceFor('974')).toEqual({ voiceConnectionInfo: '', voiceServerId: '' })
+
+			// With no sandbox pool configured, a sandbox account falls back to the live one.
+			env.TACHYON_HOST_PORT_SANDBOX = undefined
 			const instance = await createRoomInstance(env.DB, {
 				ownerAccountId: 974,
 				roomId: 2,
-				photonRoomId: 'tachyon-instance-dev',
+				photonRoomId: 'tachyon-sandbox-unset',
 				maxCapacity: 12,
 			})
 			expect(await voiceFor('974', instance.roomInstanceId)).toEqual({
-				voiceConnectionInfo: '198.51.100.12:7778',
-				voiceServerId: 'dev',
-			})
-			// Everyone else in that instance keeps the pool entry's own port and id.
-			expect(await voiceFor('975', instance.roomInstanceId)).toEqual({
 				voiceConnectionInfo: '198.51.100.12:7777',
 				voiceServerId: 'tachyon-1',
 			})
-
-			// In no instance there is no server to move the port of: a bare ':7778' would be
-			// an address that answers nothing, named `dev`.
-			const none = await exports.default.fetch(`${ORIGIN}/player/connection-info`, {
-				headers: await bearer('974'),
-			})
-			const body = (await none.json()) as {
-				value: { voiceConnectionInfo: string; voiceServerId: string }
-			}
-			expect(body.value.voiceConnectionInfo).toBe('')
-			expect(body.value.voiceServerId).toBe('')
 		} finally {
 			env.TACHYON_HOST_PORT = original
+			env.TACHYON_HOST_PORT_SANDBOX = originalSandbox
 		}
 	})
 
