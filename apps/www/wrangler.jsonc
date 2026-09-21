@@ -7,9 +7,10 @@
 	"routes": [],
 	// The shared `recflare` D1. Read for the public `/server-status` head-count and the
 	// benefits claim; WRITTEN by the claim (`hasPlus`) and by the staff moderation panel,
-	// which files reports and hands down bans on the `report` table (see src/staff.ts).
+	// which files reports and hands down bans on the `report` table (see src/staff.ts) and
+	// records every ban and lift on `audit_log`.
 	// The schema is owned by the workers that write it (presence lives in
-	// apps/rooms/migrations, `report` in apps/api/migrations), so no migrations_dir: www
+	// apps/rooms/migrations, `report` and `audit_log` in apps/api/migrations), so no migrations_dir: www
 	// never migrates. The "local" placeholder is spliced with RECFLARE_D1 at deploy time,
 	// as it is for every other worker.
 	"d1_databases": [

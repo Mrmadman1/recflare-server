@@ -1,4 +1,4 @@
-import { getPresences, movePlayerToDorm } from '@repo/domain'
+import { getPresences, movePlayerToDorm, writeAuditLog } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
@@ -224,6 +224,54 @@ async function kickBannedPlayer(c: Context<App>, report: ReportRow, moderatorId:
 	}
 }
 
+/**
+ * Record a ban or a lift on the `audit_log` table, against the moderator who made it.
+ *
+ * The report row only ever holds the ban's CURRENT state: a lift clears `banned_by` and
+ * `banned_at`, and a re-ban overwrites them, so without this row nothing says who lifted a
+ * ban, or that one was ever handed down on a report that is clean today. `ban` and `unban`
+ * are separate actions because they are the two questions asked of this log ("who banned
+ * X", "who let X back in"); the target and the report go in `data`, per the table's rule
+ * that `player_id` is the actor. `previous` is the row's ban state before this call, which
+ * is the only place a lifted ban's original moderator and expiry survive.
+ *
+ * Written after the row is committed and never throws — the ban has already happened, and a
+ * failed audit insert must not turn it into a 500 the panel would read as refused.
+ */
+async function recordBanAudit(
+	c: Context<App>,
+	moderatorId: number,
+	before: ReportRow,
+	after: ReportRow
+) {
+	const action = after.banned ? 'ban' : 'unban'
+	try {
+		await writeAuditLog(c.env.DB, {
+			playerId: moderatorId,
+			action,
+			data: {
+				reportId: after.id,
+				playerId: after.reported_player_id,
+				reportCategory: after.report_category,
+				banExpires: after.ban_expires,
+				previous: {
+					banned: before.banned === 1,
+					banExpires: before.ban_expires,
+					bannedBy: before.banned_by_player_id,
+					bannedAt: before.banned_at,
+				},
+			},
+		})
+	} catch (err) {
+		logger.error('could not write an audit log row', {
+			action,
+			moderatorId,
+			reportId: after.id,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
 /** The evasion arms in force, read from the same knob `api` and `match` read. */
 const armsFor = (env: Env) => banEvasionMatch(env.BAN_EVASION_MATCH)
 
@@ -362,6 +410,8 @@ export async function banReportHandler(c: Context<App>) {
 		bannedPlayerId: report.reported_player_id,
 		banExpires: report.ban_expires,
 	})
+
+	await recordBanAudit(c, moderatorId, existing, report)
 
 	if (banned) await kickBannedPlayer(c, report, moderatorId)
 	return c.json(report)

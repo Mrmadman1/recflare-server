@@ -2,6 +2,7 @@ import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { beforeAll, expect, it } from 'vitest'
 
 import { SCHEMA_DDL as ACCOUNT_SCHEMA_DDL, updateAccount } from '@repo/domain/src/accounts-db'
+import { AUDIT_LOG_SCHEMA_DDL } from '@repo/domain/src/audit-db'
 import { PlatformType } from '@repo/domain/src/enums'
 import {
 	PRESENCE_SCHEMA_DDL,
@@ -95,6 +96,8 @@ beforeAll(async () => {
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// `stat` is written by the `match` presence cron; www only reads it, for `/stats`.
 	for (const stmt of STAT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// `audit_log` is owned by `api`; www files a row there for every ban and lift.
+	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -946,6 +949,48 @@ it('lifts a ban, clearing the expiry and the audit columns but keeping the repor
 
 	const bans = (await (await staffGet('/api/staff/bans', 8110)).json()) as Array<{ id: number }>
 	expect(bans.map((b) => b.id)).not.toContain(report.id)
+})
+
+// The report row keeps only the ban's CURRENT state — a lift wipes who banned and when —
+// so the audit log is the one place a ban and its lift are both still on record.
+it('records a ban and its lift on the audit log, against the moderator', async () => {
+	const report = await createReport(env.DB, {
+		reporterPlayerId: 8186,
+		reportedPlayerId: 8185,
+		reportCategory: 102,
+	})
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 2 })).status).toBe(
+		200
+	)
+	expect(
+		(await staffPost(`/api/staff/reports/${report.id}/ban`, 8111, { banned: false })).status
+	).toBe(200)
+
+	const { results } = await env.DB.prepare(
+		`SELECT player_id, action, data FROM audit_log
+		 WHERE action IN ('ban', 'unban') AND json_extract(data, '$.reportId') = ?1
+		 ORDER BY audit_log_id`
+	)
+		.bind(report.id)
+		.all<{ player_id: number; action: string; data: string }>()
+	expect(results.map((r) => [r.player_id, r.action])).toEqual([
+		[8110, 'ban'],
+		[8111, 'unban'],
+	])
+
+	const ban = JSON.parse(results[0].data)
+	expect(ban).toMatchObject({ reportId: report.id, playerId: 8185, reportCategory: 102 })
+	expect(ban.banExpires).toEqual(expect.any(String))
+	expect(ban.previous).toMatchObject({ banned: false, bannedBy: null })
+
+	// The lift names who it undid: the report row itself no longer can.
+	const unban = JSON.parse(results[1].data)
+	expect(unban).toMatchObject({ playerId: 8185, banExpires: null })
+	expect(unban.previous).toMatchObject({
+		banned: true,
+		bannedBy: 8110,
+		banExpires: ban.banExpires,
+	})
 })
 
 it('answers a ban on a report that does not exist with a 404', async () => {
