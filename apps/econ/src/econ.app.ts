@@ -1140,6 +1140,40 @@ function toGiftContent(
 }
 
 /**
+ * The stored gift box for a bought CUSTOM avatar item: the item named by
+ * `CustomAvatarItemId` where a catalog box names an `AvatarItemDesc`, every other item field
+ * empty. A custom item is no storefront drop, so it has no rarity of its own, and its context
+ * is the `Gift` block's or 0. `fromPlayerId` is routed as {@link toGiftContent}'s is.
+ */
+function toCustomGiftContent(
+	item: CustomAvatarItem,
+	message: string,
+	fromPlayerId: number,
+	giftContext: number | null
+): GiftContent {
+	return {
+		FromPlayerId: fromPlayerId,
+		GiftContext: giftContext ?? 0,
+		ConsumableItemDesc: '',
+		ConsumableCount: 0,
+		AvatarItemDesc: '',
+		AvatarItemType: 0,
+		CustomAvatarItemId: item.CustomAvatarItemId,
+		CurrencyType: 0,
+		Currency: 0,
+		Xp: 0,
+		PackageType: 0,
+		Message: message,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		GiftRarity: 0,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: null,
+	}
+}
+
+/**
  * Push a GiftPackageReceivedImmediate notification for a gift box the player didn't ask
  * for, mirroring the reference's
  * `HubSendToPlayer(accountID, NotifFrame(GiftPackageReceivedImmediate, {...}))` — the
@@ -1165,35 +1199,79 @@ async function pushGiftReceived(
 	fromPlayerId: number,
 	giftContext: number | null = null
 ): Promise<void> {
+	await sendGiftReceivedFrame(c, accountId, {
+		Id: gift.id,
+		FromGiftDropId: 0,
+		FromPlayerId: fromPlayerId,
+		ConsumableItemDesc: gift.drop.ConsumableItemDesc,
+		AvatarItemDesc: gift.drop.AvatarItemDesc,
+		AvatarItemType: gift.drop.AvatarItemType ?? 0,
+		EquipmentPrefabName: gift.drop.EquipmentPrefabName,
+		EquipmentModificationGuid: gift.drop.EquipmentModificationGuid,
+		CurrencyType: gift.drop.CurrencyType,
+		Currency: gift.drop.Currency,
+		Xp: gift.drop.Xp ?? 0,
+		Level: 0,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: ALL_PLATFORMS,
+		GiftContext: giftContext ?? gift.drop.Context,
+		GiftRarity: gift.drop.Rarity,
+		Message: message,
+	})
+}
+
+/**
+ * {@link pushGiftReceived} for a gifted custom avatar item's box, read off its stored
+ * content. The frame carries `CustomAvatarItemId` beside the usual fields: the decoder
+ * recovered for this frame names no such member and drops unknown ones silently, so it costs
+ * nothing if unread, and it is the only thing on the frame that says what the box holds.
+ */
+async function pushCustomGiftReceived(
+	c: Context<App>,
+	accountId: number,
+	giftId: number,
+	content: GiftContent
+): Promise<void> {
+	await sendGiftReceivedFrame(c, accountId, {
+		Id: giftId,
+		FromGiftDropId: 0,
+		FromPlayerId: content.FromPlayerId,
+		ConsumableItemDesc: content.ConsumableItemDesc,
+		AvatarItemDesc: content.AvatarItemDesc,
+		AvatarItemType: content.AvatarItemType,
+		CustomAvatarItemId: content.CustomAvatarItemId,
+		EquipmentPrefabName: content.EquipmentPrefabName,
+		EquipmentModificationGuid: content.EquipmentModificationGuid,
+		CurrencyType: content.CurrencyType,
+		Currency: content.Currency,
+		Xp: content.Xp,
+		Level: 0,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: ALL_PLATFORMS,
+		GiftContext: content.GiftContext,
+		GiftRarity: content.GiftRarity,
+		Message: content.Message,
+	})
+}
+
+/** Send one GiftPackageReceivedImmediate frame, best-effort (see {@link pushGiftReceived}). */
+async function sendGiftReceivedFrame(
+	c: Context<App>,
+	accountId: number,
+	payload: Record<string, unknown> & { Id: number }
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			accountId,
 			NotificationType.GiftPackageReceivedImmediate,
-			{
-				Id: gift.id,
-				FromGiftDropId: 0,
-				FromPlayerId: fromPlayerId,
-				ConsumableItemDesc: gift.drop.ConsumableItemDesc,
-				AvatarItemDesc: gift.drop.AvatarItemDesc,
-				AvatarItemType: gift.drop.AvatarItemType ?? 0,
-				EquipmentPrefabName: gift.drop.EquipmentPrefabName,
-				EquipmentModificationGuid: gift.drop.EquipmentModificationGuid,
-				CurrencyType: gift.drop.CurrencyType,
-				Currency: gift.drop.Currency,
-				Xp: gift.drop.Xp ?? 0,
-				Level: 0,
-				Platform: -1,
-				PlatformsToSpawnOn: -1,
-				BalanceType: ALL_PLATFORMS,
-				GiftContext: giftContext ?? gift.drop.Context,
-				GiftRarity: gift.drop.Rarity,
-				Message: message,
-			}
+			payload
 		)
 	} catch (err) {
 		logger.error('failed to push GiftPackageReceivedImmediate notification', {
 			accountId,
-			giftId: gift.id,
+			giftId: payload.Id,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
@@ -1685,7 +1763,7 @@ interface BulkCustomLine {
 	custom: CustomAvatarItem
 	price: number
 	count: 1
-	gift: null
+	gift: GiftRequest | null
 }
 
 /** A line that resolved to something buyable. */
@@ -1698,8 +1776,9 @@ type BulkPurchaseLine = BulkCatalogLine | BulkCustomLine
  *
  * `CustomAvatarItem` is the UGC counterpart of `PurchasableItemId`: the whole item record on
  * a guid-keyed line that sold, which the client has nothing else to render it from. Both it
- * and `GiftPackage` are null on a line that didn't sell, and a custom item comes without a
- * box — it is granted straight into `inventory_custom` rather than wrapped.
+ * and `GiftPackage` are null on a line that didn't sell. A custom item's box names it by
+ * `CustomAvatarItemId` rather than `AvatarItemDesc`; ownership is granted straight into
+ * `inventory_custom` either way.
  */
 interface BulkPurchaseData {
 	GiftPackage: Record<string, unknown> | null
@@ -1745,6 +1824,40 @@ function toGiftPackage(
 		GiftContext: giftContext ?? drop.Context,
 		GiftRarity: drop.Rarity,
 		Message: message,
+		Signature: null,
+		IsSignatureValid: false,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: ALL_PLATFORMS,
+	}
+}
+
+/**
+ * {@link toGiftPackage} for the box a custom avatar item comes in — the same twenty keys,
+ * read off the stored {@link toCustomGiftContent} so the response and `GET
+ * /api/avatar/v2/gifts` describe one box.
+ */
+function toCustomGiftPackage(
+	id: number,
+	playerId: number,
+	content: GiftContent
+): Record<string, unknown> {
+	return {
+		Id: id,
+		PlayerId: playerId,
+		FromPlayerId: content.FromPlayerId,
+		ConsumableItemDesc: content.ConsumableItemDesc,
+		AvatarItemType: content.AvatarItemType,
+		AvatarItemDesc: content.AvatarItemDesc,
+		CustomAvatarItemId: content.CustomAvatarItemId,
+		EquipmentPrefabName: content.EquipmentPrefabName,
+		EquipmentModificationGuid: content.EquipmentModificationGuid,
+		CurrencyType: content.CurrencyType,
+		Currency: content.Currency,
+		Xp: content.Xp,
+		GiftContext: content.GiftContext,
+		GiftRarity: content.GiftRarity,
+		Message: content.Message,
 		Signature: null,
 		IsSignatureValid: false,
 		Platform: -1,
@@ -1927,19 +2040,27 @@ function resolveBulkLine(
 interface CustomBagContext {
 	buyerId: number
 	items: Map<string, CustomAvatarItem>
-	owned: Set<string>
+	/** Which of the bag's guids each line's RECEIVER already owns, keyed by receiver. */
+	owned: Map<number, Set<string>>
+}
+
+/** Who a bag line's item goes to: the `Gift` block's `ToPlayerId`, else the buyer. */
+function lineReceiver(gift: GiftRequest | null | undefined, buyerId: number): number {
+	return Number.isInteger(gift?.ToPlayerId) ? (gift?.ToPlayerId as number) : buyerId
 }
 
 /**
  * Resolve a guid-keyed line to the custom avatar item it names, or the failure its entry will
- * carry. The rules are buyInvention's, per line: the item must exist and be published
- * (`Accessibility` 0 is a draft, visible to its creator alone), the buyer must not be its
- * creator (who owns it already — and would be paying themself) nor own it already, and the
+ * carry. The rules are buyInvention's, per line, applied to whoever RECEIVES the item — the
+ * buyer, or the player a `Gift` block names: the item must exist and be published
+ * (`Accessibility` 0 is a draft, visible to its creator alone), the receiver must not be its
+ * creator (who owns it already — and, buying it themself, would be paying themself) nor own
+ * it already, and the
  * posted `RequestedPrice` must be the item's `Price` — no subscriber band, since a custom
  * item has no `SubscriberPrices`. Custom items are priced in RecCenterTokens only, as the
  * store lists them, so a bag in another currency cannot buy one. Owned once, so a count above
- * one is refused as it is for an avatar item; and not giftable, since a custom item is granted
- * without a box and a gift here would land on the receiver unannounced.
+ * one is refused as it is for an avatar item. A creator may GIFT their own item: they pay the
+ * price and are paid it back, so the receiver gets it at no net cost to anyone.
  */
 function resolveCustomLine(
 	line: PurchaseItemRequest,
@@ -1953,14 +2074,19 @@ function resolveCustomLine(
 	if (guid === null || item === undefined || item.Accessibility === 0) {
 		return { method, code: UpdateResponse.NoItemAvailable, error: 'Item not found' }
 	}
-	if (item.CreatorAccountId === custom.buyerId) {
+	const gift = typeof line.Gift === 'object' && line.Gift !== null ? line.Gift : null
+	const receiverId = lineReceiver(gift, custom.buyerId)
+	if (item.CreatorAccountId === receiverId) {
 		return {
 			method,
 			code: UpdateResponse.PlayerNotEligible,
-			error: 'Cannot buy your own item',
+			error:
+				receiverId === custom.buyerId
+					? 'Cannot buy your own item'
+					: 'The recipient created this item',
 		}
 	}
-	if (custom.owned.has(guid)) {
+	if (custom.owned.get(receiverId)?.has(guid) === true) {
 		return { method, code: UpdateResponse.AlreadyOwned, error: 'Already owned' }
 	}
 	if (currencyType !== CurrencyType.RecCenterTokens) {
@@ -1977,13 +2103,6 @@ function resolveCustomLine(
 			error: 'This item can only be bought once per line',
 		}
 	}
-	if (typeof line.Gift === 'object' && line.Gift !== null) {
-		return {
-			method,
-			code: UpdateResponse.PlayerNotEligible,
-			error: 'Custom avatar items cannot be gifted',
-		}
-	}
 	if (line.RequestedPrice !== item.Price) {
 		return {
 			method,
@@ -1993,7 +2112,7 @@ function resolveCustomLine(
 				: 'Price has changed',
 		}
 	}
-	return { kind: 'custom', method, custom: item, price: item.Price, count: 1, gift: null }
+	return { kind: 'custom', method, custom: item, price: item.Price, count: 1, gift }
 }
 
 /** Whether a resolved line is buyable or is already a failure. */
@@ -4554,9 +4673,10 @@ const app = new Hono<App>({ strict: false })
 				'line’s `RequestedPrice` still matches, debits the total in ONE atomic spend, grants',
 				'what sold, and answers the `{ Success, Error, error_id, Value }` envelope. A custom',
 				'item is a sale between players: its price is paid to its creator (pushed to them as',
-				'a balance update), ownership lands in `inventory_custom` with no gift box, and the',
-				'entry’s `CustomAvatarItem` carries the item itself. A custom line fails with',
-				'AlreadyOwned on a re-buy, PlayerNotEligible for its own creator or when gifted, and',
+				'a balance update), ownership lands in `inventory_custom`, its gift box names it by',
+				'`CustomAvatarItemId`, and the entry’s `CustomAvatarItem` carries the item itself. A',
+				'custom line may be gifted, and fails with AlreadyOwned when its receiver owns it,',
+				'PlayerNotEligible when its receiver created it, and',
 				'NoItemAvailable for a draft, an unknown id or a currency other than RecCenterTokens.',
 				'`Value.Balance` is the RESULTING total (not buyItem’s change) in the',
 				'`Platform` bucket named beside it, and `BalanceUpdates` carries one entry per',
@@ -4641,12 +4761,19 @@ const app = new Hono<App>({ strict: false })
 			// `CustomAvatarItemId` — which resolve against the `custom_avatar_item` table rather than
 			// the catalog. One read for the items the bag names and one for which of them the buyer
 			// already owns, so each line still resolves in memory.
-			const guids = lines.flatMap((line) => {
+			// Ownership is checked against each line's RECEIVER, so read it once per distinct
+			// receiver of a guid line — the buyer, plus anyone a custom line gifts to.
+			const guidLines = lines.flatMap((line) => {
 				const method = toPurchaseMethodId(line.ItemPurchaseMethodId)
 				return method.Type === PURCHASE_METHOD_TYPE_GUID && method.Guid !== null
-					? [method.Guid.toLowerCase()]
+					? [{ guid: method.Guid.toLowerCase(), receiverId: lineReceiver(line.Gift, id) }]
 					: []
 			})
+			const guids = guidLines.map((line) => line.guid)
+			const owned = new Map<number, Set<string>>()
+			for (const receiverId of new Set(guidLines.map((line) => line.receiverId))) {
+				owned.set(receiverId, await ownedCustomAvatarItemIds(c.env.DB, receiverId, guids))
+			}
 			const custom: CustomBagContext = {
 				buyerId: id,
 				items: new Map(
@@ -4655,7 +4782,7 @@ const app = new Hono<App>({ strict: false })
 						item,
 					])
 				),
-				owned: await ownedCustomAvatarItemIds(c.env.DB, id, guids),
+				owned,
 			}
 			const subscriber = await isSubscriber(c)
 			const resolved = lines.map((line) =>
@@ -4733,6 +4860,18 @@ const app = new Hono<App>({ strict: false })
 			// Grant what sold, keeping each line's box so the entry built below can carry it.
 			const packages = new Map<BulkPurchaseLine, Record<string, unknown> | null>()
 			for (const line of affordable) {
+				// Same routing as buyItem, for both kinds of line: a Gift block sends the item (and
+				// its box) to another player while the caller pays, a named gift shows the sender,
+				// and a self-buy or an anonymous gift is attributed to the "Coach" system account.
+				const gift = line.gift
+				// Annotated: without it the inference of this handler's own type runs through the
+				// hub call below and back, and tsc gives up on the initializer (TS7022).
+				const receiverId: number = lineReceiver(gift, id)
+				const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
+				const message = giftMessage(gift)
+				const giftContext = Number.isInteger(gift?.GiftContext)
+					? (gift?.GiftContext as number)
+					: null
 				if (line.kind === 'custom') {
 					// A custom item is a SALE between players, settled the way buyInvention settles
 					// one: the buyer's share of the bag was debited above, so record ownership first
@@ -4745,7 +4884,7 @@ const app = new Hono<App>({ strict: false })
 					// different, probably-online player with no response to read, so the sale is
 					// pushed as a plain update carrying their RESULTING total (what `creditCurrency`
 					// returns) — sending the payout would set their whole balance to it.
-					await grantCustomAvatarItem(c.env.DB, id, line.custom.CustomAvatarItemId)
+					await grantCustomAvatarItem(c.env.DB, receiverId, line.custom.CustomAvatarItemId)
 					if (line.price > 0) {
 						const creatorId = line.custom.CreatorAccountId
 						await ensureStartingBalances(c.env.DB, creatorId, startingTokens)
@@ -4758,25 +4897,23 @@ const app = new Hono<App>({ strict: false })
 						)
 						await pushBalanceUpdate(c, creatorId, currencyType as number, creatorBalance)
 					}
-					// No box: the item is in the buyer's inventory outright, and the entry below
-					// carries the item itself for the client to render.
-					packages.set(line, null)
+					// Wrapped like any purchase: a box naming the item by `CustomAvatarItemId`, which
+					// the client opens to show what was bought — in the receiver's gifts, announced to
+					// them when that is someone else, as a catalog line's is. Ownership was granted
+					// above, so the box is cosmetic and `BypassGiftPackages` skips it exactly as it
+					// does a catalog line's. The entry below also carries the item record itself.
+					if (skipGiftBox) {
+						packages.set(line, null)
+						continue
+					}
+					const content = toCustomGiftContent(line.custom, message, fromPlayerId, giftContext)
+					const box = await createGift(c.env.DB, receiverId, content)
+					if (receiverId !== id) {
+						await pushCustomGiftReceived(c, receiverId, box.id, content)
+					}
+					packages.set(line, toCustomGiftPackage(box.id, receiverId, content))
 					continue
 				}
-				// Same routing as buyItem: a Gift block sends the item (and its box) to another
-				// player while the caller pays, a named gift shows the sender, and a self-buy or an
-				// anonymous gift is attributed to the "Coach" system account.
-				const gift = line.gift
-				// Annotated: without it the inference of this handler's own type runs through the
-				// hub call below and back, and tsc gives up on the initializer (TS7022).
-				const receiverId: number = Number.isInteger(gift?.ToPlayerId)
-					? (gift?.ToPlayerId as number)
-					: id
-				const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
-				const message = giftMessage(gift)
-				const giftContext = Number.isInteger(gift?.GiftContext)
-					? (gift?.GiftContext as number)
-					: null
 				// One box per requested item, holding all `count` copies — the wire has one
 				// `GiftPackage` per entry, and only a consumable can be asked for more than once
 				// (`resolveBulkLine` refuses a bigger count on anything owned once).

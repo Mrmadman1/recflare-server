@@ -236,8 +236,13 @@ inconsistency here without checking the client first.
   the `Type: 0, NumberId` catalog lines. It is a SALE between players: the price leaves the buyer
   in the bag's one debit and is credited to the item's `CreatorAccountId` (pushed to them as a
   `StorefrontBalanceUpdate` carrying their resulting total), ownership is a row in
-  `inventory_custom`, and the entry's `Data.CustomAvatarItem` is the whole item record with
-  `GiftPackage` null — no box is minted. `GET /econ/customAvatarItems/v1/owned` is that table
+  `inventory_custom`, and the entry's `Data.CustomAvatarItem` is the whole item record. The item
+  still comes in a gift box, like any purchase: its `GiftPackage` names it by
+  `CustomAvatarItemId` with `AvatarItemDesc`/`EquipmentPrefabName`/etc. empty — without a box
+  the purchase shows the player nothing. `BypassGiftPackages` skips it as it does any line.
+  A custom line may carry a `Gift` block: ownership and the box go to `ToPlayerId` (announced
+  with `GiftPackageReceivedImmediate`), the buyer still pays and the creator is still paid, and
+  the owned/creator refusals are checked against the RECEIVER — so a creator may gift their own. `GET /econ/customAvatarItems/v1/owned` is that table
   joined to the item record PLUS everything the caller created (drafts included): a creator
   owns their own through `CreatorAccountId`, and the bag refuses to sell it to them.
 - A chat report (`api`: `POST /api/chatreport/createChatReport`) is form-encoded and sends

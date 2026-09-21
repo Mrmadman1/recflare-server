@@ -367,7 +367,8 @@ export const BulkPurchaseResponse = z.object({
 							),
 						Data: z.object({
 							GiftPackage: JsonObject.nullable().describe(
-								'The box created for this line (20 keys). Null on a line that didn’t sell, ' +
+								'The box created for this line (20 keys; a custom item’s names it by ' +
+									'`CustomAvatarItemId`). Null on a line that didn’t sell, ' +
 									'and under `BypassGiftPackages` — the item is granted either way'
 							),
 							PurchasableItemId: z.int().nullable().describe('The catalog item this line named'),

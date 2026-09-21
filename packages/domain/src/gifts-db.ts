@@ -54,6 +54,11 @@ export interface GiftContent extends Record<string, unknown> {
 	ConsumablePreExistingCount?: number
 	AvatarItemDesc: string
 	AvatarItemType: number | null
+	/**
+	 * The custom avatar item the box holds — set, in place of `AvatarItemDesc`, on the box a
+	 * bulk purchase mints for a guid-keyed line. Absent on every other box.
+	 */
+	CustomAvatarItemId?: string | null
 	CurrencyType: number
 	Currency: number
 	Xp: number
