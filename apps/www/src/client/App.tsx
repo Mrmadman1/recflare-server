@@ -246,7 +246,7 @@ function errorMessage(data: Record<string, unknown>, status: number): string {
 }
 
 interface CallOptions {
-	method?: 'GET' | 'POST' | 'PUT'
+	method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
 	/** Form fields — auth and accounts read their input with Hono's `parseBody()`. */
 	form?: Record<string, string>
 	/** A JSON body — what notify's internal endpoints take instead. */
@@ -329,6 +329,33 @@ async function fetchMyRooms(): Promise<OwnedRoom[]> {
 	if (!Array.isArray(rooms)) return []
 	// ISO-8601 timestamps, so lexical order IS chronological order.
 	return [...rooms].sort((a, b) => (a.CreatedAt < b.CreatedAt ? 1 : -1))
+}
+
+/**
+ * Look up one room for the staff Room Takedown tool.
+ */
+async function fetchRoomForTakedown(input: { id?: string; name?: string }): Promise<OwnedRoom | null> {
+        const params = new URLSearchParams()
+        if (input.id) params.set('id', input.id)
+        else if (input.name) params.set('name', input.name)
+        else throw new Error('Enter a room ID or room name.')
+
+        const room = await call<OwnedRoom | Record<string, never>>(`${where().rooms}/rooms?${params}`, {
+                authed: true,
+        })
+
+        if (!room || typeof room !== 'object' || !('RoomId' in room)) return null
+        return room as OwnedRoom
+}
+
+/**
+ * Permanently delete a room through the staff-authorized rooms endpoint.
+ */
+async function deleteRoomForTakedown(roomId: number): Promise<void> {
+        await call(`${where().rooms}/rooms/${roomId}`, {
+                method: 'DELETE',
+                authed: true,
+        })
 }
 
 /**
@@ -2366,6 +2393,7 @@ function Dashboard({
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
 					{ id: 'coach', label: 'Coach message', render: () => <CoachMessageForm /> },
+                                        { id: 'takedown', label: 'Room takedown', render: () => <RoomTakedown /> },
 				]
 			: []),
 	]
@@ -2397,6 +2425,162 @@ function Dashboard({
 			</div>
 		</>
 	)
+}
+
+
+function RoomTakedown() {
+        const [roomId, setRoomId] = useState('')
+        const [roomName, setRoomName] = useState('')
+        const [room, setRoom] = useState<OwnedRoom | null>(null)
+        const [searched, setSearched] = useState(false)
+        const [confirming, setConfirming] = useState(false)
+        const { pending, error, done, run } = useAction()
+
+        const lookup = async (input: { id?: string; name?: string }) => {
+                setRoom(null)
+                setSearched(false)
+                setConfirming(false)
+                await run(async () => {
+                        const found = await fetchRoomForTakedown(input)
+                        setSearched(true)
+                        if (!found) return 'No room was found with that ID or name.'
+                        setRoom(found)
+                        return `Found room #${found.RoomId}.`
+                })
+        }
+
+        const handleIdLookup = (event: React.FormEvent<HTMLFormElement>) => {
+                event.preventDefault()
+                const id = roomId.trim()
+                if (!id) return
+                void lookup({ id })
+        }
+
+        const handleNameLookup = (event: React.FormEvent<HTMLFormElement>) => {
+                event.preventDefault()
+                const name = roomName.trim()
+                if (!name) return
+                void lookup({ name })
+        }
+
+        const handleDelete = () => {
+                if (!room) return
+                void run(async () => {
+                        await deleteRoomForTakedown(room.RoomId)
+                        setRoom(null)
+                        setSearched(false)
+                        setConfirming(false)
+                        return `Room #${room.RoomId} was deleted.`
+                })
+        }
+
+        return (
+                <section className="card">
+                        <h2>Room takedown</h2>
+                        <p className="muted">
+                                Staff can permanently remove a room by its ID or exact name. The room is shown for
+                                confirmation before anything is deleted.
+                        </p>
+
+                        <div className="form-grid">
+                                <form onSubmit={handleIdLookup}>
+                                        <label>
+                                                Room ID
+                                                <input
+                                                        type="number"
+                                                        min="1"
+                                                        value={roomId}
+                                                        onChange={(event) => setRoomId(event.target.value)}
+                                                        placeholder="e.g. 12345"
+                                                />
+                                        </label>
+                                        <button type="submit" disabled={pending || !roomId.trim()}>
+                                                Look up ID
+                                        </button>
+                                </form>
+
+                                <form onSubmit={handleNameLookup}>
+                                        <label>
+                                                Exact room name
+                                                <input
+                                                        value={roomName}
+                                                        onChange={(event) => setRoomName(event.target.value)}
+                                                        placeholder="e.g. My Room"
+                                                />
+                                        </label>
+                                        <button type="submit" disabled={pending || !roomName.trim()}>
+                                                Look up name
+                                        </button>
+                                </form>
+                        </div>
+
+                        {error ? <p className="error">{error}</p> : null}
+                        {done ? <p className="success">{done}</p> : null}
+
+                        {searched && !room && !error ? (
+                                <p className="muted">No room found.</p>
+                        ) : null}
+
+                        {room ? (
+                                <div className="takedown-result">
+                                        <div className="takedown-header">
+                                                <div>
+                                                        <div className="muted">Room #{room.RoomId}</div>
+                                                        <h3>^{room.Name}</h3>
+                                                </div>
+                                                <VisibilityBadge accessibility={room.Accessibility} />
+                                        </div>
+
+                                        <p className="muted">
+                                                {room.Description || 'No description.'}
+                                        </p>
+
+                                        <div className="room-stats">
+                                                <span>{room.MaxPlayers} max players</span>
+                                                <span>{room.SubRooms.length} subrooms</span>
+                                                <span>{room.Stats.VisitCount} visits</span>
+                                                <span>{room.Stats.FavoriteCount} favorites</span>
+                                        </div>
+
+                                        {!confirming ? (
+                                                <button
+                                                        type="button"
+                                                        className="danger"
+                                                        onClick={() => setConfirming(true)}
+                                                        disabled={pending}
+                                                >
+                                                        Delete room
+                                                </button>
+                                        ) : (
+                                                <div className="takedown-confirm">
+                                                        <strong>Delete ^{room.Name} permanently?</strong>
+                                                        <p className="muted">
+                                                                This removes the room and its room image. This action cannot
+                                                                be undone.
+                                                        </p>
+                                                        <div className="button-row">
+                                                                <button
+                                                                        type="button"
+                                                                        className="danger"
+                                                                        onClick={handleDelete}
+                                                                        disabled={pending}
+                                                                >
+                                                                        {pending ? 'Deleting…' : 'Yes, delete this room'}
+                                                                </button>
+                                                                <button
+                                                                        type="button"
+                                                                        onClick={() => setConfirming(false)}
+                                                                        disabled={pending}
+                                                                >
+                                                                        Cancel
+                                                                </button>
+                                                        </div>
+                                                </div>
+                                        )}
+                                </div>
+                        ) : null}
+                </section>
+        )
 }
 
 /**

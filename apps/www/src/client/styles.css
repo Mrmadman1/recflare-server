@@ -734,6 +734,74 @@ h2 {
 	font-variant-numeric: tabular-nums;
 }
 
+/* ---- Room takedown ------------------------------------------------------ */
+
+.form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 18px;
+}
+
+.form-grid form {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+}
+
+.takedown-result {
+        margin-top: 20px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+}
+
+.takedown-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+}
+
+.takedown-header h3 {
+        margin: 4px 0 0;
+        font-family: var(--display);
+        font-size: 1.15rem;
+}
+
+.takedown-confirm {
+        margin-top: 18px;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-hi);
+}
+
+.takedown-confirm p {
+        margin: 6px 0 14px;
+}
+
+.button-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+}
+
+button.danger {
+        background: var(--error);
+        border-color: var(--error);
+        color: var(--text);
+}
+
+button.danger:hover:not(:disabled) {
+        filter: brightness(1.08);
+}
+
+@media (max-width: 700px) {
+        .form-grid {
+                grid-template-columns: 1fr;
+        }
+}
+
 /* ---- One room's page ---------------------------------------------------- */
 
 /* The way back out, above the page's own heading. */
