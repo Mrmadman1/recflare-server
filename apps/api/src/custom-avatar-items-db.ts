@@ -297,6 +297,59 @@ export async function getCustomAvatarItems(
 }
 
 /**
+ * Where the QUEST builds of the assetbundles live, relative to the PC ones. An assetbundle is
+ * built per Unity target, and a save names its bundle by bare filename for the client to fetch
+ * from the cdn's `/avatar/`; the Android build of the same bundle keeps the same filename one
+ * folder down, so a caller asking for the Quest target is served `quest/<name>.assetbundle` and asks the cdn for
+ * `/avatar/quest/<name>.assetbundle`.
+ */
+export const QUEST_ASSET_PREFIX = 'quest/'
+
+/**
+ * The `unityAssetTarget` a Quest asks with — the Unity build target the caller wants its
+ * assetbundles built for, which the client names on every custom-avatar-item read. 0 is PC
+ * (Windows), and is what the saves' bare names are; 2 has been SEEN from the Android/Oculus
+ * client and is read as that. The rest of the enum has not been observed.
+ */
+export const UNITY_ASSET_TARGET_QUEST = 2
+
+/**
+ * Whether a request's `unityAssetTarget` asks for the Quest builds. Anything else — 0, a
+ * target not seen yet, or none at all — is served the PC names, which is what was served
+ * before targets were read.
+ */
+export function isQuestAssetTarget(target: string | null | undefined): boolean {
+	return target?.trim() === String(UNITY_ASSET_TARGET_QUEST)
+}
+
+/**
+ * An assetbundle name under {@link QUEST_ASSET_PREFIX}. Only `.assetbundle` names are touched,
+ * and one that already carries the prefix is left alone; null (an absent `UnityAsset2`) is
+ * returned as it came.
+ */
+function questAsset<T extends string | null>(name: T): T | string {
+	if (name === null || !name.endsWith('.assetbundle')) return name
+	return name.startsWith(QUEST_ASSET_PREFIX) ? name : QUEST_ASSET_PREFIX + name
+}
+
+/**
+ * An item as a caller asking for the Quest target is served it: every save's `UnityAsset`/`UnityAsset2` pointed at
+ * the Quest build (see {@link QUEST_ASSET_PREFIX}). Per-response, never stored — the row keeps
+ * the bare names, which are what every other target is served. The hashes are left as
+ * stored. A player-made shirt has no saves and comes back unchanged.
+ */
+export function toQuestCustomAvatarItem(item: CustomAvatarItem): CustomAvatarItem {
+	return {
+		...item,
+		CurrentSaves: item.CurrentSaves.map((save) => ({
+			...save,
+			UnityAsset: questAsset(save.UnityAsset),
+			UnityAsset2: questAsset(save.UnityAsset2),
+		})),
+	}
+}
+
+/**
  * The featured feed (`GET /api/customAvatarItems/v1/featured`): items flagged
  * `is_featured` that are also published — `Accessibility` 0 is the unpublished state, so
  * those are excluded even when flagged. Newest first. Nothing sets the flag yet, so the
