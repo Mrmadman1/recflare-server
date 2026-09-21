@@ -27,17 +27,27 @@
  * `verifyPlatformProof` answers `unsupported` for anything but Steam and Meta, so a
  * `cached_login` naming platform 101 is refused — and the picker must not offer it
  * either. See {@link CACHED_LOGIN_PLATFORMS}, which is what keeps those two in step.
+ *
+ * That entitlement is also the one thing a link carries beyond the identity itself: the
+ * `role` column (migration 0010) records the Discord roles the claim read, so what a
+ * player was granted Plus FOR survives the claim instead of collapsing into a bare
+ * `hasPlus`. See {@link PlatformLink.roles}.
  */
 
 import { PlatformType } from '@repo/domain/src/enums'
 
-/** Schema DDL (mirror of migrations/0007_platform_accounts.sql, sans the backfill). */
+/**
+ * Schema DDL (mirror of migrations/0007_platform_accounts.sql, sans the backfill, plus
+ * 0010's `role` column — which is an ALTER on prod and a plain column here, since this
+ * builds the table from nothing).
+ */
 export const PLATFORM_SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS platform_account (
 		account_id INTEGER NOT NULL,
 		platform INTEGER NOT NULL,
 		platform_id TEXT NOT NULL,
 		linked_at TEXT NOT NULL,
+		role TEXT,
 		PRIMARY KEY (platform, platform_id, account_id)
 	)`,
 	// The picker's lookup: "which accounts does this identity open?". Covered by the
@@ -113,6 +123,17 @@ export interface PlatformLink {
 	platformId: string
 	/** ISO-8601 time the link was made. */
 	linkedAt: string
+	/**
+	 * The roles this identity held in its platform's community when the link was last
+	 * written — Discord role id snowflakes, kept as strings (one exceeds 2^53). Empty for
+	 * every platform that has no such thing, which is all of them but Discord.
+	 *
+	 * A SNAPSHOT from the claim, not a live read: nothing here can re-read a member's roles
+	 * without their own OAuth token (see apps/www/src/discord.ts, which deliberately holds
+	 * no bot token), so this says what they held when they claimed. Stored as a JSON array
+	 * in the `role` column (migration 0010).
+	 */
+	roles: string[]
 }
 
 interface LinkRow {
@@ -120,10 +141,39 @@ interface LinkRow {
 	platform: number
 	platformId: string
 	linkedAt: string
+	/** The `role` column: a JSON array of role ids, or NULL for a link that has none. */
+	role: string | null
 }
 
 const SELECT_LINK = `SELECT account_id AS accountId, platform, platform_id AS platformId,
-	linked_at AS linkedAt FROM platform_account`
+	linked_at AS linkedAt, role FROM platform_account`
+
+/**
+ * A stored `role` array back into role ids. Tolerant by design — every failure mode is
+ * "this link has no roles recorded", which is the truth for every Steam and Meta link and
+ * the honest answer for a row written before 0010. A NULL, a value that isn't JSON, or a
+ * JSON value that isn't an array of strings all land there rather than throwing: the roles
+ * are a record, and no caller's correctness depends on them, so a bad one must not take
+ * down the login picker that reads the same rows.
+ */
+const parseRoles = (raw: string | null): string[] => {
+	if (raw === null || raw === '') return []
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		return Array.isArray(parsed) ? parsed.filter((r): r is string => typeof r === 'string') : []
+	} catch {
+		return []
+	}
+}
+
+/** One row as the rest of the codebase sees it. */
+const toLink = (row: LinkRow): PlatformLink => ({
+	accountId: row.accountId,
+	platform: row.platform,
+	platformId: row.platformId,
+	linkedAt: row.linkedAt,
+	roles: parseRoles(row.role),
+})
 
 /**
  * Link a verified platform identity to an account. Idempotent — re-logging in on the
@@ -132,22 +182,49 @@ const SELECT_LINK = `SELECT account_id AS accountId, platform, platform_id AS pl
  *
  * Callers must pass an identity the platform itself proved. Nothing in here can tell
  * a verified id from a spoofed one.
+ *
+ * `roles` records what that identity held in its platform's community — Discord role ids,
+ * from the benefits claim's member read. Omitting it (every login path: Steam and Meta
+ * have no such thing) leaves the column NULL rather than writing an empty array, so
+ * "never had roles" stays distinguishable in the table from "claimed holding none". An
+ * EMPTY array is a real value and is stored as one.
+ *
+ * Unlike the rest of the row, roles are REFRESHED on a repeat link: they're a snapshot of
+ * a membership that moves, and the later claim is the fresher reading. That is also why
+ * the update is separate from the insert rather than an upsert — the insert's
+ * `meta.changes` is what tells a new link from an existing one, and an
+ * `ON CONFLICT DO UPDATE` reports a change either way, which would make every re-login
+ * look like a first link to {@link linkLoginIdentity}'s primary-identity write. The second
+ * statement only runs on the Discord path, and only when the row was already there.
  */
 export async function linkPlatformIdentity(
 	db: D1Database,
 	accountId: number,
 	platform: number,
-	platformId: string
+	platformId: string,
+	roles?: readonly string[]
 ): Promise<boolean> {
 	if (platformId === '') return false
+	const role = roles === undefined ? null : JSON.stringify([...roles])
 	const res = await db
 		.prepare(
-			`INSERT OR IGNORE INTO platform_account (account_id, platform, platform_id, linked_at)
-			 VALUES (?1, ?2, ?3, ?4)`
+			`INSERT OR IGNORE INTO platform_account (account_id, platform, platform_id, linked_at, role)
+			 VALUES (?1, ?2, ?3, ?4, ?5)`
 		)
-		.bind(accountId, platform, platformId, new Date().toISOString())
+		.bind(accountId, platform, platformId, new Date().toISOString(), role)
 		.run()
-	return res.meta.changes > 0
+	if (res.meta.changes > 0) return true
+
+	if (role !== null) {
+		await db
+			.prepare(
+				`UPDATE platform_account SET role = ?4
+				 WHERE account_id = ?1 AND platform = ?2 AND platform_id = ?3`
+			)
+			.bind(accountId, platform, platformId, role)
+			.run()
+	}
+	return false
 }
 
 /**
@@ -170,7 +247,7 @@ export async function getLinksForPlatformIdentity(
 		)
 		.bind(platform, platformId)
 		.all<LinkRow>()
-	return results
+	return results.map(toLink)
 }
 
 /**
@@ -193,7 +270,7 @@ export async function getLinksForPlatformId(
 		)
 		.bind(platformId, ...CACHED_LOGIN_PLATFORMS)
 		.all<LinkRow>()
-	return results
+	return results.map(toLink)
 }
 
 /** Every platform identity linked to an account (a player's PC and headset, say). */
@@ -205,7 +282,7 @@ export async function getLinksForAccount(
 		.prepare(`${SELECT_LINK} WHERE account_id = ?1 ORDER BY linked_at, platform`)
 		.bind(accountId)
 		.all<LinkRow>()
-	return results
+	return results.map(toLink)
 }
 
 /**

@@ -473,6 +473,60 @@ describe('auth worker routes', () => {
 		).resolves.toBe(1)
 	})
 
+	// The `role` column (migration 0010): what the benefits claim read about a member, kept
+	// so "why does this account have Plus" is answerable later. Exercised through the helper
+	// rather than the claim route, which runs through discord.com.
+	test('records the roles a claimed Discord identity held, and refreshes them on a re-claim', async () => {
+		const discordId = '308994132968210434'
+		const supporter = '1077000000000000001'
+		const booster = '1077000000000000002'
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 31400, username: 'RoleClaimer', hasPlus: true }))
+			.run()
+
+		await linkPlatformIdentity(env.DB, 31400, PlatformType.Discord, discordId, [supporter])
+		const first = await getLinksForAccount(env.DB, 31400)
+		// Snowflakes come back as STRINGS — parsed as numbers they'd round past 2^53 and stop
+		// matching the real role.
+		expect(first.map((l) => l.roles)).toEqual([[supporter]])
+
+		// A re-claim is the same row (INSERT OR IGNORE, so `linkedAt` is the first claim's)
+		// with a FRESH role list: a membership moves, and this reading is the later one.
+		await linkPlatformIdentity(env.DB, 31400, PlatformType.Discord, discordId, [supporter, booster])
+		const second = await getLinksForAccount(env.DB, 31400)
+		expect(second).toHaveLength(1)
+		expect(second[0]?.roles).toEqual([supporter, booster])
+		expect(second[0]?.linkedAt).toBe(first[0]?.linkedAt)
+
+		// Losing every role still stores the reading. Empty is a fact about the claim, not an
+		// absence of one — and it is what distinguishes this from a Steam link, below.
+		await linkPlatformIdentity(env.DB, 31400, PlatformType.Discord, discordId, [])
+		expect((await getLinksForAccount(env.DB, 31400))[0]?.roles).toEqual([])
+		const stored = await env.DB.prepare(
+			'SELECT role FROM platform_account WHERE account_id = 31400'
+		).first<{ role: string | null }>()
+		expect(stored?.role).toBe('[]')
+	})
+
+	// Every login path omits the argument, because Steam and Meta have no such thing. The
+	// column stays NULL there rather than becoming `[]`, so the table can still tell "never
+	// had roles" from "claimed holding none".
+	test('leaves the role column null for a link with no roles to record', async () => {
+		const steamId = '76561197962463299'
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 31401, username: 'NoRoles' }))
+			.run()
+		await linkPlatformIdentity(env.DB, 31401, PlatformType.Steam, steamId)
+
+		const row = await env.DB.prepare(
+			'SELECT role FROM platform_account WHERE account_id = 31401'
+		).first<{ role: string | null }>()
+		expect(row?.role).toBeNull()
+		// A NULL reads back as no roles rather than throwing — which is also how a row written
+		// before 0010 reads.
+		expect((await getLinksForAccount(env.DB, 31401))[0]?.roles).toEqual([])
+	})
+
 	// The 20250424.01 build POSTs the picker lookup with a platform-attestation form body
 	// instead of GETting it. Nothing reads that body yet, so both methods must answer the
 	// same list — otherwise the newer client's login screen comes up empty.

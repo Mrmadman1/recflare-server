@@ -429,7 +429,21 @@ const app = new Hono<App>()
 
 		// Both writes are idempotent: the link is INSERT OR IGNORE (so `linkedAt` keeps the
 		// FIRST claim's time), and the flag is already true on a re-claim.
-		await linkPlatformIdentity(c.env.DB, accountId, PlatformType.Discord, membership.userId)
+		//
+		// The member's roles ride along onto the link's `role` column — the WHOLE list Discord
+		// served, not just the ones that qualified. `hasPlus` records only that a qualifying
+		// role was held; this records which, so an operator can tell a supporter from a
+		// booster from staff without going and asking Discord, and can still read a grant made
+		// under a role that has since been retired from the config. Roles are the one part of
+		// the row a re-claim REFRESHES, because they're a snapshot of a membership that moves
+		// and this reading is the fresher one.
+		await linkPlatformIdentity(
+			c.env.DB,
+			accountId,
+			PlatformType.Discord,
+			membership.userId,
+			membership.roles
+		)
 		await updateAccount(c.env.DB, accountId, { hasPlus: true })
 		logger.info('granted plus from a discord benefits claim', { accountId })
 
