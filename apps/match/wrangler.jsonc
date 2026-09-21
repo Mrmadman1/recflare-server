@@ -61,10 +61,7 @@
 	},
 	"upload_source_maps": true,
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	// The operator's knobs — the room substitutions (ROOM_REDIRECTS), the Photon app ids
 	// and region (PHOTON_REALTIME_APP_ID, PHOTON_VOICE_APP_ID, PHOTON_CHAT_APP_ID,

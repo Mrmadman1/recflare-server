@@ -9,10 +9,7 @@
                 "enabled": true
         },
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	"vars": {
 		"ENVIRONMENT": "development", // overridden during deployment

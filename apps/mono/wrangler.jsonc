@@ -68,10 +68,7 @@
 	],
 	"upload_source_maps": true,
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	"vars": {
 		"NAME": "mono", // logging tag; split workers derive this per-app

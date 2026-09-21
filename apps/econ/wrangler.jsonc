@@ -50,10 +50,7 @@
 	},
 	"upload_source_maps": true,
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	// The signup token grant (STARTING_TOKENS) is deliberately NOT set here. It's injected
 	// at deploy time from the gitignored .env (RECFLARE_STARTING_TOKENS, see .env.example),

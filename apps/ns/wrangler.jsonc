@@ -7,10 +7,7 @@
 	"logpush": false,
 	"upload_source_maps": true,
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	"vars": {
 		"ENVIRONMENT": "development", // overridden during deployment

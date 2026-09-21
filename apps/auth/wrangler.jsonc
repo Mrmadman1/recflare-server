@@ -48,10 +48,7 @@
 	],
 	"upload_source_maps": true,
 	"observability": {
-		"logs": {
-			"enabled": true,
-			"head_sampling_rate": 1 // 100%
-		}
+		"enabled": false
 	},
 	// The signup caps (MAX_ACCOUNTS_PER_PLATFORM_ID, MAX_ACCOUNTS_PER_IP) are deliberately
 	// NOT set here. They're injected at deploy time from the gitignored .env
