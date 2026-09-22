@@ -44,7 +44,13 @@ import {
 	VoteToKickRequest,
 } from '../openapi'
 import { banBlockDetails, createReport, getActiveBan, NOT_BLOCKED } from '../reports-db'
-import { countKickVotes, isKickMajority, recordRoomVote } from '../votes-db'
+import {
+	countKickVotes,
+	getOpenVote,
+	isKickMajority,
+	isOnVoteCooldown,
+	recordRoomVote,
+} from '../votes-db'
 import { createWarning } from '../warnings-db'
 
 import type { Context } from 'hono'
@@ -609,7 +615,8 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 	// A player calling a vote to kick another. Ungated by role — anyone may start one —
 	// but both players have to be standing in the session the vote is called in, which is
 	// what stops a client putting a vote to a room it isn't in, about someone who isn't
-	// there. Nothing tallies the votes yet: this relays the prompt and no more.
+	// there. The call and every answer arrive here alike; the first ballot while no vote on
+	// that player is open CALLS one (`init`), and only a call is put to the room.
 	.post(
 		'/api/PlayerReporting/v3/voteToKick',
 		describeRoute({
@@ -646,6 +653,15 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				'them), `PlayerIdReporter` the voter whose ballot carried it, and the reason in ' +
 				'`VoteKickReason`. `IsBan` is false: nothing stops them rejoining. No prompt goes ' +
 				'out in that case — the room is not asked a question that is already answered.\n\n' +
+				'The call and the answers arrive on this same endpoint with the same body. A ballot ' +
+				'posted while no vote on `PlayerId` is open in that session CALLS one: it is stored ' +
+				'with `init` 1 and is the only kind that puts the prompt to the room. A vote stays ' +
+				'open for 60 seconds; every ballot inside that window answers it — recorded and ' +
+				'tallied, but relayed to nobody — and only ballots from its call on are counted, so ' +
+				'an expired vote’s yes ballots cannot carry the next.\n\n' +
+				'Calling is THROTTLED: a player who called a vote in the last 5 minutes, in any ' +
+				'session, is refused with a 429. Answering is never throttled. A `No` cannot call a ' +
+				'vote — with none open it is refused with a 409.\n\n' +
 				'`Response` is the caller’s own vote, recorded but never relayed. Answers the same lowercase `{ success, error }` envelope as the ' +
 				'write; a hub failure for any recipient is reported honestly as a 500, since ' +
 				'with nothing behind it the frame is the whole delivery.',
@@ -656,6 +672,8 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				400: json(SuccessErrorEnvelope, 'No `PlayerId` or no `GameSessionId`'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: json(SuccessErrorEnvelope, 'Either player is not in that game session'),
+				409: json(SuccessErrorEnvelope, 'A `No` with no vote open to answer'),
+				429: json(SuccessErrorEnvelope, 'The caller called a vote too recently'),
 				500: json(SuccessErrorEnvelope, 'The notifications hub could not be reached'),
 			},
 		}),
@@ -694,26 +712,43 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				return c.json({ success: false, error: 'That player is not in that game session!' }, 403)
 			}
 
-			// The room votes, so the audience is everyone standing there — the player being
-			// voted on included; a vote is called in front of them. The caller is dropped:
-			// their vote is the one they just posted.
-			const audience = (await getPlayerIdsInInstance(c.env.DB, gameSessionId)).filter(
-				(id) => id !== voterId
-			)
+			// Call or answer? Nothing in the body says, so it is whether a vote on this player is
+			// already open here: with none, this ballot calls one.
+			const response = isYesVote(formField(body, c, 'Response'))
+			const openVote = await getOpenVote(c.env.DB, gameSessionId, playerId)
+			const init = openVote === null
+			if (init) {
+				// A late "no" to a vote that has expired would otherwise call a new one.
+				if (!response) {
+					return c.json({ success: false, error: 'There is no vote in progress!' }, 409)
+				}
+				// Only calling is throttled — this is what stops one player putting vote after
+				// vote to the room. Answering someone else's vote never is.
+				if (await isOnVoteCooldown(c.env.DB, voterId)) {
+					return c.json({ success: false, error: 'You are calling votes too quickly!' }, 429)
+				}
+			}
 
 			// The caller's own ballot, recorded before the room is asked: they have voted, and a
 			// vote in a session holding only them and the player they called it on should carry on
 			// its own rather than waiting for an answer that can never come.
-			await recordRoomVote(c.env.DB, {
+			const ballot = await recordRoomVote(c.env.DB, {
 				gameSessionId,
 				playerId,
-				voterId: voterId,
-				response: isYesVote(formField(body, c, 'Response')),
+				voterId,
+				response,
+				init,
 			})
 
 			// Counted against who is standing there RIGHT NOW: a majority is of the room as it is,
-			// not of the room as it was when the vote was called, and players leave mid-vote.
-			const yesVotes = await countKickVotes(c.env.DB, gameSessionId, playerId)
+			// not of the room as it was when the vote was called, and players leave mid-vote. Only
+			// THIS vote's ballots count — from its call on.
+			const yesVotes = await countKickVotes(
+				c.env.DB,
+				gameSessionId,
+				playerId,
+				openVote?.id ?? ballot.id
+			)
 			const playerCount = await countPlayersInInstance(c.env.DB, gameSessionId)
 			if (isKickMajority(yesVotes, playerCount)) {
 				logger.info('vote to kick carried', {
@@ -727,6 +762,17 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 				// The room is not asked a question that has already been answered.
 				return c.json({ success: true, error: '' })
 			}
+
+			// An answer is recorded and no more: the room was asked when the vote was called, and
+			// re-sending the prompt on every answer would raise it again for everyone.
+			if (!init) return c.json({ success: true, error: '' })
+
+			// The room votes, so the audience is everyone standing there — the player being
+			// voted on included; a vote is called in front of them. The caller is dropped:
+			// their vote is the one they just posted.
+			const audience = (await getPlayerIdsInInstance(c.env.DB, gameSessionId)).filter(
+				(id) => id !== voterId
+			)
 
 			// Every recipient is attempted even if an earlier one fails, so the reachable
 			// players still get the vote.

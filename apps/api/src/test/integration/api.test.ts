@@ -1,6 +1,6 @@
 import { adminSecretsStore, env } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
-import { beforeAll, describe, expect, test } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, test } from 'vitest'
 
 import {
 	addXp,
@@ -5162,6 +5162,13 @@ describe('vote to kick', () => {
 	const REVOTE_SESSION = 1014082
 	const TIE_SESSION = 1014083
 
+	// Every test calls votes as 42, and calling is throttled per caller — with the ballots of
+	// the test before still there, each call after the first would be refused with a 429, or
+	// land as an answer to a vote still open from earlier.
+	beforeEach(async () => {
+		await env.DB.prepare('DELETE FROM room_vote').run()
+	})
+
 	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
 
 	const standIn = async (accountId: number, roomInstanceId: number) =>
@@ -5205,7 +5212,13 @@ describe('vote to kick', () => {
 				'SELECT * FROM room_vote WHERE game_session_id = ?1 AND player_id = ?2 ORDER BY id'
 			)
 				.bind(gameSessionId, playerId)
-				.all<{ voter_id: number; response: number; player_id: number; voted_at: string }>()
+				.all<{
+					voter_id: number
+					response: number
+					player_id: number
+					voted_at: string
+					init: number
+				}>()
 		).results
 
 	// The body the client posts: `PlayerId=205&Response=True&Reason=…&GameSessionId=…`.
@@ -5444,6 +5457,80 @@ describe('vote to kick', () => {
 		expect(await res.json()).toEqual({ success: true, error: '' })
 		// 205 is still in the session, so they still hear it — only the caller is dropped.
 		expect((await frames()).map((f) => f.playerId)).toEqual([205])
+	})
+
+	// The client posts the call and every answer alike; only the call raises the prompt.
+	test('the first ballot calls the vote, and answers to it put nothing to the room', async () => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		for (const id of [42, 205, 206, 207, 208]) await standIn(id, SESSION)
+
+		expect((await vote(FIELDS)).status).toBe(200)
+		expect(await frames()).toHaveLength(4)
+
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect((await vote({ ...FIELDS, Response: 'False' }, '206')).status).toBe(200)
+		expect((await vote(FIELDS, '207')).status).toBe(200)
+		expect(await frames()).toEqual([])
+
+		expect((await ballots(SESSION, 205)).map((b) => [b.voter_id, b.init])).toEqual([
+			[42, 1],
+			[206, 0],
+			[207, 0],
+		])
+	})
+
+	test('a player may not call vote after vote', async () => {
+		for (const id of [42, 205, 206, 207, 208]) await standIn(id, SESSION)
+
+		expect((await vote(FIELDS)).status).toBe(200)
+		// Another vote, on another player — still a CALL, so still refused.
+		const again = await vote({ ...FIELDS, PlayerId: '206' })
+		expect(again.status).toBe(429)
+		expect(await again.json()).toEqual({
+			success: false,
+			error: 'You are calling votes too quickly!',
+		})
+		// Answering someone else's vote is never throttled...
+		expect((await vote({ ...FIELDS, PlayerId: '206' }, '207')).status).toBe(200)
+		expect((await vote({ ...FIELDS, PlayerId: '206' })).status).toBe(200)
+		// ...and neither is re-voting in their own.
+		expect((await vote(FIELDS)).status).toBe(200)
+
+		// Once the cooldown has passed, they may call again.
+		await env.DB.prepare(
+			"UPDATE room_vote SET voted_at = '2000-01-01T00:00:00.000Z' WHERE voter_id = 42 AND init = 1"
+		).run()
+		expect((await vote({ ...FIELDS, PlayerId: '208' })).status).toBe(200)
+	})
+
+	test('a "no" cannot call a vote', async () => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		await standIn(42, SESSION)
+		await standIn(205, SESSION)
+		await standIn(206, SESSION)
+
+		const res = await vote({ ...FIELDS, Response: 'False' })
+		expect(res.status).toBe(409)
+		expect(await res.json()).toEqual({ success: false, error: 'There is no vote in progress!' })
+		expect(await ballots(SESSION, 205)).toEqual([])
+		expect(await frames()).toEqual([])
+	})
+
+	// Otherwise yes ballots from a vote that failed would carry the next one on the same player.
+	test('an expired vote’s ballots do not count toward the next', async () => {
+		for (const id of [42, 217, 218, 219]) await standIn(id, TALLY_SESSION)
+		const fields = { ...FIELDS, PlayerId: '217', GameSessionId: String(TALLY_SESSION) }
+
+		// 42 calls it: one yes of four. Then the vote expires.
+		expect((await vote(fields)).status).toBe(200)
+		await env.DB.prepare("UPDATE room_vote SET voted_at = '2000-01-01T00:00:00.000Z'").run()
+
+		// 218 calls a fresh one — counting 42's old yes, that would be two of four... and 219's
+		// yes would make three and carry it. Without it, 219 makes two of four: a tie.
+		expect((await vote(fields, '218')).status).toBe(200)
+		expect((await vote(fields, '219')).status).toBe(200)
+		expect(await inSession(217, TALLY_SESSION)).toBe(true)
+		expect((await ballots(TALLY_SESSION, 217)).map((b) => b.init)).toEqual([1, 1, 0])
 	})
 })
 
