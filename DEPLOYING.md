@@ -43,13 +43,16 @@ services but would require small code changes.
 
 ## Prerequisites
 
-**You must have all these requirements or RecFlare deployment will fail!**
+**You must have all these requirements or RecFlare will not work!**
 
 - node 24 (https://nodejs.org)
 - pnpm (install with `npm install -g pnpm`)
 - bun (https://bun.sh)
 - jq/awk/sed (on Windows try `winget jq` etc.)
-- A Cloudflare account with a zone (domain) you control, for deploying.
+- A Cloudflare account with a zone (domain) you control, for deploying
+- **For 2023:** A Photon Cloud Realtime and Voice account OR a custom Photon server (Luxon, OpenPhoton)
+- **For 2025:** A Photon Cloud Realtime account AND a Tachyon server, which is a custom fork of Dissonance voice that Rec Room developed. See https://discord.com/channels/1524485206550118460/1544055485336915979
+  If you don't provide a Tachyon server address during deployment, your server will still work but without voice.
 
 Cloudflare's free plan is good enough for testing (100k worker requests/day) but the
 Rec Room client is very chatty. Frequent testing may exhaust that quota. The $5/month
@@ -59,6 +62,8 @@ See https://developers.cloudflare.com/workers/platform/pricing/#workers
 
 ## Getting Started
 
+**WSL** is preferred for deploying if you are on Windows. Only Linux has been fully tested.
+
 **Install dependencies:**
 
 We use [Just](https://github.com/casey/just) for convenience. This will install all dependencies across the microservices.
@@ -67,7 +72,7 @@ We use [Just](https://github.com/casey/just) for convenience. This will install 
 just install
 ```
 
-You do not have to use `just` but you will have to run things manually with `pnpm`/`bun`.
+You do not have to use `just` but then you will have to run things manually with `pnpm`/`bun`.
 
 **Configure your custom domain:**
 
@@ -78,6 +83,8 @@ cp .env.example .env
 ```
 
 Edit `.env` and set `RECFLARE_DOMAIN` to your domain (or declare it with `export RECFLARE_DOMAIN=rec.example.com`)
+
+Go through the rest of the file and set the variables as needed.
 
 (Optional) - per-service subdomain overrides come from `RECFLARE_SUBDOMAINS`, a JSON
 object keyed by each service's default subdomain (see `SERVICES.md`), e.g.
