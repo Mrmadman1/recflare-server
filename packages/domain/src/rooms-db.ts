@@ -1671,6 +1671,50 @@ const LISTABLE_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1 AND exclude_from_
 const PUBLIC_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1'
 
 /**
+ * The columns a scan-then-rank feed selects in place of {@link ROOM_COLUMNS}: a STUB room
+ * holding only the fields the feeds filter and sort on, not the whole blob. The feeds rank
+ * every listable room to serve one page, so reading the full blobs moved every listable
+ * room's JSON over the wire and through `JSON.parse` for the handful that get served; the
+ * page's full rooms are then read by id ({@link loadRankedPage}).
+ *
+ * `->` rather than `json_extract` because it hands back JSON, so `json_object` embeds each
+ * value with its JSON type intact — `true` stays `true`, not 1, and a `"1"` stays a string.
+ * That is what lets {@link isListable} and friends run on the stub unchanged and remain the
+ * definition of listable. A missing key comes back as null, which every test below reads
+ * the same as absent. A feed that starts reading a new field off the room has to add it
+ * here, or it reads null.
+ */
+const RANK_COLUMNS = `json_object(${[
+	'RoomId',
+	'IsDorm',
+	'Accessibility',
+	'ExcludeFromLists',
+	'CreatorAccountId',
+	'CreatedAt',
+	'IsRRO',
+	'Stats',
+]
+	.map((key) => `'${key}', data -> '$.${key}'`)
+	.join(', ')}) AS data, visits`
+
+/**
+ * The full rooms behind a page of {@link RANK_COLUMNS} stubs, in the stubs' order, parsed
+ * like any room read (not yet hydrated). A room deleted between the two reads is dropped
+ * rather than served as a stub.
+ */
+async function loadRankedPage(db: D1Database, stubs: Room[]): Promise<Room[]> {
+	const ids = stubs.map(roomIdOf)
+	if (ids.length === 0) return []
+	const rows = await selectInChunks<RoomRow>(
+		db,
+		ids,
+		(placeholders) => `SELECT ${ROOM_COLUMNS} FROM room WHERE room_id IN (${placeholders})`
+	)
+	const byId = new Map(parseAll(rows).map((room) => [roomIdOf(room), room]))
+	return ids.map((id) => byId.get(id)).filter((room): room is Room => room !== undefined)
+}
+
+/**
  * Keys on the client's room DTO that nothing here stores, defaulted on every read so the
  * key is PRESENT rather than absent — the seed blobs and every room written since predate
  * them, so they can't come from the data:
@@ -1979,12 +2023,16 @@ export async function setRoomTags(db: D1Database, roomId: number, tags: RoomTag[
  * what the in-memory filter it replaced cost. The join searches the tag index FIRST and
  * then looks up only the rooms that matched, which is what makes a category row cheap.
  */
-function roomsByTagsQuery(tagSets: string[][], where = ''): { sql: string; binds: string[] } {
+function roomsByTagsQuery(
+	tagSets: string[][],
+	where = '',
+	columns = ROOM_COLUMNS
+): { sql: string; binds: string[] } {
 	// `where` is the caller's row filter ({@link LISTABLE_WHERE} or {@link PUBLIC_WHERE}) —
 	// unqualified, which is unambiguous under either shape below. It matters most when
 	// `tagSets` is EMPTY: that branch is the full scan every pseudo-tag feed still runs.
 	const filter = where === '' ? '' : ` WHERE ${where}`
-	if (tagSets.length === 0) return { sql: `SELECT ${ROOM_COLUMNS} FROM room${filter}`, binds: [] }
+	if (tagSets.length === 0) return { sql: `SELECT ${columns} FROM room${filter}`, binds: [] }
 
 	const binds: string[] = []
 	const joins = tagSets.map((tags, i) => {
@@ -1993,9 +2041,9 @@ function roomsByTagsQuery(tagSets: string[][], where = ''): { sql: string; binds
 		return `JOIN (SELECT DISTINCT room_id FROM room_tag WHERE tag IN (${placeholders})) f${i}
 		         ON f${i}.room_id = r.room_id`
 	})
-	// `data`/`visits` are unqualified but unambiguous: the joined subqueries expose only
-	// `room_id`.
-	return { sql: `SELECT ${ROOM_COLUMNS} FROM room r ${joins.join(' ')}${filter}`, binds }
+	// `data`/`visits` — in {@link ROOM_COLUMNS} or the ranking stub {@link RANK_COLUMNS} —
+	// are unqualified but unambiguous: the joined subqueries expose only `room_id`.
+	return { sql: `SELECT ${columns} FROM room r ${joins.join(' ')}${filter}`, binds }
 }
 
 /** Parse subroom rows and resolve their `CurrentSave` in one batched query. */
@@ -3013,7 +3061,8 @@ export async function getHotRooms(
 	const isPseudo = t === '' || t === NEW_TAG || t === COMMUNITY_TAG
 	const { sql, binds } = roomsByTagsQuery(
 		isPseudo ? [] : [[t, ...(TAG_ALIASES[t] ?? [])]],
-		LISTABLE_WHERE
+		LISTABLE_WHERE,
+		RANK_COLUMNS
 	)
 	const { results } = await db
 		.prepare(sql)
@@ -3028,7 +3077,7 @@ export async function getHotRooms(
 			.filter((r) => !isRRO(r))
 			.sort((a, b) => createdAt(b) - createdAt(a) || roomIdOf(b) - roomIdOf(a))
 		return {
-			Results: await hydrateRooms(db, fresh.slice(skip, skip + take)),
+			Results: await hydrateRooms(db, await loadRankedPage(db, fresh.slice(skip, skip + take))),
 			TotalResults: fresh.length,
 		}
 	}
@@ -3049,7 +3098,11 @@ export async function getHotRooms(
 			roomIdOf(a) - roomIdOf(b)
 	)
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
+		Results: await hydrateRooms(
+			db,
+			await loadRankedPage(db, rooms.slice(skip, skip + take)),
+			stats
+		),
 		TotalResults: rooms.length,
 	}
 }
@@ -3108,7 +3161,7 @@ export async function getRecentlyUpdatedRooms(
 	take: number
 ): Promise<{ Results: Room[]; TotalResults: number }> {
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
 	const rooms = parseAll(results).filter((r) => isListable(r) && isPlayerMade(r))
 
@@ -3117,7 +3170,7 @@ export async function getRecentlyUpdatedRooms(
 	rooms.sort((a, b) => updatedAt(b) - updatedAt(a) || roomIdOf(b) - roomIdOf(a))
 
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		Results: await hydrateRooms(db, await loadRankedPage(db, rooms.slice(skip, skip + take))),
 		TotalResults: rooms.length,
 	}
 }
@@ -3140,14 +3193,14 @@ export async function getNewRooms(
 	take: number
 ): Promise<{ Results: Room[]; TotalResults: number }> {
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
 	const rooms = parseAll(results)
 		.filter((r) => isListable(r) && isPlayerMade(r))
 		.sort((a, b) => createdAt(b) - createdAt(a) || roomIdOf(b) - roomIdOf(a))
 
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		Results: await hydrateRooms(db, await loadRankedPage(db, rooms.slice(skip, skip + take))),
 		TotalResults: rooms.length,
 	}
 }
@@ -3166,17 +3219,14 @@ export async function getRecommendedRooms(
 	take: number
 ): Promise<Room[]> {
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
 	const stats = await getRoomStats(db)
-	return hydrateRooms(
-		db,
-		parseAll(results)
-			.filter(isListable)
-			.sort((a, b) => hotScore(b, stats) - hotScore(a, stats) || roomIdOf(a) - roomIdOf(b))
-			.slice(skip, skip + take),
-		stats
-	)
+	const page = parseAll(results)
+		.filter(isListable)
+		.sort((a, b) => hotScore(b, stats) - hotScore(a, stats) || roomIdOf(a) - roomIdOf(b))
+		.slice(skip, skip + take)
+	return hydrateRooms(db, await loadRankedPage(db, page), stats)
 }
 
 /**
@@ -3201,7 +3251,7 @@ export async function getTrendingRooms(
 	if (players.size === 0) return { Results: [], TotalResults: 0 }
 
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
 	const stats = await getRoomStats(db)
 	const playerCount = (r: Room): number => players.get(roomIdOf(r)) ?? 0
@@ -3215,7 +3265,11 @@ export async function getTrendingRooms(
 		)
 
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
+		Results: await hydrateRooms(
+			db,
+			await loadRankedPage(db, rooms.slice(skip, skip + take)),
+			stats
+		),
 		TotalResults: rooms.length,
 	}
 }
@@ -3255,15 +3309,17 @@ export const FEATURED_ROOM_LIMIT = 10
  */
 export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGroup> {
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
-	const rooms = parseAll(results).filter(isListable)
+	const candidates = parseAll(results).filter(isListable)
 	// Fisher–Yates shuffle so the feed varies between requests.
-	for (let i = rooms.length - 1; i > 0; i--) {
+	for (let i = candidates.length - 1; i > 0; i--) {
 		const j = Math.floor(Math.random() * (i + 1))
-		;[rooms[i], rooms[j]] = [rooms[j], rooms[i]]
+		;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
 	}
-	rooms.length = Math.min(rooms.length, FEATURED_ROOM_LIMIT)
+	candidates.length = Math.min(candidates.length, FEATURED_ROOM_LIMIT)
+	// The stubs carry none of the fields the group shows, so the sample is read in full.
+	const rooms = await loadRankedPage(db, candidates)
 
 	const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 	const num = (v: unknown): number => (typeof v === 'number' ? v : 0)
@@ -3304,7 +3360,7 @@ export async function getSimilarRooms(
 	if (targetTags.size === 0) return empty
 
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
 	const sharedCount = (r: Room): number => roomTags(r).filter((t) => targetTags.has(t)).length
 	const stats = await getRoomStats(db)
@@ -3331,7 +3387,11 @@ export async function getSimilarRooms(
 	)
 	const rooms = scored.map((x) => x.room)
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
+		Results: await hydrateRooms(
+			db,
+			await loadRankedPage(db, rooms.slice(skip, skip + take)),
+			stats
+		),
 		TotalResults: rooms.length,
 	}
 }
