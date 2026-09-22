@@ -10,7 +10,7 @@ These are the instructions for deploying the RecFlare infrastructure to Cloudfla
   the real thing — services scale,
   fail, and deploy independently — instead of collapsing everything into a single
   giant server.
-- **It's free/cheap to run a lot of service.**
+- **It's free/cheap to run a lot of services.**
   Cloudflare Workers' free tier is keyed
   to usage, not to the number of Workers — so whether you deploy 1 service or all
   36, the baseline cost is the same. You only start paying once usage crosses the
