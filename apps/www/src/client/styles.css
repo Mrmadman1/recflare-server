@@ -1556,6 +1556,23 @@ button[type='submit']:disabled {
 	width: auto;
 }
 
+/* The staff card on a player's profile: the token amount and its Send button on one line. */
+.staff-gift {
+	display: flex;
+	gap: 10px;
+	margin-top: 6px;
+}
+
+.staff-gift input {
+	margin-top: 0;
+	max-width: 180px;
+}
+
+.staff-actions {
+	flex-wrap: wrap;
+	margin-top: 8px;
+}
+
 /* Tables are the one thing allowed to be wider than the page — a report row has more in
    it than a phone is wide, and wrapping the cells would make it unscannable. */
 .mod-scroll {

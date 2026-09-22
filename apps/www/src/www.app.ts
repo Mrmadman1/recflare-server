@@ -34,10 +34,13 @@ import {
 import { docsPage, fetchSpec } from './docs'
 import { privacyPage } from './privacy'
 import {
+	addUsernameChangeHandler,
 	banReportHandler,
 	bansInForceHandler,
+	clearPasswordHandler,
 	createReportHandler,
 	getReportHandler,
+	giftTokensHandler,
 	linkedAccountsHandler,
 	playerHistoryHandler,
 	requireStaff,
@@ -475,6 +478,10 @@ const app = new Hono<App>()
 	.get('/api/staff/bans', bansInForceHandler)
 	.get('/api/staff/players/:id', playerHistoryHandler)
 	.get('/api/staff/players/:id/linked', linkedAccountsHandler)
+	// The staff card on a player's profile page — account fixes the game has no endpoint for.
+	.post('/api/staff/players/:id/gift-tokens', giftTokensHandler)
+	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
+	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 
 	// ---- Privacy policy -----------------------------------------------------
 	// Server-rendered rather than a SPA route so the page has real text without

@@ -400,7 +400,12 @@ export function ModerationPage({
 							// is almost always the first half of banning somebody, and the new report's
 							// id is then in the URL, so the ban is a real page rather than a modal that
 							// a reload would lose.
-							<FileReport onFiled={openBan} />
+							// `?player=` pre-fills who it's against — the Report link on a player's
+							// profile page lands here with it.
+							<FileReport
+								initialPlayer={new URLSearchParams(search).get('player') ?? ''}
+								onFiled={openBan}
+							/>
 						)}
 					</div>
 				</div>
@@ -1218,8 +1223,14 @@ function LinkedAccountsPanel({ playerId }: { playerId: number }) {
  * Hands the new report straight to the ban dialog, since filing one is almost always the
  * first half of banning somebody.
  */
-function FileReport({ onFiled }: { onFiled: (report: ReportRow) => void }) {
-	const [player, setPlayer] = useState('')
+function FileReport({
+	initialPlayer,
+	onFiled,
+}: {
+	initialPlayer: string
+	onFiled: (report: ReportRow) => void
+}) {
+	const [player, setPlayer] = useState(initialPlayer)
 	const [category, setCategory] = useState(String(KickReportCategory.Misc))
 	const [details, setDetails] = useState('')
 	const { pending, error, run } = useAction()

@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	createAccount,
+	DEFAULT_USERNAME_CHANGES,
 	defaultAccount,
 	getAccount,
 	getAccountByUsername,
@@ -79,9 +80,6 @@ async function authedId(c: Context<App>): Promise<number | null> {
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
 }
-
-/** Username changes a fresh account starts with (until one has been consumed). */
-const DEFAULT_USERNAME_CHANGES = 3
 
 /**
  * Username-change result envelope: `{ success, error, value }`, always HTTP 200.

@@ -18,10 +18,11 @@ export type Env = SharedHonoEnv & {
 	 */
 	DB: D1Database
 	/**
-	 * SignalR notifications hub (DO owned by the `notify` worker). Bound for ONE thing: a
+	 * SignalR notifications hub (DO owned by the `notify` worker). Bound mainly for one thing: a
 	 * ban handed down from the staff panel ejects the player from the instance they are
 	 * standing in, which needs a `ModerationKick` frame pushed to them (see src/staff.ts).
-	 * Without it a ban would only bite on their next matchmake.
+	 * Without it a ban would only bite on their next matchmake. A staff token gift uses it
+	 * too, to set the player's balance and show them the box.
 	 */
 	RECFLARE_NOTIFICATIONS_HUB: DurableObjectNamespace<NotificationsHub>
 	/**
@@ -36,6 +37,20 @@ export type Env = SharedHonoEnv & {
 	 * Undeclared in wrangler.jsonc, as it is there: an operator who wants it sets it.
 	 */
 	BAN_EVASION_MATCH?: string
+	/**
+	 * The signup token grant — the same knob `econ` reads, injected into every worker from
+	 * RECFLARE_STARTING_TOKENS at deploy. www needs it for a staff token gift, which seeds a
+	 * never-touched balance with the signup grant before crediting, exactly as econ does; a
+	 * different value here would start that player on the wrong amount. Unset means
+	 * DEFAULT_STARTING_TOKENS, as it does in econ.
+	 */
+	STARTING_TOKENS?: string | number
+	/**
+	 * The most RecCenterTokens one staff token gift can carry (see src/staff.ts). A typo guard
+	 * rather than a policy, since a credit can't be taken back. Unset means
+	 * DEFAULT_MAX_TOKEN_GIFT (10,000).
+	 */
+	MAX_TOKEN_GIFT?: string | number
 	/**
 	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
 	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).

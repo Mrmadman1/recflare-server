@@ -1155,7 +1155,138 @@ function PlayerPage({
 					<PhotoGrid photos={photos} />
 				)}
 			</section>
+
+			{/* Staff only, and cosmetic: hidden for everyone else, but every endpoint behind it
+			    is gated by `requireStaff`. */}
+			{isAdmin() && <StaffPlayerActions account={account} navigate={navigate} />}
 		</main>
+	)
+}
+
+/**
+ * The staff card at the foot of a player's profile: account fixes the game gives staff no
+ * way to make. Each is a `www` endpoint (see src/staff.ts) that records itself on
+ * `audit_log`. Clearing a password asks twice, since it logs the player out of password
+ * sign-in until they set a new one; the rest are one click.
+ */
+function StaffPlayerActions({ account, navigate }: { account: PublicAccount; navigate: Navigate }) {
+	const [tokens, setTokens] = useState('')
+	const [confirmingClear, setConfirmingClear] = useState(false)
+	const gift = useAction()
+	const usernameChange = useAction()
+	const clearPassword = useAction()
+	const base = `/api/staff/players/${account.accountId}`
+
+	return (
+		<section className="card">
+			<h2>Staff</h2>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void gift.run(async () => {
+						const amount = Number(tokens)
+						const res = await call<{ balance: number }>(`${base}/gift-tokens`, {
+							authed: true,
+							json: { amount },
+						})
+						setTokens('')
+						return `Sent ${amount.toLocaleString()} tokens. @${account.username} now has ${res.balance.toLocaleString()}.`
+					})
+				}}
+			>
+				<label>
+					Gift tokens
+					<span className="staff-gift">
+						<input
+							type="number"
+							min={1}
+							step={1}
+							inputMode="numeric"
+							value={tokens}
+							required
+							onChange={(e) => setTokens(e.target.value)}
+						/>
+						<button type="submit" disabled={gift.pending}>
+							{gift.pending ? 'Sending…' : 'Send'}
+						</button>
+					</span>
+					<span className="hint">
+						Arrives as a gift box, and is added to their balance right away.
+					</span>
+				</label>
+				{gift.error && <p className="error">{gift.error}</p>}
+				{gift.done && <p className="ok">{gift.done}</p>}
+			</form>
+
+			<div className="mod-filter-actions staff-actions">
+				<button
+					type="submit"
+					disabled={usernameChange.pending}
+					onClick={() =>
+						void usernameChange.run(async () => {
+							const res = await call<{ availableUsernameChanges: number }>(
+								`${base}/username-changes`,
+								{ authed: true, method: 'POST' }
+							)
+							const n = res.availableUsernameChanges
+							return `@${account.username} now has ${n} username change${n === 1 ? '' : 's'}.`
+						})
+					}
+				>
+					{usernameChange.pending ? 'Adding…' : 'Add username change'}
+				</button>
+				{confirmingClear ? (
+					<>
+						<button
+							type="submit"
+							disabled={clearPassword.pending}
+							onClick={() =>
+								void clearPassword.run(async () => {
+									const res = await call<{ hadPassword: boolean }>(`${base}/clear-password`, {
+										authed: true,
+										method: 'POST',
+									})
+									setConfirmingClear(false)
+									return res.hadPassword
+										? `Password cleared. @${account.username} can set a new one in game.`
+										: `@${account.username} had no password set.`
+								})
+							}
+						>
+							{clearPassword.pending ? 'Clearing…' : 'Confirm clear password'}
+						</button>
+						<button
+							type="button"
+							className="linkish"
+							disabled={clearPassword.pending}
+							onClick={() => setConfirmingClear(false)}
+						>
+							Cancel
+						</button>
+					</>
+				) : (
+					<button type="submit" onClick={() => setConfirmingClear(true)}>
+						Clear password
+					</button>
+				)}
+				<button
+					type="submit"
+					onClick={() =>
+						navigate(`/moderation/new?player=${encodeURIComponent(`@${account.username}`)}`)
+					}
+				>
+					Report
+				</button>
+			</div>
+			<p className="hint">
+				<strong>Clear password:</strong> Only use if the player has requested a password clear and
+				they can still login via Steam or Meta.
+			</p>
+			{usernameChange.error && <p className="error">{usernameChange.error}</p>}
+			{usernameChange.done && <p className="ok">{usernameChange.done}</p>}
+			{clearPassword.error && <p className="error">{clearPassword.error}</p>}
+			{clearPassword.done && <p className="ok">{clearPassword.done}</p>}
+		</section>
 	)
 }
 

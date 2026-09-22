@@ -1,5 +1,13 @@
-import { getPresences, movePlayerToDorm, writeAuditLog } from '@repo/domain'
-import { logger } from '@repo/hono-helpers'
+import {
+	addUsernameChange,
+	clearPasswordHash,
+	createGift,
+	getAccount,
+	getPresences,
+	movePlayerToDorm,
+	writeAuditLog,
+} from '@repo/domain'
+import { intVar, logger } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 // The report table and the ban policy over it, owned (and migrated) by the `api` worker.
@@ -19,13 +27,26 @@ import {
 	searchReports,
 } from '../../api/src/reports-db'
 import { getWarningsAgainst } from '../../api/src/warnings-db'
+// Balances, owned by `econ`. A staff token gift is the same credit econ's own faucets make.
+import {
+	ALL_PLATFORMS,
+	creditCurrency,
+	CurrencyType,
+	DEFAULT_STARTING_TOKENS,
+	ensureStartingBalances,
+} from '../../econ/src/balance-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
 // imported as values/types with no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
 
 import type { Context, MiddlewareHandler } from 'hono'
+import type { GiftContent } from '@repo/domain'
 import type { ReportRow, ReportSearch } from '../../api/src/reports-db'
-import type { ModerationKickPayload } from '../../notify/src/notification-payloads'
+import type {
+	BalanceResponsePayload,
+	GiftPackagePayload,
+	ModerationKickPayload,
+} from '../../notify/src/notification-payloads'
 import type { App, Env } from './context'
 
 /**
@@ -477,4 +498,188 @@ export async function linkedAccountsHandler(c: Context<App>) {
 
 	const arms = armsFor(c.env)
 	return c.json({ playerId, arms, linked: await linkedAccounts(c.env.DB, playerId, arms) })
+}
+
+// ---- Player actions ---------------------------------------------------------
+//
+// The staff card on a player's profile page. None of these has a game endpoint to call —
+// the client can't grant tokens, hand back a username change or wipe a password — so, like
+// the moderation panel, they live here. Each one is recorded on `audit_log` against the
+// acting staffer, with the target in `data` (the table's `player_id` is the actor).
+
+/** The system "Coach" account — who a box the server hands over is from. */
+const COACH_ACCOUNT_ID = 1
+
+/**
+ * The most one gift can carry when the operator's `MAX_TOKEN_GIFT` is unset. Not a policy —
+ * staff can send as many gifts as they like — but a guard against a stray keypress turning
+ * 1,000 into 10,000,000, which nothing can take back: there is no debit endpoint to undo a
+ * credit with.
+ */
+export const DEFAULT_MAX_TOKEN_GIFT = 10_000
+
+/** The message on a staff token gift's box. */
+const TOKEN_GIFT_MESSAGE = 'A gift from the staff!'
+
+/** A path's `:id` as a player id, or null when it isn't a positive integer. */
+function playerIdParam(c: Context<App>): number | null {
+	const id = Number(c.req.param('id'))
+	return Number.isInteger(id) && id > 0 ? id : null
+}
+
+/**
+ * Record a player action on `audit_log`. Written after the change has committed and never
+ * throws, for the reason {@link recordBanAudit} gives: the change has already happened.
+ */
+async function recordPlayerAudit(
+	c: Context<App>,
+	action: string,
+	data: Record<string, unknown>
+): Promise<void> {
+	try {
+		await writeAuditLog(c.env.DB, { playerId: staffId(c), action, data })
+	} catch (err) {
+		logger.error('could not write an audit log row', {
+			action,
+			moderatorId: staffId(c),
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * Send a player RecCenterTokens in a gift box.
+ *
+ * The same shape as econ's own server-handed currency (a game reward's Laser Tag tickets):
+ * the balance is CREDITED here — opening a box only deletes it, it grants nothing — then a
+ * `StorefrontBalanceUpdate` carrying the resulting total sets the client's bucket, and the box
+ * is stored and announced with `GiftPackageReceivedImmediate` so the player sees what arrived.
+ * The box is from the Coach, as every box the server hands over on nobody's behalf is; who
+ * really sent it is on the audit row.
+ *
+ * Both frames are best-effort: the tokens are banked by the time they go out, and an offline
+ * player meets the box in `GET /api/avatar/v2/gifts` and the balance on their next read.
+ */
+export async function giftTokensHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const amount = Number(body.amount)
+	if (!Number.isInteger(amount) || amount <= 0) {
+		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
+	}
+	const maxGift = intVar(c.env.MAX_TOKEN_GIFT, DEFAULT_MAX_TOKEN_GIFT)
+	if (amount > maxGift) {
+		return c.json({ error: `A gift can carry at most ${maxGift.toLocaleString()} tokens` }, 400)
+	}
+	if ((await getAccount(c.env.DB, playerId)) === null) {
+		return c.json({ error: 'No such player' }, 404)
+	}
+
+	// Seed the signup grant first, as econ does before every credit: `creditCurrency` upserts,
+	// and a never-touched balance would otherwise start from this gift instead of the grant.
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	await ensureStartingBalances(c.env.DB, playerId, startingTokens)
+	const balance = await creditCurrency(
+		c.env.DB,
+		playerId,
+		CurrencyType.RecCenterTokens,
+		amount,
+		startingTokens
+	)
+
+	const content: GiftContent = {
+		FromPlayerId: COACH_ACCOUNT_ID,
+		GiftContext: 0,
+		ConsumableItemDesc: '',
+		ConsumableCount: 0,
+		AvatarItemDesc: '',
+		AvatarItemType: 0,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Currency: amount,
+		Xp: 0,
+		PackageType: 0,
+		Message: TOKEN_GIFT_MESSAGE,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		GiftRarity: 0,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: null,
+	}
+	const gift = await createGift(c.env.DB, playerId, content)
+
+	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, balance, giftId: gift.id })
+	logger.info('staff gifted tokens', { moderatorId: staffId(c), playerId, amount })
+
+	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	try {
+		await hub.notifyPlayer(playerId, NotificationType.StorefrontBalanceUpdate, {
+			Balance: balance,
+			CurrencyType: CurrencyType.RecCenterTokens,
+			Platform: ALL_PLATFORMS,
+		} satisfies BalanceResponsePayload)
+		await hub.notifyPlayer(playerId, NotificationType.GiftPackageReceivedImmediate, {
+			Id: gift.id,
+			FromPlayerId: content.FromPlayerId ?? COACH_ACCOUNT_ID,
+			ConsumableItemDesc: content.ConsumableItemDesc,
+			AvatarItemType: content.AvatarItemType,
+			AvatarItemDesc: content.AvatarItemDesc,
+			EquipmentPrefabName: content.EquipmentPrefabName,
+			EquipmentModificationGuid: content.EquipmentModificationGuid,
+			CurrencyType: content.CurrencyType,
+			Currency: content.Currency,
+			Xp: content.Xp,
+			GiftContext: content.GiftContext ?? 0,
+			GiftRarity: content.GiftRarity,
+			Message: content.Message,
+			Platform: -1,
+			PlatformsToSpawnOn: -1,
+			BalanceType: ALL_PLATFORMS,
+		} satisfies GiftPackagePayload)
+	} catch (err) {
+		logger.error('failed to announce a staff token gift', {
+			playerId,
+			giftId: gift.id,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+
+	return c.json({ playerId, amount, balance, giftId: gift.id })
+}
+
+/**
+ * Give a player one more username change. The client reads the count off `/account/me`,
+ * so it shows the next time the player opens the name screen.
+ */
+export async function addUsernameChangeHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const remaining = await addUsernameChange(c.env.DB, playerId)
+	if (remaining === null) return c.json({ error: 'No such player' }, 404)
+
+	await recordPlayerAudit(c, 'add_username_change', {
+		playerId,
+		availableUsernameChanges: remaining,
+	})
+	return c.json({ playerId, availableUsernameChanges: remaining })
+}
+
+/**
+ * Remove a player's password so they can set a new one in game — the recovery for someone
+ * who has forgotten it, since nothing here can send a reset email. `hadPassword` says whether
+ * there was one to remove; clearing an already-clear password succeeds, and is still logged.
+ */
+export async function clearPasswordHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const hadPassword = await clearPasswordHash(c.env.DB, playerId)
+	if (hadPassword === null) return c.json({ error: 'No such player' }, 404)
+
+	await recordPlayerAudit(c, 'clear_password', { playerId, hadPassword })
+	logger.info('staff cleared a password', { moderatorId: staffId(c), playerId, hadPassword })
+	return c.json({ playerId, hadPassword })
 }

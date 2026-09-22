@@ -4,6 +4,7 @@ import { beforeAll, expect, it } from 'vitest'
 import { SCHEMA_DDL as ACCOUNT_SCHEMA_DDL, updateAccount } from '@repo/domain/src/accounts-db'
 import { AUDIT_LOG_SCHEMA_DDL } from '@repo/domain/src/audit-db'
 import { PlatformType } from '@repo/domain/src/enums'
+import { getPendingGifts, RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain/src/gifts-db'
 import {
 	PRESENCE_SCHEMA_DDL,
 	PRESENCE_TTL_SECONDS,
@@ -29,6 +30,12 @@ import {
 	linkPlatformIdentity,
 	PLATFORM_SCHEMA_DDL,
 } from '../../../../auth/src/platform-db'
+import {
+	BALANCE_SCHEMA_DDL,
+	CurrencyType,
+	DEFAULT_STARTING_TOKENS,
+	getBalance,
+} from '../../../../econ/src/balance-db'
 import { discordConfig, parseRoleIds, qualifies } from '../../discord'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
@@ -98,6 +105,9 @@ beforeAll(async () => {
 	for (const stmt of STAT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// `audit_log` is owned by `api`; www files a row there for every ban and lift.
 	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// `balance` and `received_gift` are owned by `econ`; a staff token gift writes both.
+	for (const stmt of BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of RECEIVED_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -685,6 +695,19 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
 	]
+	const writes = [
+		'/api/staff/players/1/gift-tokens',
+		'/api/staff/players/1/username-changes',
+		'/api/staff/players/1/clear-password',
+	]
+	for (const path of writes) {
+		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
+		const res = await SELF.fetch(`https://example.com${path}`, {
+			method: 'POST',
+			headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
+		})
+		expect(res.status).toBe(403)
+	}
 
 	for (const path of paths) {
 		expect((await SELF.fetch(`https://example.com${path}`)).status).toBe(401)
@@ -1226,4 +1249,130 @@ it('serves standing bans most recently handed down first', async () => {
 	const bans = (await (await staffGet('/api/staff/bans', 8110)).json()) as Array<{ id: number }>
 	const ordered = bans.map((b) => b.id).filter((id) => [older.id, newer.id].includes(id))
 	expect(ordered).toEqual([newer.id, older.id])
+})
+
+// ---- Staff player actions ---------------------------------------------------
+//
+// The staff card on a player's profile page. Each action is recorded on `audit_log` against
+// the staffer who took it, with the target in `data`.
+
+/** The audit rows for one action against one target player, oldest first. */
+async function auditRows(action: string, playerId: number) {
+	const { results } = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log
+		 WHERE action = ?1 AND json_extract(data, '$.playerId') = ?2 ORDER BY audit_log_id`
+	)
+		.bind(action, playerId)
+		.all<{ player_id: number; data: string }>()
+	return results.map((r) => ({ actor: r.player_id, data: JSON.parse(r.data) }))
+}
+
+// Credited on top of the signup grant (a never-touched balance is seeded first, as econ
+// does), boxed, and announced: the balance frame carries the resulting TOTAL in the one
+// ALL_PLATFORMS bucket, and the box frame is what shows the player it arrived.
+it('gifts a player tokens in a gift box', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	await updateAccount(env.DB, 8300, { username: 'Giftee' })
+
+	const res = await staffPost('/api/staff/players/8300/gift-tokens', 8110, { amount: 500 })
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { balance: number; giftId: number }
+	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS + 500)
+	await expect(
+		getBalance(env.DB, 8300, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(DEFAULT_STARTING_TOKENS + 500)
+
+	const gifts = await getPendingGifts(env.DB, 8300)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		Id: body.giftId,
+		FromPlayerId: 1,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Currency: 500,
+	})
+
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerId: number
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([
+		[8300, 61],
+		[8300, 31],
+	])
+	expect(frames[0].data).toEqual({
+		Balance: DEFAULT_STARTING_TOKENS + 500,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Platform: -2,
+	})
+	expect(frames[1].data).toMatchObject({ Id: body.giftId, Currency: 500, BalanceType: -2 })
+
+	expect(await auditRows('gift_tokens', 8300)).toEqual([
+		{
+			actor: 8110,
+			data: {
+				playerId: 8300,
+				amount: 500,
+				balance: DEFAULT_STARTING_TOKENS + 500,
+				giftId: body.giftId,
+			},
+		},
+	])
+})
+
+it('refuses a token gift that is not a positive whole number, too large, or to nobody', async () => {
+	await updateAccount(env.DB, 8301, { username: 'NotGifted' })
+	for (const amount of [0, -5, 1.5, 'lots', 10_001]) {
+		const res = await staffPost('/api/staff/players/8301/gift-tokens', 8110, { amount })
+		expect(res.status).toBe(400)
+	}
+	expect((await staffPost('/api/staff/players/8399/gift-tokens', 8110, { amount: 5 })).status).toBe(
+		404
+	)
+	expect(await getPendingGifts(env.DB, 8301)).toEqual([])
+	expect(await auditRows('gift_tokens', 8301)).toEqual([])
+})
+
+// An account that has never renamed itself stores no count and is read as the default 3, so
+// the first grant makes it 4 rather than 1.
+it('adds a username change on top of the default', async () => {
+	await updateAccount(env.DB, 8310, { username: 'Renamer' })
+
+	let res = await staffPost('/api/staff/players/8310/username-changes', 8110, {})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ playerId: 8310, availableUsernameChanges: 4 })
+
+	await updateAccount(env.DB, 8310, { availableUsernameChanges: 0 })
+	res = await staffPost('/api/staff/players/8310/username-changes', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8310, availableUsernameChanges: 1 })
+
+	expect((await auditRows('add_username_change', 8310)).map((r) => r.data)).toEqual([
+		{ playerId: 8310, availableUsernameChanges: 4 },
+		{ playerId: 8310, availableUsernameChanges: 1 },
+	])
+	expect((await staffPost('/api/staff/players/8398/username-changes', 8110, {})).status).toBe(404)
+})
+
+it('clears a player’s password so they can set a new one in game', async () => {
+	await updateAccount(env.DB, 8320, { username: 'Forgetful', passwordHash: 'salt:hash' })
+
+	let res = await staffPost('/api/staff/players/8320/clear-password', 8110, {})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ playerId: 8320, hadPassword: true })
+	const row = await env.DB.prepare(
+		"SELECT json_extract(data, '$.passwordHash') AS hash, json_extract(data, '$.username') AS username FROM account WHERE account_id = 8320"
+	).first<{ hash: string | null; username: string }>()
+	// Only the hash goes: the rest of the account is untouched.
+	expect(row).toEqual({ hash: null, username: 'Forgetful' })
+
+	// Clearing it again is harmless, and says there was nothing to clear.
+	res = await staffPost('/api/staff/players/8320/clear-password', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8320, hadPassword: false })
+
+	expect(await auditRows('clear_password', 8320)).toEqual([
+		{ actor: 8110, data: { playerId: 8320, hadPassword: true } },
+		{ actor: 8110, data: { playerId: 8320, hadPassword: false } },
+	])
+	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
 })

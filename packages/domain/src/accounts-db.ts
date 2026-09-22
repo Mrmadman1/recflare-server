@@ -445,6 +445,52 @@ export async function getPasswordHash(db: D1Database, id: number): Promise<strin
 	return row?.hash ?? null
 }
 
+/**
+ * Remove the account's password hash, leaving it with no credential login — which the game
+ * reads as "set one", so a player locked out of their password can choose a new one in game.
+ * Returns null when no such account exists, else whether it HAD a password to remove.
+ */
+export async function clearPasswordHash(db: D1Database, id: number): Promise<boolean | null> {
+	const row = await db
+		.prepare(
+			"SELECT json_extract(data, '$.passwordHash') IS NOT NULL AS had FROM account WHERE account_id = ?1"
+		)
+		.bind(id)
+		.first<{ had: number }>()
+	if (row === null) return null
+	if (row.had) {
+		await db
+			.prepare(
+				"UPDATE account SET data = json_remove(data, '$.passwordHash') WHERE account_id = ?1"
+			)
+			.bind(id)
+			.run()
+	}
+	return row.had === 1
+}
+
+/** Username changes a fresh account starts with (until one has been consumed). */
+export const DEFAULT_USERNAME_CHANGES = 3
+
+/**
+ * Grant the account one more username change, returning how many it now has — or null when
+ * no such account exists. An account that has never changed its name has no stored count and
+ * is read as {@link DEFAULT_USERNAME_CHANGES}, so the grant lands on top of that. One UPDATE,
+ * so two grants racing each other both count.
+ */
+export async function addUsernameChange(db: D1Database, id: number): Promise<number | null> {
+	const row = await db
+		.prepare(
+			`UPDATE account SET data = json_set(data, '$.availableUsernameChanges',
+				COALESCE(json_extract(data, '$.availableUsernameChanges'), ?2) + 1)
+			 WHERE account_id = ?1
+			 RETURNING json_extract(data, '$.availableUsernameChanges') AS remaining`
+		)
+		.bind(id, DEFAULT_USERNAME_CHANGES)
+		.first<{ remaining: number }>()
+	return row?.remaining ?? null
+}
+
 /** Persist the account's password hash. Returns false when no such account exists. */
 export async function setPasswordHash(db: D1Database, id: number, hash: string): Promise<boolean> {
 	const { meta } = await db
