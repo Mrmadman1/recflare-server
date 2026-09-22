@@ -16,6 +16,7 @@ import {
 	NOTIFICATION_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
+	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -115,8 +116,10 @@ beforeAll(async () => {
 	// The audit log the staff takedown writes to. Owned by `api`'s migrations; built here
 	// directly, the way `notify`'s tests do.
 	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
-	// Vote-to-kick ballots (owned by `api`) — the cron here sweeps the stale ones.
+	// Vote-to-kick ballots (owned by `api`) and game invites (owned by `match`) — the cron
+	// here sweeps the stale ones.
 	for (const stmt of ROOM_VOTE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -5333,7 +5336,7 @@ describe('room name validation', () => {
 	})
 })
 
-describe('room_vote sweep cron', () => {
+describe('sweep cron', () => {
 	async function castBallot(voterId: number, agoMs: number, init = 0): Promise<void> {
 		await env.DB.prepare(
 			`INSERT INTO room_vote (game_session_id, player_id, response, voter_id, voted_at, init)
@@ -5369,11 +5372,43 @@ describe('room_vote sweep cron', () => {
 		expect(await voterIds()).toEqual([3, 4, 5])
 	})
 
-	it('is a no-op on an empty table', async () => {
+	async function sendInvite(fromPlayerId: number, agoSeconds: number): Promise<void> {
+		await env.DB.prepare(
+			`INSERT INTO room_invite (from_player_id, to_player_id, room_id, created_at)
+			 VALUES (?1, 790, 823, ?2)`
+		)
+			.bind(fromPlayerId, Math.floor(Date.now() / 1000) - agoSeconds)
+			.run()
+	}
+
+	async function inviterIds(): Promise<number[]> {
+		const rows = await env.DB.prepare(
+			'SELECT from_player_id FROM room_invite ORDER BY from_player_id'
+		).all<{ from_player_id: number }>()
+		return rows.results.map((r) => r.from_player_id)
+	}
+
+	it('deletes invites older than 5 minutes and keeps the rest', async () => {
+		await env.DB.prepare('DELETE FROM room_invite').run()
+		await sendInvite(1, 6 * 60)
+		await sendInvite(2, 5 * 60 + 1)
+		await sendInvite(3, 4 * 60 + 30)
+		await sendInvite(4, 0)
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		expect(await inviterIds()).toEqual([3, 4])
+	})
+
+	it('is a no-op on empty tables', async () => {
 		await env.DB.prepare('DELETE FROM room_vote').run()
+		await env.DB.prepare('DELETE FROM room_invite').run()
 		const ctx = createExecutionContext()
 		await scheduled(createScheduledController(), env, ctx)
 		await waitOnExecutionContext(ctx)
 		expect(await voterIds()).toEqual([])
+		expect(await inviterIds()).toEqual([])
 	})
 })

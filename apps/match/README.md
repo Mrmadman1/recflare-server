@@ -127,8 +127,9 @@ The `presence` and `room_instance` tables are owned/migrated by the `rooms` work
 worker owns one table of its own, `room_invite` (`migrations/0001_room_invite.sql`, applied
 under its own `d1_migrations_match` table so it doesn't clash with the other workers
 sharing the database): a row per game invite `POST /invite` sends, which is what gives the
-invite the `RoomInviteId` the response carries. Its `created_at` is epoch seconds, so old
-invites can be swept later.
+invite the `RoomInviteId` the response carries. Its `created_at` is epoch seconds; the
+`rooms` worker's cron deletes rows older than `ROOM_INVITE_TTL_SECONDS` (5 minutes), and a
+redeem that misses the row answers `RoomInviteExpired`.
 
 The settings KV is owned by the `playersettings` worker; this worker touches exactly one
 key in it, the "avoid juniors" preference, and its write merges (as that worker's own PUT

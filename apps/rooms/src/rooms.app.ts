@@ -15,6 +15,7 @@ import {
 	countRoomsByCreator,
 	createNotification,
 	createSubRoom,
+	deleteExpiredRoomInvites,
 	deleteRoom,
 	deleteRoomLeaderboard,
 	deleteSubRoom,
@@ -4218,21 +4219,27 @@ async function deleteStaleRoomVotes(db: D1Database, now = Date.now()): Promise<n
 	return res.meta.changes ?? 0
 }
 
-/** Cron: sweep `room_vote` ballots older than {@link ROOM_VOTE_RETENTION_MS}. */
-async function sweepStaleRoomVotes(env: Env): Promise<void> {
-	const removed = await deleteStaleRoomVotes(env.DB)
+/**
+ * Cron: sweep the short-lived rows on the shared database — `room_vote` ballots older than
+ * {@link ROOM_VOTE_RETENTION_MS} and `room_invite` rows older than
+ * `ROOM_INVITE_TTL_SECONDS` (both 5 minutes). Neither table is this worker's — `api` and
+ * `match` own them — but both are room housekeeping, so it runs here.
+ */
+async function sweepStaleRows(env: Env): Promise<void> {
+	const votes = await deleteStaleRoomVotes(env.DB)
+	const invites = await deleteExpiredRoomInvites(env.DB)
 	// The tagged logger is request-scoped (its middleware never runs for a cron), so
 	// log plainly here — Workers observability picks it up either way.
-	console.log(`room_vote sweep: removed ${removed} stale ballots`)
+	console.log(`room sweep: removed ${votes} stale ballots, ${invites} expired invites`)
 }
 
 // The HTTP surface is a standard Hono app, exported by name so it can be mounted
 // uniformly like every other worker (e.g. by the `mono` facade). The cron that sweeps
-// stale vote-to-kick ballots is exported alongside it.
+// stale ballots and expired invites is exported alongside it.
 export { app }
 
 export const scheduled: ExportedHandlerScheduledHandler<Env> = (_controller, env, ctx) => {
-	ctx.waitUntil(sweepStaleRoomVotes(env))
+	ctx.waitUntil(sweepStaleRows(env))
 }
 
 // Standalone entry: a Worker only runs `scheduled` when it's on the default export,

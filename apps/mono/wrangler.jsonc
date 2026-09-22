@@ -45,8 +45,8 @@
 		"bindings": [{ "name": "RECFLARE_NOTIFICATIONS_HUB", "class_name": "NotificationsHub" }]
 	},
 	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["NotificationsHub"] }],
-	// Presence sweep (owned by match) and the stale vote-to-kick ballot sweep (owned by
-	// rooms) — both `*/5 * * * *`, so one trigger fires both. Every 5 minutes.
+	// Presence sweep (owned by match) and the stale ballot / expired invite sweep (owned
+	// by rooms) — both `*/5 * * * *`, so one trigger fires both. Every 5 minutes.
 	"triggers": {
 		"crons": ["*/5 * * * *"]
 	},

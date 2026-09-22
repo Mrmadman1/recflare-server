@@ -13,6 +13,10 @@
  * (`apps/match/migrations/0001_room_invite.sql`, applied under its own `migrations_table`
  * so it doesn't clash with the other workers' migrations that share the database).
  * `ROOM_INVITE_SCHEMA_DDL` mirrors that migration so tests can build the table directly.
+ *
+ * The `rooms` worker's cron expires them: {@link deleteExpiredRoomInvites} drops every row
+ * older than {@link ROOM_INVITE_TTL_SECONDS}, after which redeeming the invite answers
+ * `RoomInviteExpired`.
  */
 
 /** Schema DDL (mirror of apps/match/migrations/0001_room_invite.sql). */
@@ -59,6 +63,12 @@ interface RoomInviteRow {
 const SELECT_COLUMNS = `room_invite_id, from_player_id, to_player_id, room_id`
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
+
+/**
+ * How long an invite stays redeemable (s) after it is sent. The prompt the invitee sees is
+ * a live socket frame, and this is how long the row behind it survives the `rooms` cron.
+ */
+export const ROOM_INVITE_TTL_SECONDS = 300
 
 /**
  * One invite by its id, or null when there is no such row.
@@ -146,6 +156,22 @@ export async function createRoomInvite(
 		ToPlayerId: row.to_player_id,
 		RoomId: row.room_id,
 	}
+}
+
+/**
+ * Delete every invite sent more than {@link ROOM_INVITE_TTL_SECONDS} ago. Returns rows
+ * removed. The `rooms` cron runs this; a redeem that then misses the row answers
+ * `RoomInviteExpired`, which is the whole of what expiry means here.
+ */
+export async function deleteExpiredRoomInvites(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<number> {
+	const res = await db
+		.prepare('DELETE FROM room_invite WHERE created_at < ?1')
+		.bind(now - ROOM_INVITE_TTL_SECONDS)
+		.run()
+	return res.meta.changes ?? 0
 }
 
 /**

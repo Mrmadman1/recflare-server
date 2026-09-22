@@ -106,7 +106,7 @@ export default {
 		return services[resolved.name].fetch(resolved.request, env, ctx)
 	},
 
-	// `match` (presence sweep) and `rooms` (stale vote-to-kick ballots) each run a
+	// `match` (presence sweep) and `rooms` (stale ballots, expired invites) each run a
 	// `*/5 * * * *` cron in the split deployment; this worker's one trigger fires both.
 	// Each schedules its work on `ctx.waitUntil`, so the runtime waits for both.
 	scheduled(

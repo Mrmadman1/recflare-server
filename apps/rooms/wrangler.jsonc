@@ -49,9 +49,11 @@
 			"secret_name": "JWT_SECRET"
 		}
 	],
-	// Vote-to-kick sweep. `room_vote` (owned by `api`) is append-only and a ballot
-	// matters for at most 5 minutes — a vote is open for 60s and the caller cooldown
-	// looks back 5 minutes — so the cron drops everything older. Every 5 minutes.
+	// Housekeeping sweep, every 5 minutes. Drops `room_vote` ballots (owned by `api`,
+	// append-only; a vote is open for 60s and the caller cooldown looks back 5 minutes,
+	// so nothing reads an older ballot) and `room_invite` rows (owned by `match`; an
+	// invite is redeemable for 5 minutes, after which the missing row IS the expiry)
+	// older than 5 minutes.
 	"triggers": {
 		"crons": ["*/5 * * * *"]
 	},

@@ -39,9 +39,17 @@ same number, because the client's paged DTO and the reference disagree on the na
 
 ## Cron
 
-A `*/5 * * * *` cron (`scheduled`) deletes vote-to-kick ballots in `room_vote` older than
-5 minutes. The table is the `api` worker's and append-only; a vote stays open for 60
-seconds and the caller cooldown looks back 5 minutes, so nothing reads an older ballot.
+A `*/5 * * * *` cron (`scheduled`) sweeps two short-lived tables on the shared database,
+neither of them this worker's own:
+
+- `room_vote` (the `api` worker's) — vote-to-kick ballots older than 5 minutes. The table
+  is append-only; a vote stays open for 60 seconds and the caller cooldown looks back 5
+  minutes, so nothing reads an older ballot.
+- `room_invite` (the `match` worker's) — game invites older than 5 minutes
+  (`ROOM_INVITE_TTL_SECONDS`). Expiry IS the deletion: a redeem that misses the row answers
+  `RoomInviteExpired`, so the invite prompt goes stale rather than becoming a permanent
+  key into wherever the inviter is later.
+
 The `mono` facade fires this sweep from its own trigger alongside `match`'s presence sweep.
 
 ## Development
