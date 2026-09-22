@@ -4,6 +4,7 @@ import { beforeAll, describe, expect, it } from 'vitest'
 import '../../rooms.app'
 
 import {
+	AUDIT_LOG_SCHEMA_DDL,
 	createRoomInstance,
 	getRoomInstance,
 	MessageType,
@@ -104,6 +105,9 @@ beforeAll(async () => {
 	// Message store (owned by the api worker) — a room-role invite is written there before
 	// it is pushed, so the invited player can read it back from their inbox.
 	for (const stmt of NOTIFICATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The audit log the staff takedown writes to. Owned by `api`'s migrations; built here
+	// directly, the way `notify`'s tests do.
+	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -1671,6 +1675,23 @@ describe('rooms endpoints', () => {
 		expect(await roomExists()).toBe(true)
 		expect(await del(staff)).toMatchObject({ Success: true })
 		expect(await roomExists()).toBe(false)
+
+		// The takedown is the one row in the audit log: the owner's own deletion in the test
+		// above wrote none, and the refused attempts wrote none. It names the actor and keeps
+		// enough of the room to say which one it was, now that the room itself is gone.
+		const { results: audit } = await env.DB.prepare(
+			'SELECT player_id, action, data FROM audit_log WHERE action = ?1'
+		)
+			.bind('room_delete')
+			.all<{ player_id: number; action: string; data: string }>()
+		expect(audit).toHaveLength(1)
+		expect(audit[0].player_id).toBe(999)
+		expect(JSON.parse(audit[0].data)).toEqual({
+			roomId: 9501,
+			name: 'TakeMeDown',
+			creatorAccountId: 1,
+			accessibility: 1,
+		})
 	})
 
 	it('PUT /rooms/:id/roles/:accountId grants a helper role outright, but never co-owner', async () => {

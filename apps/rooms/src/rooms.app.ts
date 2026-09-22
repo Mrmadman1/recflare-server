@@ -69,6 +69,7 @@ import {
 	transferRoomOwnership,
 	unbanPlayerFromRoom,
 	updateRoomFields,
+	writeAuditLog,
 } from '@repo/domain'
 import {
 	intVar,
@@ -2115,6 +2116,33 @@ const app = new Hono<App>()
 			const imageName = typeof room.ImageName === 'string' ? room.ImageName : ''
 			if (imageName !== '') {
 				await c.env.CDN_ASSETS.delete(`room/${imageName}`)
+			}
+
+			// A takedown — staff deleting a room that isn't theirs — goes in the audit log; an
+			// owner deleting their own room is their business and doesn't. The row keeps the
+			// room's identity, since the room itself is gone and nothing else will answer "which
+			// room was that". Written after the fact and caught: a failed insert must not report
+			// a deletion that has already happened as refused. It leaves a loud line instead.
+			if (!isOwner) {
+				try {
+					await writeAuditLog(c.env.DB, {
+						playerId: accountId,
+						action: 'room_delete',
+						data: {
+							roomId,
+							name: room.Name,
+							creatorAccountId: room.CreatorAccountId,
+							accessibility: room.Accessibility,
+						},
+					})
+				} catch (err) {
+					logger.error('could not write an audit log row', {
+						action: 'room_delete',
+						playerId: accountId,
+						roomId,
+						error: err instanceof Error ? err.message : String(err),
+					})
+				}
 			}
 
 			return roomResult(c, { Success: true })
