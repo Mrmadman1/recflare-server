@@ -1858,8 +1858,7 @@ const app = new Hono<App>()
 					Error: 'This room does not exist!',
 				})
 			}
-			const isOwner = room.CreatorAccountId === accountId
-			if (!isOwner && !(await isStaff(c))) {
+			if (room.CreatorAccountId !== accountId) {
 				return roomResult(c, {
 					Success: false,
 					ErrorId: 'Rooms.NotOwner',
@@ -2098,7 +2097,8 @@ const app = new Hono<App>()
 					Error: 'This room does not exist!',
 				})
 			}
-			if (room.CreatorAccountId !== accountId) {
+			const isOwner = room.CreatorAccountId === accountId
+			if (!isOwner && !(await isStaff(c))) {
 				return roomResult(c, {
 					Success: false,
 					ErrorId: 'Rooms.NotOwner',
