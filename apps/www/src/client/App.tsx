@@ -20,6 +20,7 @@ import {
 	call,
 	hasToken,
 	isAdmin,
+	isDeveloper,
 	setHosts,
 	setToken,
 	useAction,
@@ -1184,129 +1185,134 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	return (
 		<section className="card">
 			<h2>Staff</h2>
-			<form
-				onSubmit={(e) => {
-					e.preventDefault()
-					void gift.run(async () => {
-						const amount = Number(tokens)
-						const res = await call<{ balance: number }>(`${base}/gift-tokens`, {
-							authed: true,
-							json: { amount },
-						})
-						setTokens('')
-						const what =
-							amount < 0
-								? `Took ${Math.abs(amount).toLocaleString()} tokens back`
-								: amount === 0
-									? 'Sent an empty box'
-									: `Sent ${amount.toLocaleString()} tokens`
-						return `${what}. @${account.username} now has ${res.balance.toLocaleString()}.`
-					})
-				}}
-			>
-				<label>
-					Gift tokens
-					<span className="staff-gift">
-						<input
-							type="number"
-							step={1}
-							value={tokens}
-							required
-							onChange={(e) => setTokens(e.target.value)}
-						/>
-						<button type="submit" disabled={gift.pending}>
-							{gift.pending ? 'Sending…' : 'Send'}
-						</button>
-					</span>
-					<span className="hint">
-						Arrives as a gift box, and is added to their balance right away. A negative amount takes
-						tokens back instead — it still sends a box, and it can&apos;t take more than they have.
-						Zero sends an empty box and moves nothing.
-					</span>
-				</label>
-				{gift.error && <p className="error">{gift.error}</p>}
-				{gift.done && <p className="ok">{gift.done}</p>}
-			</form>
+			{/* The gifts are developer-only; www refuses them to moderators. */}
+			{isDeveloper() && (
+				<>
+					<form
+						onSubmit={(e) => {
+							e.preventDefault()
+							void gift.run(async () => {
+								const amount = Number(tokens)
+								const res = await call<{ balance: number }>(`${base}/gift-tokens`, {
+									authed: true,
+									json: { amount },
+								})
+								setTokens('')
+								const what =
+									amount < 0
+										? `Took ${Math.abs(amount).toLocaleString()} tokens back`
+										: amount === 0
+											? 'Sent an empty box'
+											: `Sent ${amount.toLocaleString()} tokens`
+								return `${what}. @${account.username} now has ${res.balance.toLocaleString()}.`
+							})
+						}}
+					>
+						<label>
+							Gift tokens
+							<span className="staff-gift">
+								<input
+									type="number"
+									step={1}
+									value={tokens}
+									required
+									onChange={(e) => setTokens(e.target.value)}
+								/>
+								<button type="submit" disabled={gift.pending}>
+									{gift.pending ? 'Sending…' : 'Send'}
+								</button>
+							</span>
+							<span className="hint">
+								Arrives as a gift box, and is added to their balance right away. A negative amount
+								takes tokens back instead — it still sends a box, and it can&apos;t take more than
+								they have. Zero sends an empty box and moves nothing.
+							</span>
+						</label>
+						{gift.error && <p className="error">{gift.error}</p>}
+						{gift.done && <p className="ok">{gift.done}</p>}
+					</form>
 
-			<form
-				onSubmit={(e) => {
-					e.preventDefault()
-					void xpGift.run(async () => {
-						const amount = Number(xp)
-						const res = await call<{ level: number; levelsGained: number }>(`${base}/gift-xp`, {
-							authed: true,
-							json: { amount },
-						})
-						setXp('')
-						const levels =
-							res.levelsGained > 0
-								? ` They went up ${res.levelsGained} level${res.levelsGained === 1 ? '' : 's'}, to ${res.level}.`
-								: ` They're level ${res.level}.`
-						return `Sent ${amount.toLocaleString()} XP.${levels}`
-					})
-				}}
-			>
-				<label>
-					Gift XP
-					<span className="staff-gift">
-						<input
-							type="number"
-							min={1}
-							step={1}
-							inputMode="numeric"
-							value={xp}
-							required
-							onChange={(e) => setXp(e.target.value)}
-						/>
-						<button type="submit" disabled={xpGift.pending}>
-							{xpGift.pending ? 'Sending…' : 'Send'}
-						</button>
-					</span>
-					<span className="hint">
-						Arrives as a gift box. Levels it crosses count, but don&apos;t pay their level-up
-						rewards.
-					</span>
-				</label>
-				{xpGift.error && <p className="error">{xpGift.error}</p>}
-				{xpGift.done && <p className="ok">{xpGift.done}</p>}
-			</form>
+					<form
+						onSubmit={(e) => {
+							e.preventDefault()
+							void xpGift.run(async () => {
+								const amount = Number(xp)
+								const res = await call<{ level: number; levelsGained: number }>(`${base}/gift-xp`, {
+									authed: true,
+									json: { amount },
+								})
+								setXp('')
+								const levels =
+									res.levelsGained > 0
+										? ` They went up ${res.levelsGained} level${res.levelsGained === 1 ? '' : 's'}, to ${res.level}.`
+										: ` They're level ${res.level}.`
+								return `Sent ${amount.toLocaleString()} XP.${levels}`
+							})
+						}}
+					>
+						<label>
+							Gift XP
+							<span className="staff-gift">
+								<input
+									type="number"
+									min={1}
+									step={1}
+									inputMode="numeric"
+									value={xp}
+									required
+									onChange={(e) => setXp(e.target.value)}
+								/>
+								<button type="submit" disabled={xpGift.pending}>
+									{xpGift.pending ? 'Sending…' : 'Send'}
+								</button>
+							</span>
+							<span className="hint">
+								Arrives as a gift box. Levels it crosses count, but don&apos;t pay their level-up
+								rewards.
+							</span>
+						</label>
+						{xpGift.error && <p className="error">{xpGift.error}</p>}
+						{xpGift.done && <p className="ok">{xpGift.done}</p>}
+					</form>
 
-			<form
-				onSubmit={(e) => {
-					e.preventDefault()
-					void customGift.run(async () => {
-						const res = await call<{ name: string }>(`${base}/gift-custom-item`, {
-							authed: true,
-							json: { customAvatarItemId: customItemId.trim() },
-						})
-						setCustomItemId('')
-						return `Sent “${res.name}” to @${account.username}.`
-					})
-				}}
-			>
-				<label>
-					Gift custom item
-					<span className="staff-gift">
-						<input
-							type="text"
-							value={customItemId}
-							placeholder="Custom avatar item id"
-							spellCheck={false}
-							required
-							onChange={(e) => setCustomItemId(e.target.value)}
-						/>
-						<button type="submit" disabled={customGift.pending}>
-							{customGift.pending ? 'Sending…' : 'Send'}
-						</button>
-					</span>
-					<span className="hint">
-						Arrives as a gift box, as if bought from the store. Free to them, and the creator
-						isn&apos;t paid.
-					</span>
-				</label>
-				{customGift.error && <p className="error">{customGift.error}</p>}
-				{customGift.done && <p className="ok">{customGift.done}</p>}
-			</form>
+					<form
+						onSubmit={(e) => {
+							e.preventDefault()
+							void customGift.run(async () => {
+								const res = await call<{ name: string }>(`${base}/gift-custom-item`, {
+									authed: true,
+									json: { customAvatarItemId: customItemId.trim() },
+								})
+								setCustomItemId('')
+								return `Sent “${res.name}” to @${account.username}.`
+							})
+						}}
+					>
+						<label>
+							Gift custom item
+							<span className="staff-gift">
+								<input
+									type="text"
+									value={customItemId}
+									placeholder="Custom avatar item id"
+									spellCheck={false}
+									required
+									onChange={(e) => setCustomItemId(e.target.value)}
+								/>
+								<button type="submit" disabled={customGift.pending}>
+									{customGift.pending ? 'Sending…' : 'Send'}
+								</button>
+							</span>
+							<span className="hint">
+								Arrives as a gift box, as if bought from the store. Free to them, and the creator
+								isn&apos;t paid.
+							</span>
+						</label>
+						{customGift.error && <p className="error">{customGift.error}</p>}
+						{customGift.done && <p className="ok">{customGift.done}</p>}
+					</form>
+				</>
+			)}
 
 			<div className="mod-filter-actions staff-actions">
 				<button
@@ -2161,7 +2167,7 @@ function PublicRoomView({
 			    role itself on the DELETE. */}
 			{isAdmin() && (
 				<>
-					<StaffRoomTokens room={room} />
+					{isDeveloper() && <StaffRoomTokens room={room} />}
 					<StaffTakedown room={room} onTakenDown={onTakenDown} />
 				</>
 			)}

@@ -75,7 +75,8 @@ import type { App, Env } from './context'
  * `developer`, the operator-granted roles `auth` stamps from an account's
  * isModerator/isDeveloper flags (see the admin CLI's `grant-moderator` /
  * `grant-developer`). The SPA's `isAdmin()` gate only decides what to SHOW; this is the
- * one that decides anything.
+ * one that decides anything. The gifts are narrower still — developers only, via
+ * {@link requireDeveloper}.
  */
 
 /**
@@ -111,6 +112,18 @@ export const requireStaff: MiddlewareHandler<App> = async (c, next) => {
 	// moderator, and every action here is recorded against one.
 	if (accountId === null) return c.json({ error: 'Unauthorized' }, 401)
 	c.set('staffId', accountId)
+	c.set('staffRoles', roles)
+	await next()
+}
+
+/**
+ * Narrows a staff route to developers — the ones that mint currency, items or XP out of
+ * nothing, which moderation has no need for. Runs AFTER {@link requireStaff} (it reads the
+ * roles that gate stashed), so a missing or invalid token is still that gate's 401 and a
+ * moderator without `developer` gets a 403.
+ */
+export const requireDeveloper: MiddlewareHandler<App> = async (c, next) => {
+	if (!c.get('staffRoles').includes('developer')) return c.json({ error: 'Forbidden' }, 403)
 	await next()
 }
 

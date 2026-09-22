@@ -135,6 +135,11 @@ export type Variables = SharedHonoVariables & {
 	 * same token a second time — and so a handler can only get at it behind that gate.
 	 */
 	staffId: number
+	/**
+	 * The roles on that same token, set beside `staffId` so `requireDeveloper` can narrow a
+	 * staff route to developers without verifying the token again.
+	 */
+	staffRoles: string[]
 }
 
 export interface App extends HonoApp {

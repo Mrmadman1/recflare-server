@@ -74,13 +74,6 @@ const TEST_JWT_SECRET = 'test-jwt-secret'
 const tokenFor = (accountId: number, roles: string[] = []): Promise<string> =>
 	generateToken(String(accountId), '', 4, TEST_JWT_SECRET, roles)
 
-/**
- * A STAFF token — one carrying the `moderator` role, as `auth` stamps it from an
- * account's isModerator flag. The whole moderation surface is gated on this and nothing
- * else, so a test that forgets it is testing the 403.
- */
-const staffToken = (accountId: number): Promise<string> => tokenFor(accountId, ['moderator'])
-
 // A Discord app that is HALF configured: credentials seeded below, but wrangler.jsonc
 // leaves DISCORD_GUILD_ID / DISCORD_BENEFITS_ROLE_IDS empty. This is deliberately the most
 // dangerous half — an operator who registers an app and stops has something that can sign
@@ -686,17 +679,26 @@ async function staffGet(path: string, accountId: number, roles: string[] = ['mod
 	})
 }
 
-/** POST a JSON body to a staff endpoint as a moderator. */
-async function staffPost(path: string, accountId: number, body: unknown) {
+/** POST a JSON body to a staff endpoint as a moderator (or whatever `roles` names). */
+async function staffPost(
+	path: string,
+	accountId: number,
+	body: unknown,
+	roles: string[] = ['moderator']
+) {
 	return SELF.fetch(`https://example.com${path}`, {
 		method: 'POST',
 		headers: {
-			authorization: `Bearer ${await staffToken(accountId)}`,
+			authorization: `Bearer ${await tokenFor(accountId, roles)}`,
 			'content-type': 'application/json',
 		},
 		body: JSON.stringify(body),
 	})
 }
+
+/** POST a JSON body to a developer-only staff endpoint (the gifts) as a developer. */
+const devPost = (path: string, accountId: number, body: unknown) =>
+	staffPost(path, accountId, body, ['developer'])
 
 // Two refusals, not one. A 401 is an expired session — the SPA drops the token and sends
 // the player to sign in — while a 403 is a signed-in player who simply isn't staff, and
@@ -726,6 +728,11 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 			headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
 		})
 		expect(res.status).toBe(403)
+	}
+
+	// The gifts are narrower: a moderator is staff, but not a developer.
+	for (const path of writes.filter((p) => p.includes('/gift-'))) {
+		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
 
 	for (const path of paths) {
@@ -1294,7 +1301,7 @@ it('gifts a player tokens in a gift box', async () => {
 	await hub().fetch('http://do/all', { method: 'DELETE' })
 	await updateAccount(env.DB, 8300, { username: 'Giftee' })
 
-	const res = await staffPost('/api/staff/players/8300/gift-tokens', 8110, { amount: 500 })
+	const res = await devPost('/api/staff/players/8300/gift-tokens', 8110, { amount: 500 })
 	expect(res.status).toBe(200)
 	const body = (await res.json()) as { balance: number; giftId: number }
 	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS + 500)
@@ -1345,10 +1352,10 @@ it('refuses a token gift that is not a whole number, too large, or to nobody', a
 	// A fraction and a word are not amounts, and the cap binds in both directions, since a
 	// negative gift takes tokens away. Zero is allowed — see the empty box below.
 	for (const amount of [1.5, 'lots', 10_001, -10_001]) {
-		const res = await staffPost('/api/staff/players/8301/gift-tokens', 8110, { amount })
+		const res = await devPost('/api/staff/players/8301/gift-tokens', 8110, { amount })
 		expect(res.status).toBe(400)
 	}
-	expect((await staffPost('/api/staff/players/8399/gift-tokens', 8110, { amount: 5 })).status).toBe(
+	expect((await devPost('/api/staff/players/8399/gift-tokens', 8110, { amount: 5 })).status).toBe(
 		404
 	)
 	expect(await getPendingGifts(env.DB, 8301)).toEqual([])
@@ -1363,7 +1370,7 @@ it('takes tokens back on a negative gift, and cannot overdraw', async () => {
 	await hub().fetch('http://do/all', { method: 'DELETE' })
 	await updateAccount(env.DB, 8360, { username: 'Indebted' })
 
-	const res = await staffPost('/api/staff/players/8360/gift-tokens', 8110, { amount: -400 })
+	const res = await devPost('/api/staff/players/8360/gift-tokens', 8110, { amount: -400 })
 	expect(res.status).toBe(200)
 	const body = (await res.json()) as { balance: number; giftId: number }
 	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS - 400)
@@ -1397,7 +1404,7 @@ it('takes tokens back on a negative gift, and cannot overdraw', async () => {
 	// More than they hold changes nothing: no debit, no box, no audit row beyond the first.
 	// Under the cap, so this is the BALANCE refusing it and not the typo guard (they hold
 	// DEFAULT_STARTING_TOKENS - 400 by now).
-	const tooMuch = await staffPost('/api/staff/players/8360/gift-tokens', 8110, {
+	const tooMuch = await devPost('/api/staff/players/8360/gift-tokens', 8110, {
 		amount: -(DEFAULT_STARTING_TOKENS - 100),
 	})
 	expect(tooMuch.status).toBe(400)
@@ -1427,7 +1434,7 @@ it('sends tokens to everyone in a room, across its instances', async () => {
 	await inRoom(8372, 7700, 77102)
 	await inRoom(8373, 7701, 77103)
 
-	const res = await staffPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 250 })
+	const res = await devPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 250 })
 	expect(res.status).toBe(200)
 	expect(await res.json()).toEqual({
 		roomId: 7700,
@@ -1462,18 +1469,18 @@ it('sends tokens to everyone in a room, across its instances', async () => {
 // An empty room is a 404 rather than a silent success: a staffer who pressed the button
 // expects somebody to have been paid.
 it('refuses a room gift with nobody in the room, and a bad amount', async () => {
-	expect((await staffPost('/api/staff/rooms/7799/gift-tokens', 8110, { amount: 10 })).status).toBe(
+	expect((await devPost('/api/staff/rooms/7799/gift-tokens', 8110, { amount: 10 })).status).toBe(
 		404
 	)
 	expect(
-		(await staffPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 10_001 })).status
+		(await devPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 10_001 })).status
 	).toBe(400)
 })
 
 // Zero is a real gift here: nothing moves, and the player gets an empty box.
 it('sends an empty box on a zero token gift', async () => {
 	await updateAccount(env.DB, 8361, { username: 'Emptyhanded' })
-	const res = await staffPost('/api/staff/players/8361/gift-tokens', 8110, { amount: 0 })
+	const res = await devPost('/api/staff/players/8361/gift-tokens', 8110, { amount: 0 })
 	expect(res.status).toBe(200)
 	const body = (await res.json()) as { balance: number; giftId: number }
 	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS)
@@ -1551,7 +1558,7 @@ it('gifts a player a custom item in a gift box', async () => {
 	const item = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000001', 8331)
 
 	// Upper-cased on purpose: a GUID's case is not part of its identity.
-	const res = await staffPost('/api/staff/players/8330/gift-custom-item', 8110, {
+	const res = await devPost('/api/staff/players/8330/gift-custom-item', 8110, {
 		customAvatarItemId: item.CustomAvatarItemId.toUpperCase(),
 	})
 	expect(res.status).toBe(200)
@@ -1608,7 +1615,7 @@ it('refuses a custom item gift the store would refuse', async () => {
 	await grantCustomAvatarItem(env.DB, 8340, published.CustomAvatarItemId)
 
 	const gift = (customAvatarItemId: unknown, playerId = 8340) =>
-		staffPost(`/api/staff/players/${playerId}/gift-custom-item`, 8110, { customAvatarItemId })
+		devPost(`/api/staff/players/${playerId}/gift-custom-item`, 8110, { customAvatarItemId })
 
 	expect((await gift('')).status).toBe(400)
 	expect((await gift('no-such-item')).status).toBe(404)
@@ -1629,7 +1636,7 @@ it('gifts a player XP in a gift box', async () => {
 	await hub().fetch('http://do/all', { method: 'DELETE' })
 	await updateAccount(env.DB, 8350, { username: 'Climber' })
 
-	const res = await staffPost('/api/staff/players/8350/gift-xp', 8110, { amount: 25 })
+	const res = await devPost('/api/staff/players/8350/gift-xp', 8110, { amount: 25 })
 	expect(res.status).toBe(200)
 	const body = (await res.json()) as { giftId: number }
 	expect(body).toMatchObject({ level: 3, xp: 5, levelsGained: 2 })
@@ -1668,9 +1675,9 @@ it('gifts a player XP in a gift box', async () => {
 it('refuses an XP gift that is not a positive whole number, too large, or to nobody', async () => {
 	await updateAccount(env.DB, 8351, { username: 'Stuck' })
 	for (const amount of [0, -5, 1.5, 'lots', 101]) {
-		expect((await staffPost('/api/staff/players/8351/gift-xp', 8110, { amount })).status).toBe(400)
+		expect((await devPost('/api/staff/players/8351/gift-xp', 8110, { amount })).status).toBe(400)
 	}
-	expect((await staffPost('/api/staff/players/8395/gift-xp', 8110, { amount: 5 })).status).toBe(404)
+	expect((await devPost('/api/staff/players/8395/gift-xp', 8110, { amount: 5 })).status).toBe(404)
 	await expect(getProgression(env.DB, 8351)).resolves.toEqual({ PlayerId: 8351, Level: 1, XP: 0 })
 	expect(await auditRows('gift_xp', 8351)).toEqual([])
 })

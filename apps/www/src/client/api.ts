@@ -78,22 +78,35 @@ export function where(): Hosts {
  */
 const ADMIN_ROLES = new Set(['developer', 'moderator'])
 
+/** The session token's `role` claim, decoded WITHOUT verifying it. Malformed reads as none. */
+function tokenRoles(): string[] {
+	const payload = token?.split('.')[1]
+	if (!payload) return []
+	try {
+		const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+		const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')
+		const claims = JSON.parse(atob(padded)) as { role?: unknown }
+		return Array.isArray(claims.role) ? (claims.role as string[]) : []
+	} catch {
+		return []
+	}
+}
+
 /**
  * Whether the session token carries an admin role. Decodes the `role` claim WITHOUT
  * verifying it — a page holds no signing key, and faking one here only reveals buttons
  * whose endpoints reject the same token. A malformed token reads as "not admin".
  */
 export function isAdmin(): boolean {
-	const payload = token?.split('.')[1]
-	if (!payload) return false
-	try {
-		const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
-		const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')
-		const claims = JSON.parse(atob(padded)) as { role?: unknown }
-		return Array.isArray(claims.role) && claims.role.some((r) => ADMIN_ROLES.has(r as string))
-	} catch {
-		return false
-	}
+	return tokenRoles().some((r) => ADMIN_ROLES.has(r))
+}
+
+/**
+ * Whether the session token carries the `developer` role — the staff gifts are narrowed to
+ * it (www's `requireDeveloper`). Cosmetic in the same way as {@link isAdmin}.
+ */
+export function isDeveloper(): boolean {
+	return tokenRoles().includes('developer')
 }
 
 /**

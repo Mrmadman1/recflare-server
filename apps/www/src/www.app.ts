@@ -46,6 +46,7 @@ import {
 	giftXpHandler,
 	linkedAccountsHandler,
 	playerHistoryHandler,
+	requireDeveloper,
 	requireStaff,
 	searchReportsHandler,
 	topReportedHandler,
@@ -482,11 +483,12 @@ const app = new Hono<App>()
 	.get('/api/staff/players/:id', playerHistoryHandler)
 	.get('/api/staff/players/:id/linked', linkedAccountsHandler)
 	// The staff card on a player's profile page — account fixes the game has no endpoint for.
-	.post('/api/staff/players/:id/gift-tokens', giftTokensHandler)
-	.post('/api/staff/players/:id/gift-custom-item', giftCustomItemHandler)
-	.post('/api/staff/players/:id/gift-xp', giftXpHandler)
+	// The gifts create value from nothing, so they are developer-only, not all staff.
+	.post('/api/staff/players/:id/gift-tokens', requireDeveloper, giftTokensHandler)
+	.post('/api/staff/players/:id/gift-custom-item', requireDeveloper, giftCustomItemHandler)
+	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
-	.post('/api/staff/rooms/:roomId/gift-tokens', giftRoomTokensHandler)
+	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 
