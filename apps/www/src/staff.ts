@@ -4,6 +4,7 @@ import {
 	clearPasswordHash,
 	createGift,
 	getAccount,
+	getPlayerIdsInRoom,
 	getPresences,
 	movePlayerToDorm,
 	writeAuditLog,
@@ -673,23 +674,62 @@ export async function giftTokensHandler(c: Context<App>) {
 
 	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
 	const amount = Number(body.amount)
-	if (!Number.isInteger(amount)) {
-		return c.json({ error: 'Enter a whole number of tokens, positive or negative' }, 400)
-	}
-	const maxGift = intVar(c.env.MAX_TOKEN_GIFT, DEFAULT_MAX_TOKEN_GIFT)
-	if (Math.abs(amount) > maxGift) {
-		return c.json({ error: `A gift can carry at most ${maxGift.toLocaleString()} tokens` }, 400)
-	}
+	const refusal = tokenAmountRefusal(c, amount)
+	if (refusal !== null) return c.json({ error: refusal }, 400)
 	if ((await getAccount(c.env.DB, playerId)) === null) {
 		return c.json({ error: 'No such player' }, 404)
 	}
 
-	// Seed the signup grant first, as econ does before every credit: `creditCurrency` upserts,
-	// and a never-touched balance would otherwise start from this gift instead of the grant.
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const sent = await sendTokens(c, playerId, amount, startingTokens)
+	if (sent === null) {
+		const held = await getBalance(c.env.DB, playerId, CurrencyType.RecCenterTokens, startingTokens)
+		return c.json({ error: `They only have ${held.toLocaleString()} tokens to take` }, 400)
+	}
+
+	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, ...sent })
+	logger.info(amount < 0 ? 'staff took tokens back' : 'staff gifted tokens', {
+		moderatorId: staffId(c),
+		playerId,
+		amount,
+	})
+	return c.json({ playerId, amount, ...sent })
+}
+
+/**
+ * Why this token amount can't be sent, or null when it can. Shared by the one-player gift
+ * and the room-wide one so they agree on what an amount is: any whole number within the
+ * operator's cap, in either direction (see {@link sendTokens} for what each sign does).
+ */
+function tokenAmountRefusal(c: Context<App>, amount: number): string | null {
+	if (!Number.isInteger(amount)) return 'Enter a whole number of tokens, positive or negative'
+	const maxGift = intVar(c.env.MAX_TOKEN_GIFT, DEFAULT_MAX_TOKEN_GIFT)
+	if (Math.abs(amount) > maxGift) {
+		return `A gift can carry at most ${maxGift.toLocaleString()} tokens`
+	}
+	return null
+}
+
+/**
+ * Move one player's token balance by `amount`, box it and tell them — the whole of a token
+ * gift, for one player. Returns their resulting balance and the box's id, or null when a
+ * negative amount is more than they hold (nothing is changed, and no box is minted).
+ *
+ * A POSITIVE amount credits, as econ's own faucets do. A NEGATIVE one debits through the
+ * same guarded spend a purchase uses, so it cannot overdraw. ZERO moves nothing. All three
+ * mint a box — an empty or negative one has never been seen in the client, and finding out
+ * is the point.
+ *
+ * The signup grant is seeded first, as econ does before every credit: `creditCurrency`
+ * upserts the row, so a never-touched balance would otherwise start from this gift.
+ */
+async function sendTokens(
+	c: Context<App>,
+	playerId: number,
+	amount: number,
+	startingTokens: number
+): Promise<{ balance: number; giftId: number } | null> {
 	await ensureStartingBalances(c.env.DB, playerId, startingTokens)
-	// A NEGATIVE amount takes tokens back, through the same guarded debit a purchase spends
-	// with — so it can't overdraw, and a player who can't afford it keeps what they have.
 	if (amount < 0) {
 		const spent = await spendCurrency(
 			c.env.DB,
@@ -698,18 +738,8 @@ export async function giftTokensHandler(c: Context<App>) {
 			-amount,
 			startingTokens
 		)
-		if (!spent) {
-			const held = await getBalance(
-				c.env.DB,
-				playerId,
-				CurrencyType.RecCenterTokens,
-				startingTokens
-			)
-			return c.json({ error: `They only have ${held.toLocaleString()} tokens to take` }, 400)
-		}
+		if (!spent) return null
 	}
-	// Zero moves nothing and still sends a box — an empty one, for the same reason a negative
-	// one is allowed: nobody has seen what the client draws for it.
 	const balance =
 		amount > 0
 			? await creditCurrency(
@@ -726,13 +756,6 @@ export async function giftTokensHandler(c: Context<App>) {
 		Currency: amount,
 	})
 	const gift = await createGift(c.env.DB, playerId, content)
-
-	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, balance, giftId: gift.id })
-	logger.info(amount < 0 ? 'staff took tokens back' : 'staff gifted tokens', {
-		moderatorId: staffId(c),
-		playerId,
-		amount,
-	})
 
 	// The balance first, so the box's announcement lands on a total that already includes it.
 	try {
@@ -752,8 +775,57 @@ export async function giftTokensHandler(c: Context<App>) {
 		})
 	}
 	await announceGift(c, playerId, gift.id, content)
+	return { balance, giftId: gift.id }
+}
 
-	return c.json({ playerId, amount, balance, giftId: gift.id })
+/**
+ * Send tokens to EVERYONE standing in a room right now — every instance of it at once.
+ *
+ * The room is the audience, not one session: `getPlayerIdsInRoom` is the live, unexpired
+ * presence for that room across its instances, deduplicated, and it is read at the moment the
+ * button is pressed. Someone who arrives a second later gets nothing; someone whose presence
+ * has lapsed is already gone from it.
+ *
+ * Each player is paid exactly as the one-player gift pays them, one after another rather than
+ * at once: this is a handful of writes per player, and a busy room would otherwise open a
+ * hundred at a time. A player a negative amount can't be taken from is SKIPPED rather than
+ * failing the room — the ones who could afford it have already been debited by then — and the
+ * response says who was missed.
+ */
+export async function giftRoomTokensHandler(c: Context<App>) {
+	const roomId = Number(c.req.param('roomId'))
+	if (!Number.isInteger(roomId) || roomId <= 0) {
+		return c.json({ error: 'A numeric room id is required' }, 400)
+	}
+
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const amount = Number(body.amount)
+	const refusal = tokenAmountRefusal(c, amount)
+	if (refusal !== null) return c.json({ error: refusal }, 400)
+
+	const playerIds = await getPlayerIdsInRoom(c.env.DB, roomId)
+	if (playerIds.length === 0) {
+		return c.json({ error: 'Nobody is in that room right now' }, 404)
+	}
+
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const paid: number[] = []
+	const skipped: number[] = []
+	for (const playerId of playerIds) {
+		const sent = await sendTokens(c, playerId, amount, startingTokens)
+		if (sent === null) skipped.push(playerId)
+		else paid.push(playerId)
+	}
+
+	await recordPlayerAudit(c, 'gift_tokens_room', { roomId, amount, paid, skipped })
+	logger.info('staff gifted tokens to a room', {
+		moderatorId: staffId(c),
+		roomId,
+		amount,
+		paidCount: paid.length,
+		skippedCount: skipped.length,
+	})
+	return c.json({ roomId, amount, paid, skipped })
 }
 
 /**

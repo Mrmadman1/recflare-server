@@ -2155,7 +2155,12 @@ function PublicRoomView({
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
 			    role itself on the DELETE. */}
-			{isAdmin() && <StaffTakedown room={room} onTakenDown={onTakenDown} />}
+			{isAdmin() && (
+				<>
+					<StaffRoomTokens room={room} />
+					<StaffTakedown room={room} onTakenDown={onTakenDown} />
+				</>
+			)}
 		</>
 	)
 }
@@ -2166,6 +2171,63 @@ function PublicRoomView({
  * steps — a plain card, then the same accent-bordered confirm the ban form uses — since
  * this is the one thing on the site that can't be undone.
  */
+/**
+ * Pay everyone standing in the room, across every instance of it, from the room's own page.
+ * The audience is read when the button is pressed, so it is whoever is in there at that
+ * moment — there is nothing to pick and nobody to look up.
+ */
+function StaffRoomTokens({ room }: { room: OwnedRoom }) {
+	const [tokens, setTokens] = useState('')
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Staff</h2>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const amount = Number(tokens)
+						const res = await call<{ paid: number[]; skipped: number[] }>(
+							`/api/staff/rooms/${room.RoomId}/gift-tokens`,
+							{ authed: true, json: { amount } }
+						)
+						setTokens('')
+						const n = res.paid.length
+						const missed =
+							res.skipped.length > 0
+								? ` ${res.skipped.length} couldn't spare it and were skipped.`
+								: ''
+						return `Sent ${amount.toLocaleString()} tokens to ${n} player${n === 1 ? '' : 's'} in ^${room.Name}.${missed}`
+					})
+				}}
+			>
+				<label>
+					Gift tokens to everyone here
+					<span className="staff-gift">
+						<input
+							type="number"
+							step={1}
+							value={tokens}
+							required
+							onChange={(e) => setTokens(e.target.value)}
+						/>
+						<button type="submit" disabled={pending}>
+							{pending ? 'Sending…' : 'Send'}
+						</button>
+					</span>
+					<span className="hint">
+						Everyone in the room right now, across all of its instances. A negative amount takes
+						tokens back, skipping anyone who can&apos;t spare it.
+					</span>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+			</form>
+		</section>
+	)
+}
+
 function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: () => void }) {
 	const [confirming, setConfirming] = useState(false)
 	const { pending, error, run } = useAction()
@@ -2173,7 +2235,7 @@ function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: ()
 	if (!confirming) {
 		return (
 			<section className="card">
-				<h2>Staff</h2>
+				<h2>Delete room</h2>
 				<p className="muted">
 					Deleting a room removes it for everyone: the room, its subrooms and their saves, and its
 					picture. Photos players took in it stay on their profiles.

@@ -718,6 +718,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
 	]
+	writes.push('/api/staff/rooms/1/gift-tokens')
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
 		const res = await SELF.fetch(`https://example.com${path}`, {
@@ -1405,6 +1406,68 @@ it('takes tokens back on a negative gift, and cannot overdraw', async () => {
 	).resolves.toBe(DEFAULT_STARTING_TOKENS - 400)
 	expect(await getPendingGifts(env.DB, 8360)).toHaveLength(1)
 	expect(await auditRows('gift_tokens', 8360)).toHaveLength(1)
+})
+
+// The room is the audience, not one session: everyone standing in any instance of it, read
+// at the moment the button is pressed.
+it('sends tokens to everyone in a room, across its instances', async () => {
+	const inRoom = async (accountId: number, roomId: number, roomInstanceId: number) =>
+		setPresence(env.DB, {
+			accountId,
+			roomInstance: { roomId, roomInstanceId },
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	// Two instances of room 7700, plus a player in a different room who must not be paid.
+	await inRoom(8370, 7700, 77101)
+	await inRoom(8371, 7700, 77101)
+	await inRoom(8372, 7700, 77102)
+	await inRoom(8373, 7701, 77103)
+
+	const res = await staffPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 250 })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		roomId: 7700,
+		amount: 250,
+		paid: [8370, 8371, 8372],
+		skipped: [],
+	})
+
+	for (const playerId of [8370, 8371, 8372]) {
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS + 250)
+		expect(await getPendingGifts(env.DB, playerId)).toHaveLength(1)
+	}
+	// The player in the other room is untouched — no box, and no balance row touched.
+	expect(await getPendingGifts(env.DB, 8373)).toEqual([])
+
+	const { results } = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log
+		 WHERE action = 'gift_tokens_room' AND json_extract(data, '$.roomId') = 7700`
+	).all<{ player_id: number; data: string }>()
+	expect(results).toHaveLength(1)
+	expect(results[0].player_id).toBe(8110)
+	expect(JSON.parse(results[0].data)).toEqual({
+		roomId: 7700,
+		amount: 250,
+		paid: [8370, 8371, 8372],
+		skipped: [],
+	})
+})
+
+// An empty room is a 404 rather than a silent success: a staffer who pressed the button
+// expects somebody to have been paid.
+it('refuses a room gift with nobody in the room, and a bad amount', async () => {
+	expect((await staffPost('/api/staff/rooms/7799/gift-tokens', 8110, { amount: 10 })).status).toBe(
+		404
+	)
+	expect(
+		(await staffPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 10_001 })).status
+	).toBe(400)
 })
 
 // Zero is a real gift here: nothing moves, and the player gets an empty box.

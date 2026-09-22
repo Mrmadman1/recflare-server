@@ -41,6 +41,7 @@ import {
 	createReportHandler,
 	getReportHandler,
 	giftCustomItemHandler,
+	giftRoomTokensHandler,
 	giftTokensHandler,
 	giftXpHandler,
 	linkedAccountsHandler,
@@ -484,6 +485,8 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/gift-tokens', giftTokensHandler)
 	.post('/api/staff/players/:id/gift-custom-item', giftCustomItemHandler)
 	.post('/api/staff/players/:id/gift-xp', giftXpHandler)
+	// Everyone standing in a room, across all of its instances.
+	.post('/api/staff/rooms/:roomId/gift-tokens', giftRoomTokensHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 
