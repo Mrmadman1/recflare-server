@@ -31,7 +31,7 @@ import { app as match, scheduled as matchScheduled } from '../../match/src/match
 import notify from '../../notify/src/notify.app'
 import ns from '../../ns/src/ns.app'
 import playersettings from '../../playersettings/src/playersettings.app'
-import rooms from '../../rooms/src/rooms.app'
+import { app as rooms, scheduled as roomsScheduled } from '../../rooms/src/rooms.app'
 import storage from '../../storage/src/storage.app'
 
 import type { Env } from './context'
@@ -106,8 +106,15 @@ export default {
 		return services[resolved.name].fetch(resolved.request, env, ctx)
 	},
 
-	// Only `match` runs a cron in the split deployment; this worker owns its presence sweep.
-	scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> | void {
-		return matchScheduled(controller, env, ctx)
+	// `match` (presence sweep) and `rooms` (stale vote-to-kick ballots) each run a
+	// `*/5 * * * *` cron in the split deployment; this worker's one trigger fires both.
+	// Each schedules its work on `ctx.waitUntil`, so the runtime waits for both.
+	scheduled(
+		controller: ScheduledController,
+		env: Env,
+		ctx: ExecutionContext
+	): Promise<void> | void {
+		matchScheduled(controller, env, ctx)
+		roomsScheduled(controller, env, ctx)
 	},
 } satisfies ExportedHandler<Env>

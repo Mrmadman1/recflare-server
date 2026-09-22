@@ -1,7 +1,12 @@
-import { adminSecretsStore, env, SELF } from 'cloudflare:test'
+import {
+	adminSecretsStore,
+	createExecutionContext,
+	createScheduledController,
+	env,
+	SELF,
+	waitOnExecutionContext,
+} from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
-
-import '../../rooms.app'
 
 import {
 	AUDIT_LOG_SCHEMA_DDL,
@@ -16,8 +21,10 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as ROOM_VOTE_SCHEMA_DDL } from '../../../../api/src/votes-db'
 import { NotificationType } from '../../../../notify/src/notification-types'
 import importRooms from '../../../static/ImportRooms.json'
+import { scheduled } from '../../rooms.app'
 
 import type { Room } from '@repo/domain'
 import type { Env } from '../../context'
@@ -108,6 +115,8 @@ beforeAll(async () => {
 	// The audit log the staff takedown writes to. Owned by `api`'s migrations; built here
 	// directly, the way `notify`'s tests do.
 	for (const stmt of AUDIT_LOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Vote-to-kick ballots (owned by `api`) — the cron here sweeps the stale ones.
+	for (const stmt of ROOM_VOTE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -5321,5 +5330,50 @@ describe('room name validation', () => {
 			expect(body.success, name).toBe(true)
 			expect(body.value.SubRooms.some((s) => s.Name === name)).toBe(true)
 		}
+	})
+})
+
+describe('room_vote sweep cron', () => {
+	async function castBallot(voterId: number, agoMs: number, init = 0): Promise<void> {
+		await env.DB.prepare(
+			`INSERT INTO room_vote (game_session_id, player_id, response, voter_id, voted_at, init)
+			 VALUES (1, 205, 1, ?1, ?2, ?3)`
+		)
+			.bind(voterId, new Date(Date.now() - agoMs).toISOString(), init)
+			.run()
+	}
+
+	async function voterIds(): Promise<number[]> {
+		const rows = await env.DB.prepare('SELECT voter_id FROM room_vote ORDER BY voter_id').all<{
+			voter_id: number
+		}>()
+		return rows.results.map((r) => r.voter_id)
+	}
+
+	it('deletes ballots older than 5 minutes and keeps the rest', async () => {
+		await env.DB.prepare('DELETE FROM room_vote').run()
+		// A vote called long ago, and one that just closed: both dead weight.
+		await castBallot(1, 6 * 60_000, 1)
+		await castBallot(2, 5 * 60_000 + 1_000)
+		// A caller still inside their 5-minute cooldown, an open vote, and its answer.
+		await castBallot(3, 4 * 60_000 + 30_000, 1)
+		await castBallot(4, 30_000, 1)
+		await castBallot(5, 0)
+
+		// Driven through the module's own export rather than the `exports` proxy — a
+		// ScheduledController can't cross the isolate boundary the proxy serializes over.
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		expect(await voterIds()).toEqual([3, 4, 5])
+	})
+
+	it('is a no-op on an empty table', async () => {
+		await env.DB.prepare('DELETE FROM room_vote').run()
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+		expect(await voterIds()).toEqual([])
 	})
 })

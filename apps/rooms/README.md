@@ -37,6 +37,13 @@ Reads are the exception: they carry no envelope at all. A paged read (the save h
 `{ Results, TotalResults, TotalCount }` wrapper — `TotalResults` and `TotalCount` are the
 same number, because the client's paged DTO and the reference disagree on the name.
 
+## Cron
+
+A `*/5 * * * *` cron (`scheduled`) deletes vote-to-kick ballots in `room_vote` older than
+5 minutes. The table is the `api` worker's and append-only; a vote stays open for 60
+seconds and the caller cooldown looks back 5 minutes, so nothing reads an older ballot.
+The `mono` facade fires this sweep from its own trigger alongside `match`'s presence sweep.
+
 ## Development
 
 ### Run in dev mode

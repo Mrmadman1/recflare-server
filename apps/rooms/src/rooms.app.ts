@@ -163,7 +163,7 @@ import {
 import type { Context } from 'hono'
 import type { RoomBan, RoomBanRecord, RoomPermission } from '@repo/domain'
 import type { MessageReceivedPayload } from '../../notify/src/notification-payloads'
-import type { App } from './context'
+import type { App, Env } from './context'
 
 /**
  * Room server. Rooms are stored in D1 as JSON blobs with generated columns for
@@ -4199,4 +4199,42 @@ app.get(
 	)
 )
 
-export default app
+/**
+ * How long a `room_vote` ballot is kept. The table is append-only (see the `api` worker's
+ * votes-db.ts, which owns the schema) and nothing there reads a ballot older than this:
+ * a vote stays open for 60 seconds (`VOTE_WINDOW_MS`) and the tally only counts ballots
+ * from the open vote's call on, and the caller throttle looks back exactly
+ * `VOTE_CALL_COOLDOWN_MS` — 5 minutes. Older rows are dead weight, so the cron drops them.
+ * Must not be shorter than that cooldown, or a purge would let a caller call again early.
+ */
+const ROOM_VOTE_RETENTION_MS = 5 * 60_000
+
+/** Delete every ballot cast before `now - ROOM_VOTE_RETENTION_MS`. Returns rows removed. */
+async function deleteStaleRoomVotes(db: D1Database, now = Date.now()): Promise<number> {
+	const res = await db
+		.prepare('DELETE FROM room_vote WHERE voted_at < ?1')
+		.bind(new Date(now - ROOM_VOTE_RETENTION_MS).toISOString())
+		.run()
+	return res.meta.changes ?? 0
+}
+
+/** Cron: sweep `room_vote` ballots older than {@link ROOM_VOTE_RETENTION_MS}. */
+async function sweepStaleRoomVotes(env: Env): Promise<void> {
+	const removed = await deleteStaleRoomVotes(env.DB)
+	// The tagged logger is request-scoped (its middleware never runs for a cron), so
+	// log plainly here — Workers observability picks it up either way.
+	console.log(`room_vote sweep: removed ${removed} stale ballots`)
+}
+
+// The HTTP surface is a standard Hono app, exported by name so it can be mounted
+// uniformly like every other worker (e.g. by the `mono` facade). The cron that sweeps
+// stale vote-to-kick ballots is exported alongside it.
+export { app }
+
+export const scheduled: ExportedHandlerScheduledHandler<Env> = (_controller, env, ctx) => {
+	ctx.waitUntil(sweepStaleRoomVotes(env))
+}
+
+// Standalone entry: a Worker only runs `scheduled` when it's on the default export,
+// so rooms keeps the object form the runtime requires to fire its `*/5 * * * *` cron.
+export default { fetch: app.fetch, scheduled } satisfies ExportedHandler<Env>

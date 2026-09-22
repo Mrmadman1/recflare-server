@@ -6,9 +6,12 @@
  * record of what happened rather than a tally that gets rewritten — the tally is computed
  * from the rows.
  *
- * The rows outlive the vote. Nothing deletes them when a session ends, and nothing needs to:
- * a ballot is keyed to its `game_session_id`, and instance ids are not reused, so an old
- * session's votes can never be counted into a new one's.
+ * The rows outlive the vote, but not by much: the `rooms` worker's cron deletes ballots
+ * older than 5 minutes (its `ROOM_VOTE_RETENTION_MS`), which is the longest anything here
+ * looks back — `VOTE_CALL_COOLDOWN_MS`. Nothing deletes them when a session ends, and
+ * nothing needs to: a ballot is keyed to its `game_session_id`, and instance ids are not
+ * reused, so an old session's votes can never be counted into a new one's. Raising the
+ * cooldown means raising that retention too.
  *
  * The `api` worker owns this schema/migration (migrations/0023_room_vote.sql and
  * 0026_room_vote_init.sql, applied under

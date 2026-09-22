@@ -49,6 +49,12 @@
 			"secret_name": "JWT_SECRET"
 		}
 	],
+	// Vote-to-kick sweep. `room_vote` (owned by `api`) is append-only and a ballot
+	// matters for at most 5 minutes — a vote is open for 60s and the caller cooldown
+	// looks back 5 minutes — so the cron drops everything older. Every 5 minutes.
+	"triggers": {
+		"crons": ["*/5 * * * *"]
+	},
 	"upload_source_maps": true,
 	"observability": {
 		"enabled": false
