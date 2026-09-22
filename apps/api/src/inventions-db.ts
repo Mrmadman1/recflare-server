@@ -39,6 +39,13 @@ export const SCHEMA_DDL: string[] = [
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_invention_id ON invention (id)`,
 	`CREATE INDEX IF NOT EXISTS idx_invention_creator ON invention (creator_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_invention_featured ON invention (is_featured)`,
+	// Backs `searchInventions`' newest-first paging (migrations/0027). Its WHERE must match
+	// `VISIBLE_IN_FEEDS` term for term or SQLite won't use it.
+	`CREATE INDEX IF NOT EXISTS idx_invention_feed_newest
+		ON invention (json_extract(data, '$.CreatedAt') DESC, id DESC)
+		WHERE is_published = 1
+		  AND hide_from_player = 0
+		  AND COALESCE(json_extract(data, '$.Accessibility'), 0) <> 2`,
 	`CREATE TABLE IF NOT EXISTS invention_interaction (
 		player_id INTEGER NOT NULL,
 		invention_id INTEGER NOT NULL,
@@ -873,6 +880,9 @@ export const INVENTION_ACCESSIBILITY = {
  * The "anyone may come across this" test the browse feeds and search share: published, not
  * hidden, and not unlisted. An unlisted invention is still reachable BY ID — that is what
  * unlisted means — so the by-id reads deliberately don't apply it.
+ *
+ * `idx_invention_feed_newest` (SCHEMA_DDL, migrations/0027) is a partial index over exactly
+ * these terms — edit one here and edit it there, or the feed goes back to a full scan.
  */
 const VISIBLE_IN_FEEDS = [
 	'is_published = 1',
