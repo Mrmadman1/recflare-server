@@ -36,6 +36,8 @@ import {
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
 	ensureStartingBalances,
+	getBalance,
+	spendCurrency,
 } from '../../econ/src/balance-db'
 import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/inventory-custom-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
@@ -647,7 +649,8 @@ async function announceGift(
 }
 
 /**
- * Send a player RecCenterTokens in a gift box.
+ * Send a player RecCenterTokens in a gift box — or, with a NEGATIVE amount, take some back.
+ *
  *
  * The same shape as econ's own server-handed currency (a game reward's Laser Tag tickets):
  * the balance is CREDITED here — opening a box only deletes it, it grants nothing — then a
@@ -658,6 +661,11 @@ async function announceGift(
  *
  * Both frames are best-effort: the tokens are banked by the time they go out, and an offline
  * player meets the box in `GET /api/avatar/v2/gifts` and the balance on their next read.
+ *
+ * A negative amount debits through the same guarded spend a purchase uses, so it cannot
+ * overdraw: a player who can't afford it is refused and keeps what they have. Zero moves
+ * nothing at all. Both still mint a box, carrying that `Currency` — nobody has seen what the
+ * client makes of an empty or a negative one, and finding out is the point.
  */
 export async function giftTokensHandler(c: Context<App>) {
 	const playerId = playerIdParam(c)
@@ -665,11 +673,11 @@ export async function giftTokensHandler(c: Context<App>) {
 
 	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
 	const amount = Number(body.amount)
-	if (!Number.isInteger(amount) || amount <= 0) {
-		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
+	if (!Number.isInteger(amount)) {
+		return c.json({ error: 'Enter a whole number of tokens, positive or negative' }, 400)
 	}
 	const maxGift = intVar(c.env.MAX_TOKEN_GIFT, DEFAULT_MAX_TOKEN_GIFT)
-	if (amount > maxGift) {
+	if (Math.abs(amount) > maxGift) {
 		return c.json({ error: `A gift can carry at most ${maxGift.toLocaleString()} tokens` }, 400)
 	}
 	if ((await getAccount(c.env.DB, playerId)) === null) {
@@ -680,13 +688,38 @@ export async function giftTokensHandler(c: Context<App>) {
 	// and a never-touched balance would otherwise start from this gift instead of the grant.
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 	await ensureStartingBalances(c.env.DB, playerId, startingTokens)
-	const balance = await creditCurrency(
-		c.env.DB,
-		playerId,
-		CurrencyType.RecCenterTokens,
-		amount,
-		startingTokens
-	)
+	// A NEGATIVE amount takes tokens back, through the same guarded debit a purchase spends
+	// with — so it can't overdraw, and a player who can't afford it keeps what they have.
+	if (amount < 0) {
+		const spent = await spendCurrency(
+			c.env.DB,
+			playerId,
+			CurrencyType.RecCenterTokens,
+			-amount,
+			startingTokens
+		)
+		if (!spent) {
+			const held = await getBalance(
+				c.env.DB,
+				playerId,
+				CurrencyType.RecCenterTokens,
+				startingTokens
+			)
+			return c.json({ error: `They only have ${held.toLocaleString()} tokens to take` }, 400)
+		}
+	}
+	// Zero moves nothing and still sends a box — an empty one, for the same reason a negative
+	// one is allowed: nobody has seen what the client draws for it.
+	const balance =
+		amount > 0
+			? await creditCurrency(
+					c.env.DB,
+					playerId,
+					CurrencyType.RecCenterTokens,
+					amount,
+					startingTokens
+				)
+			: await getBalance(c.env.DB, playerId, CurrencyType.RecCenterTokens, startingTokens)
 
 	const content = staffGiftContent({
 		CurrencyType: CurrencyType.RecCenterTokens,
@@ -695,7 +728,11 @@ export async function giftTokensHandler(c: Context<App>) {
 	const gift = await createGift(c.env.DB, playerId, content)
 
 	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, balance, giftId: gift.id })
-	logger.info('staff gifted tokens', { moderatorId: staffId(c), playerId, amount })
+	logger.info(amount < 0 ? 'staff took tokens back' : 'staff gifted tokens', {
+		moderatorId: staffId(c),
+		playerId,
+		amount,
+	})
 
 	// The balance first, so the box's announcement lands on a total that already includes it.
 	try {

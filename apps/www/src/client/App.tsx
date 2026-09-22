@@ -1194,7 +1194,13 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 							json: { amount },
 						})
 						setTokens('')
-						return `Sent ${amount.toLocaleString()} tokens. @${account.username} now has ${res.balance.toLocaleString()}.`
+						const what =
+							amount < 0
+								? `Took ${Math.abs(amount).toLocaleString()} tokens back`
+								: amount === 0
+									? 'Sent an empty box'
+									: `Sent ${amount.toLocaleString()} tokens`
+						return `${what}. @${account.username} now has ${res.balance.toLocaleString()}.`
 					})
 				}}
 			>
@@ -1203,9 +1209,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 					<span className="staff-gift">
 						<input
 							type="number"
-							min={1}
 							step={1}
-							inputMode="numeric"
 							value={tokens}
 							required
 							onChange={(e) => setTokens(e.target.value)}
@@ -1215,7 +1219,9 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 						</button>
 					</span>
 					<span className="hint">
-						Arrives as a gift box, and is added to their balance right away.
+						Arrives as a gift box, and is added to their balance right away. A negative amount takes
+						tokens back instead — it still sends a box, and it can&apos;t take more than they have.
+						Zero sends an empty box and moves nothing.
 					</span>
 				</label>
 				{gift.error && <p className="error">{gift.error}</p>}

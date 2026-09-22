@@ -1339,9 +1339,11 @@ it('gifts a player tokens in a gift box', async () => {
 	])
 })
 
-it('refuses a token gift that is not a positive whole number, too large, or to nobody', async () => {
+it('refuses a token gift that is not a whole number, too large, or to nobody', async () => {
 	await updateAccount(env.DB, 8301, { username: 'NotGifted' })
-	for (const amount of [0, -5, 1.5, 'lots', 10_001]) {
+	// A fraction and a word are not amounts, and the cap binds in both directions, since a
+	// negative gift takes tokens away. Zero is allowed — see the empty box below.
+	for (const amount of [1.5, 'lots', 10_001, -10_001]) {
 		const res = await staffPost('/api/staff/players/8301/gift-tokens', 8110, { amount })
 		expect(res.status).toBe(400)
 	}
@@ -1350,6 +1352,73 @@ it('refuses a token gift that is not a positive whole number, too large, or to n
 	)
 	expect(await getPendingGifts(env.DB, 8301)).toEqual([])
 	expect(await auditRows('gift_tokens', 8301)).toEqual([])
+})
+
+// A negative gift takes tokens back — through the same guarded debit a purchase spends with,
+// so it cannot overdraw. It still mints a box, carrying the negative amount: what the client
+// makes of one is the thing being found out.
+it('takes tokens back on a negative gift, and cannot overdraw', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	await updateAccount(env.DB, 8360, { username: 'Indebted' })
+
+	const res = await staffPost('/api/staff/players/8360/gift-tokens', 8110, { amount: -400 })
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { balance: number; giftId: number }
+	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS - 400)
+	await expect(
+		getBalance(env.DB, 8360, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(DEFAULT_STARTING_TOKENS - 400)
+
+	const gifts = await getPendingGifts(env.DB, 8360)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({ Id: body.giftId, Currency: -400 })
+
+	// The balance frame carries the resulting total, as it does for a credit.
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+	expect(frames[0].data).toMatchObject({ Balance: DEFAULT_STARTING_TOKENS - 400 })
+
+	expect(await auditRows('gift_tokens', 8360)).toEqual([
+		{
+			actor: 8110,
+			data: {
+				playerId: 8360,
+				amount: -400,
+				balance: DEFAULT_STARTING_TOKENS - 400,
+				giftId: body.giftId,
+			},
+		},
+	])
+
+	// More than they hold changes nothing: no debit, no box, no audit row beyond the first.
+	// Under the cap, so this is the BALANCE refusing it and not the typo guard (they hold
+	// DEFAULT_STARTING_TOKENS - 400 by now).
+	const tooMuch = await staffPost('/api/staff/players/8360/gift-tokens', 8110, {
+		amount: -(DEFAULT_STARTING_TOKENS - 100),
+	})
+	expect(tooMuch.status).toBe(400)
+	await expect(
+		getBalance(env.DB, 8360, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(DEFAULT_STARTING_TOKENS - 400)
+	expect(await getPendingGifts(env.DB, 8360)).toHaveLength(1)
+	expect(await auditRows('gift_tokens', 8360)).toHaveLength(1)
+})
+
+// Zero is a real gift here: nothing moves, and the player gets an empty box.
+it('sends an empty box on a zero token gift', async () => {
+	await updateAccount(env.DB, 8361, { username: 'Emptyhanded' })
+	const res = await staffPost('/api/staff/players/8361/gift-tokens', 8110, { amount: 0 })
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { balance: number; giftId: number }
+	expect(body.balance).toBe(DEFAULT_STARTING_TOKENS)
+
+	const gifts = await getPendingGifts(env.DB, 8361)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({ Id: body.giftId, Currency: 0 })
+	expect(await auditRows('gift_tokens', 8361)).toMatchObject([{ data: { amount: 0 } }])
 })
 
 // An account that has never renamed itself stores no count and is read as the default 3, so
