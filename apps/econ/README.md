@@ -487,6 +487,16 @@ failure can't leave a box promising XP nobody was credited.
 - **Deliberately smaller than a level.** The first level costs 10 XP, so a single action
   can't be a level-up — it takes two rewards to reach level 2, and the early levels are paced
   by the hourly cooldown rather than cleared in one match.
+- **A NEW activity pays 250 tokens on top** (`NEW_ACTIVITY_BONUS_TOKENS`): the first claim
+  ever in a `giftContext`, whichever reward type asked for it — `isNewActivity` counts the
+  player's rows in that context right after the claim and is true when the claim's own row
+  is the only one. Counting after the write is what stops two asks landing together
+  (`FirstActivityOfDay` and `PostGameActivity` for the same match) from both paying: a race
+  can skip the bonus, never double it. The tokens are credited to the RecCenterTokens
+  balance (`StorefrontBalanceUpdate` with the resulting total) and arrive in a **second box**
+  of their own — `GiftContext` 51 (`GameRewardsTokens`), `Currency` 250, no XP — after the
+  reward's, so the player sees what they were for. The contextless `''` bucket is not an
+  activity and never pays it.
 - **The response stays `[]`.** It's what the client already accepts, and the reward is
   delivered as a box, so there's nothing to put in the body. The reference answers its own
   (different) flow with `{ error, success, value: null }`, not a list of rewards.

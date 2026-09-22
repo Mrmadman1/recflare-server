@@ -78,3 +78,30 @@ export async function claimReward(
 		.first<{ grant_count: number }>()
 	return row?.grant_count ?? null
 }
+
+/**
+ * Whether the claim just written by {@link claimReward} is the player's FIRST in
+ * `giftContext` — across every reward type, so an activity is "new" once, not once per
+ * type it happens to be asked under. Call it right after the claim with the count it
+ * returned: it is true when that claim INSERTED its row (`grantCount` 1; a repeat past the
+ * cooldown is 2+) and the player's rows in that context are exactly that one.
+ *
+ * Counting AFTER the claim is what keeps two asks landing together (say
+ * `FirstActivityOfDay` and `PostGameActivity` for the same match) from both reading "new":
+ * D1 serializes the inserts, so at most the first insert's count is 1 and the second's is
+ * 2 — a race can skip the bonus, never pay it twice. The contextless `''` bucket is not an
+ * activity and is never new.
+ */
+export async function isNewActivity(
+	db: D1Database,
+	accountId: number,
+	giftContext: string,
+	grantCount: number
+): Promise<boolean> {
+	if (giftContext === '' || grantCount !== 1) return false
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM reward_status WHERE account_id = ?1 AND gift_context = ?2')
+		.bind(accountId, giftContext)
+		.first<{ n: number }>()
+	return row?.n === 1
+}

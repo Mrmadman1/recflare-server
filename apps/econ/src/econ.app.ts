@@ -147,7 +147,7 @@ import {
 	UpdateRoomCurrencyRequest,
 	UpsertRoomConsumableRequest,
 } from './openapi'
-import { claimReward } from './reward-db'
+import { claimReward, isNewActivity } from './reward-db'
 import {
 	awardRoomConsumable,
 	getRoomConsumable,
@@ -2140,6 +2140,46 @@ const GIFT_CONTEXT_GAME_REWARDS = 50
 
 /** Shown on the box when the client asks for a reward without saying what to call it. */
 const DEFAULT_GAME_REWARD_MESSAGE = 'Reward earned!'
+
+/**
+ * Tokens paid the FIRST time a player completes an activity — a `giftContext` no row of
+ * theirs in `reward_status` has seen before, whatever the reward type. A one-off per
+ * activity on top of the hourly XP: the reward for trying something new, sized as a
+ * visible nudge (a cheap catalog item) rather than an income, since the catalog of
+ * activities is finite and each pays it exactly once.
+ */
+const NEW_ACTIVITY_BONUS_TOKENS = 250
+
+/**
+ * `GiftContext.GameRewardsTokens` — the tokens variant of {@link GIFT_CONTEXT_GAME_REWARDS},
+ * on the box the new-activity bonus arrives in.
+ */
+const GIFT_CONTEXT_GAME_REWARDS_TOKENS = 51
+
+/** The message on the new-activity bonus box. */
+const NEW_ACTIVITY_BONUS_MESSAGE = 'New activity bonus!'
+
+/**
+ * The gift-drop the new-activity bonus hands over: tokens in a box, no item, no XP. Like
+ * {@link toGameRewardDrop}, `grantGiftDrop` creates only the box from it — the tokens are
+ * credited to the balance separately, and the copy here is what the box displays.
+ */
+function toNewActivityBonusDrop(): StoreGiftDrop {
+	return {
+		FriendlyName: '',
+		Tooltip: '',
+		ConsumableItemDesc: '',
+		AvatarItemDesc: '',
+		AvatarItemType: null,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		Rarity: 0,
+		Context: GIFT_CONTEXT_GAME_REWARDS_TOKENS,
+		Currency: NEW_ACTIVITY_BONUS_TOKENS,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Xp: 0,
+	}
+}
 
 /**
  * The gift-drop a claimed game reward hands over: XP in a box, no item. Every item field is
@@ -5325,6 +5365,10 @@ const app = new Hono<App>({ strict: false })
 	// (`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity's rewards — an avatar item
 	// granted into the inventory, or Laser Tag's ticket payout — and the box carries it, with
 	// the activity's own `GiftContext`. A context the table doesn't know gets the XP-only box.
+	//
+	// And the FIRST claim ever in a context — a new activity for this player, whichever type
+	// asked — pays NEW_ACTIVITY_BONUS_TOKENS on top, credited to the balance and delivered in
+	// a second box of its own so the player sees what the tokens were for.
 	.post(
 		'/api/gamerewards/v1/request',
 		describeRoute({
@@ -5336,8 +5380,9 @@ const app = new Hono<App>({ strict: false })
 				'owed another reward while the same one is not; an ask with no `giftContext` keys on',
 				'the empty context. A `giftContext` that names an activity in `quest-rewards.json`',
 				'(`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity’s rewards and grants it;',
-				'any other claim pays XP only. The reward rides in a gift box, so a claim and a',
-				'rejected (on-cooldown) ask both answer `[]`.',
+				'any other claim pays XP only. The first claim ever in a `giftContext` — a new activity',
+				'for the player — also pays a one-off 250 tokens, in a box of its own. The reward rides',
+				'in a gift box, so a claim and a rejected (on-cooldown) ask both answer `[]`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
@@ -5389,6 +5434,26 @@ const app = new Hono<App>({ strict: false })
 			}
 			const granted = await grantGiftDrop(c, id, drop, message)
 			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+			// A new activity pays its token bonus in a second box — after the reward's own, so
+			// the player sees the reward they asked for first and the bonus as the extra it is.
+			// Same order as the currency reward above: balance first, then the box that shows it.
+			let bonusGiftId: number | null = null
+			if (await isNewActivity(c.env.DB, id, giftContext, claimed)) {
+				const bonus = toNewActivityBonusDrop()
+				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+				await ensureStartingBalances(c.env.DB, id, startingTokens)
+				const balance = await creditCurrency(
+					c.env.DB,
+					id,
+					bonus.CurrencyType,
+					bonus.Currency,
+					startingTokens
+				)
+				await pushBalanceUpdate(c, id, bonus.CurrencyType, balance)
+				const bonusGift = await grantGiftDrop(c, id, bonus, NEW_ACTIVITY_BONUS_MESSAGE)
+				await pushGiftReceived(c, id, bonusGift, NEW_ACTIVITY_BONUS_MESSAGE, COACH_ACCOUNT_ID)
+				bonusGiftId = bonusGift.id
+			}
 			// Every grant moves the bar, whether or not it crossed a level.
 			await pushProgressionUpdate(c, id, progression)
 			// …and every level crossed is worth a box of its own tier.
@@ -5404,6 +5469,8 @@ const app = new Hono<App>({ strict: false })
 				levelsGained,
 				levelXp: progression.XP,
 				giftId: granted.id,
+				newActivityBonus: bonusGiftId === null ? 0 : NEW_ACTIVITY_BONUS_TOKENS,
+				bonusGiftId,
 			})
 			return c.json([])
 		}

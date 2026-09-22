@@ -4770,6 +4770,8 @@ describe('econ endpoints', () => {
 			ConsumableItemDesc: string
 			GiftRarity: number
 			GiftContext: number
+			Currency: number
+			CurrencyType: number
 		}>
 	}
 
@@ -5187,10 +5189,13 @@ describe('econ endpoints', () => {
 		)
 		expect(goblin.status).toBe(200)
 		expect(await goblin.json()).toEqual([])
+		// Two boxes: the quest reward, and the new-activity token bonus (covered below) that a
+		// first-ever claim in a context also pays.
 		const boxes = await giftBoxes('83')
-		expect(boxes).toHaveLength(1)
+		expect(boxes).toHaveLength(2)
 		const box = boxes[0]
 		expect(box).toMatchObject({ Xp: 5, Message: 'Quest complete', GiftContext: 4003 })
+		expect(boxes[1]).toMatchObject({ GiftContext: 51, Currency: 250 })
 		expect(box?.AvatarItemDesc).not.toBe('')
 		const row = questRewards.Quest_Goblin_S.find((r) => r.AvatarItemDesc === box?.AvatarItemDesc)
 		expect(row).toBeDefined()
@@ -5220,7 +5225,9 @@ describe('econ endpoints', () => {
 		expect(
 			await getBalance(env.DB, 83, CurrencyType.LaserTagTickets, DEFAULT_STARTING_TOKENS)
 		).toBe(before + 50)
-		const ticketBox = (await giftBoxes('83'))[1]
+		const ticketBox = (await giftBoxes('83')).find(
+			(b) => b.CurrencyType === CurrencyType.LaserTagTickets
+		)
 		expect(ticketBox).toMatchObject({
 			Currency: 50,
 			CurrencyType: CurrencyType.LaserTagTickets,
@@ -5232,10 +5239,10 @@ describe('econ endpoints', () => {
 			NotificationType.StorefrontBalanceUpdate
 		)
 
-		// An activity the table doesn't know pays the plain XP box, as before. (The LAST box:
-		// the two claims above also crossed level 1, and that level-up box sits in between.)
+		// An activity the table doesn't know pays the plain XP box, as before — the last
+		// GameRewards box, behind Bowling's own new-activity bonus.
 		expect((await request('rewardType=PostGameActivity&giftContext=Bowling')).status).toBe(200)
-		const plain = (await giftBoxes('83')).at(-1)
+		const plain = (await giftBoxes('83')).findLast((b) => b.GiftContext === 50)
 		expect(plain).toMatchObject({ Xp: 5, AvatarItemDesc: '', Currency: 0, GiftContext: 50 })
 
 		// A reward the player already owns is never drawn again: Dodgeball has three rows, so
@@ -5255,6 +5262,75 @@ describe('econ endpoints', () => {
 			else expect(latest).toMatchObject({ AvatarItemDesc: '', GiftContext: 50 })
 		}
 		expect(handed.toSorted()).toEqual(dodgeball.toSorted())
+	})
+
+	test('the first claim ever in a giftContext pays a one-off 250-token bonus', async () => {
+		const request = async (body: string) =>
+			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('84')),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body,
+			})
+		const tokens = () =>
+			getBalance(env.DB, 84, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		const bonusBoxes = async () => (await giftBoxes('84')).filter((b) => b.GiftContext === 51)
+		await drainFrames()
+		const start = await tokens()
+
+		// A contextless ask is not an activity: XP box only, no tokens.
+		expect((await request('rewardType=FirstActivityOfDay&Message=First')).status).toBe(200)
+		expect(await tokens()).toBe(start)
+		expect(await bonusBoxes()).toHaveLength(0)
+
+		// First time in Soccer: +250, in a box of its own after the reward's, credited to the
+		// balance and announced as such.
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await tokens()).toBe(start + 250)
+		const bonus = await bonusBoxes()
+		expect(bonus).toHaveLength(1)
+		expect(bonus[0]).toMatchObject({
+			Currency: 250,
+			CurrencyType: CurrencyType.RecCenterTokens,
+			Xp: 0,
+			AvatarItemDesc: '',
+			Message: 'New activity bonus!',
+		})
+		// The balance frame carries the resulting total, and the bonus box is announced like
+		// any other. (This being the second 5 XP, a level-2 box rides along too.)
+		const frames = await drainFrames()
+		expect(
+			frames.find((f) => f.notificationType === NotificationType.StorefrontBalanceUpdate)?.payload
+		).toMatchObject({ CurrencyType: CurrencyType.RecCenterTokens, Balance: start + 250 })
+		expect(
+			frames.filter((f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate)
+		).toContainEqual(
+			expect.objectContaining({
+				payload: expect.objectContaining({ Currency: 250, GiftContext: 51, Id: bonus[0]?.Id }),
+			})
+		)
+
+		// Soccer under ANOTHER type is the same activity — no second bonus…
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
+		expect(await tokens()).toBe(start + 250)
+		// …and neither is Soccer again once its cooldown has passed.
+		await env.DB.prepare(
+			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 84 AND gift_context = 'Soccer'"
+		)
+			.bind(new Date(Date.now() - 61 * 60 * 1000).toISOString())
+			.run()
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await tokens()).toBe(start + 250)
+		// An on-cooldown ask in a context never claimed pays nothing — it wrote no row.
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await tokens()).toBe(start + 250)
+
+		// A different activity is new again.
+		expect((await request('rewardType=PostGameActivity&giftContext=Paintball')).status).toBe(200)
+		expect(await tokens()).toBe(start + 500)
+		expect(await bonusBoxes()).toHaveLength(2)
 	})
 
 	test('POST /api/gamerewards/v1/request is 401 without a token, and ignores a typeless ask', async () => {
