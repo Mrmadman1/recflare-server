@@ -52,6 +52,11 @@ export type Env = SharedHonoEnv & {
 	 */
 	MAX_TOKEN_GIFT?: string | number
 	/**
+	 * The most XP one staff XP gift can carry (see src/staff.ts), a typo guard like
+	 * MAX_TOKEN_GIFT. Unset means DEFAULT_MAX_XP_GIFT (100).
+	 */
+	MAX_XP_GIFT?: string | number
+	/**
 	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
 	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).
 	 *

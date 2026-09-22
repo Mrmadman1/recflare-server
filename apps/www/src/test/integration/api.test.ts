@@ -10,6 +10,7 @@ import {
 	PRESENCE_TTL_SECONDS,
 	setPresence,
 } from '@repo/domain/src/presence-db'
+import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progression-db'
 import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
@@ -17,6 +18,10 @@ import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
 import { recordStat, STAT_SCHEMA_DDL } from '@repo/domain/src/stats-db'
 import { generateToken } from '@repo/jwt'
 
+import {
+	createCustomAvatarItem,
+	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+} from '../../../../api/src/custom-avatar-items-db'
 import {
 	createReport,
 	getReportById,
@@ -36,6 +41,11 @@ import {
 	DEFAULT_STARTING_TOKENS,
 	getBalance,
 } from '../../../../econ/src/balance-db'
+import {
+	grantCustomAvatarItem,
+	INVENTORY_CUSTOM_SCHEMA_DDL,
+	ownedCustomAvatarItemIds,
+} from '../../../../econ/src/inventory-custom-db'
 import { discordConfig, parseRoleIds, qualifies } from '../../discord'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
@@ -108,6 +118,12 @@ beforeAll(async () => {
 	// `balance` and `received_gift` are owned by `econ`; a staff token gift writes both.
 	for (const stmt of BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of RECEIVED_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// A custom item gift reads `custom_avatar_item` (owned by `api`) and writes
+	// `inventory_custom` (owned by `econ`).
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of INVENTORY_CUSTOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// And an XP gift writes `progression`.
+	for (const stmt of PROGRESSION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -697,6 +713,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
+		'/api/staff/players/1/gift-custom-item',
+		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
 	]
@@ -1375,4 +1393,152 @@ it('clears a player’s password so they can set a new one in game', async () =>
 		{ actor: 8110, data: { playerId: 8320, hadPassword: false } },
 	])
 	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
+})
+
+/** A custom avatar item made by `creatorAccountId`; published unless `accessibility` says. */
+const seedCustomItem = (id: string, creatorAccountId: number, accessibility = 1) =>
+	createCustomAvatarItem(env.DB, {
+		customAvatarItemId: id,
+		creatorAccountId,
+		name: `Shirt ${id.slice(0, 4)}`,
+		description: '',
+		price: 300,
+		baseAvatarItemId: 1,
+		baseAvatarItemColor: '',
+		accessibility,
+		designFilename: 'design.png',
+		thumbnailImageFilename: 'thumb.png',
+	})
+
+// Delivered as a purchase delivers one — owned, and boxed by `CustomAvatarItemId` — but nobody
+// is charged and the creator is not paid: a grant, not a sale.
+it('gifts a player a custom item in a gift box', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	await updateAccount(env.DB, 8330, { username: 'Wearer' })
+	const item = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000001', 8331)
+
+	// Upper-cased on purpose: a GUID's case is not part of its identity.
+	const res = await staffPost('/api/staff/players/8330/gift-custom-item', 8110, {
+		customAvatarItemId: item.CustomAvatarItemId.toUpperCase(),
+	})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { giftId: number; name: string }
+	expect(body.name).toBe(item.Name)
+
+	await expect(ownedCustomAvatarItemIds(env.DB, 8330, [item.CustomAvatarItemId])).resolves.toEqual(
+		new Set([item.CustomAvatarItemId])
+	)
+	const gifts = await getPendingGifts(env.DB, 8330)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		Id: body.giftId,
+		FromPlayerId: 1,
+		CustomAvatarItemId: item.CustomAvatarItemId,
+		AvatarItemDesc: '',
+		Currency: 0,
+		// Purchased_Gift_A: one of the contexts the client's box classifier tests. Default (0)
+		// is not, and a box it can't classify renders as "cannot display".
+		GiftContext: 500,
+	})
+
+	// Only the box is announced: no balance moved, the creator's included.
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerId: number
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([[8330, 31]])
+	expect(frames[0].data).toMatchObject({
+		Id: body.giftId,
+		CustomAvatarItemId: item.CustomAvatarItemId,
+		GiftContext: 500,
+	})
+
+	expect(await auditRows('gift_custom_item', 8330)).toEqual([
+		{
+			actor: 8110,
+			data: {
+				playerId: 8330,
+				customAvatarItemId: item.CustomAvatarItemId,
+				name: item.Name,
+				giftId: body.giftId,
+			},
+		},
+	])
+})
+
+it('refuses a custom item gift the store would refuse', async () => {
+	await updateAccount(env.DB, 8340, { username: 'Picky' })
+	const published = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000002', 8341)
+	const draft = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000003', 8341, 0)
+	const own = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000004', 8340)
+	await grantCustomAvatarItem(env.DB, 8340, published.CustomAvatarItemId)
+
+	const gift = (customAvatarItemId: unknown, playerId = 8340) =>
+		staffPost(`/api/staff/players/${playerId}/gift-custom-item`, 8110, { customAvatarItemId })
+
+	expect((await gift('')).status).toBe(400)
+	expect((await gift('no-such-item')).status).toBe(404)
+	// A draft is visible to its creator alone; handing it out would publish it for them.
+	expect((await gift(draft.CustomAvatarItemId)).status).toBe(404)
+	expect((await gift(own.CustomAvatarItemId)).status).toBe(409)
+	expect((await gift(published.CustomAvatarItemId)).status).toBe(409)
+	expect((await gift(published.CustomAvatarItemId, 8396)).status).toBe(404)
+
+	expect(await getPendingGifts(env.DB, 8340)).toEqual([])
+	expect(await auditRows('gift_custom_item', 8340)).toEqual([])
+})
+
+// Banked and levelled like a game reward's XP: 25 takes a fresh player from level 1 through
+// 2 (10) and 3 (10) with 5 into level 3. The bar moves, and the box shows what arrived.
+it('gifts a player XP in a gift box', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	await updateAccount(env.DB, 8350, { username: 'Climber' })
+
+	const res = await staffPost('/api/staff/players/8350/gift-xp', 8110, { amount: 25 })
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { giftId: number }
+	expect(body).toMatchObject({ level: 3, xp: 5, levelsGained: 2 })
+	await expect(getProgression(env.DB, 8350)).resolves.toEqual({ PlayerId: 8350, Level: 3, XP: 5 })
+
+	const gifts = await getPendingGifts(env.DB, 8350)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		Id: body.giftId,
+		FromPlayerId: 1,
+		Xp: 25,
+		Currency: 0,
+		GiftContext: 500,
+	})
+
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerId: number
+		notificationType: number | string
+		data: Record<string, unknown>
+	}>
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([
+		[8350, 'PlayerProgressionLevelUpdate'],
+		[8350, 31],
+	])
+	expect(frames[0].data).toEqual({ PlayerId: 8350, Level: 3, XP: 5 })
+	expect(frames[1].data).toMatchObject({ Id: body.giftId, Xp: 25, GiftContext: 500 })
+
+	expect(await auditRows('gift_xp', 8350)).toEqual([
+		{
+			actor: 8110,
+			data: { playerId: 8350, amount: 25, level: 3, levelsGained: 2, giftId: body.giftId },
+		},
+	])
+})
+
+it('refuses an XP gift that is not a positive whole number, too large, or to nobody', async () => {
+	await updateAccount(env.DB, 8351, { username: 'Stuck' })
+	for (const amount of [0, -5, 1.5, 'lots', 101]) {
+		expect((await staffPost('/api/staff/players/8351/gift-xp', 8110, { amount })).status).toBe(400)
+	}
+	expect((await staffPost('/api/staff/players/8395/gift-xp', 8110, { amount: 5 })).status).toBe(404)
+	await expect(getProgression(env.DB, 8351)).resolves.toEqual({ PlayerId: 8351, Level: 1, XP: 0 })
+	expect(await auditRows('gift_xp', 8351)).toEqual([])
 })

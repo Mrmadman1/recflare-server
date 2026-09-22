@@ -1,5 +1,6 @@
 import {
 	addUsernameChange,
+	addXp,
 	clearPasswordHash,
 	createGift,
 	getAccount,
@@ -15,6 +16,7 @@ import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 // is the same write `api` would do. www owns the ENDPOINTS, not the storage — see the
 // module comment below.
 import { banEvasionMatch, linkedAccounts } from '../../api/src/bans-db'
+import { getCustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import {
 	banBlockDetails,
 	banFromReport,
@@ -35,6 +37,7 @@ import {
 	DEFAULT_STARTING_TOKENS,
 	ensureStartingBalances,
 } from '../../econ/src/balance-db'
+import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/inventory-custom-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
 // imported as values/types with no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
@@ -46,6 +49,7 @@ import type {
 	BalanceResponsePayload,
 	GiftPackagePayload,
 	ModerationKickPayload,
+	PlayerProgressionLevelPayload,
 } from '../../notify/src/notification-payloads'
 import type { App, Env } from './context'
 
@@ -518,8 +522,26 @@ const COACH_ACCOUNT_ID = 1
  */
 export const DEFAULT_MAX_TOKEN_GIFT = 10_000
 
-/** The message on a staff token gift's box. */
-const TOKEN_GIFT_MESSAGE = 'A gift from the staff!'
+/**
+ * The most XP one gift can carry when the operator's `MAX_XP_GIFT` is unset — a typo guard,
+ * as {@link DEFAULT_MAX_TOKEN_GIFT} is. Kept small for now: enough to cross the first few
+ * levels, where every level to the top costs 15,090 in all (level 1 to 50).
+ */
+export const DEFAULT_MAX_XP_GIFT = 100
+
+/**
+ * `GiftContext.Purchased_Gift_A` — what a staff box says it came from.
+ *
+ * The client classifies a box by its context and only tests a small set (500–503
+ * `Purchased_Gift_A`–`D`, 1300 `Friendotron_Gift`); `Default` (0) falls outside it, and a box
+ * whose contents it won't render shows "cannot display". The TOKEN box is left on 0 because
+ * it renders as it is — this is the thing being changed, so it is not changed everywhere at
+ * once.
+ */
+const GIFT_CONTEXT_PURCHASED_GIFT_A = 500
+
+/** The message on the box a staff gift comes in. */
+const STAFF_GIFT_MESSAGE = 'A gift from the staff!'
 
 /** A path's `:id` as a player id, or null when it isn't a positive integer. */
 function playerIdParam(c: Context<App>): number | null {
@@ -542,6 +564,83 @@ async function recordPlayerAudit(
 		logger.error('could not write an audit log row', {
 			action,
 			moderatorId: staffId(c),
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * The stored content of a box staff hand over: from the Coach, as every box the server hands
+ * over on nobody's behalf is (who really sent it is on the audit row), carrying nothing but
+ * what `fields` puts in it.
+ */
+function staffGiftContent(fields: Partial<GiftContent>): GiftContent {
+	return {
+		FromPlayerId: COACH_ACCOUNT_ID,
+		GiftContext: 0,
+		ConsumableItemDesc: '',
+		ConsumableCount: 0,
+		AvatarItemDesc: '',
+		AvatarItemType: 0,
+		CurrencyType: 0,
+		Currency: 0,
+		Xp: 0,
+		PackageType: 0,
+		Message: STAFF_GIFT_MESSAGE,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		GiftRarity: 0,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: null,
+		...fields,
+	}
+}
+
+/**
+ * Show a player the box they were just handed: `GiftPackageReceivedImmediate`, the frame
+ * econ sends for a box the player never clicked for, read off the stored content so the
+ * frame and `GET /api/avatar/v2/gifts` describe one box. A custom item's box also carries
+ * `CustomAvatarItemId`, as econ's does — the recovered decoder names no such member and
+ * drops unknown ones, so it costs nothing if unread. Best-effort: the box is already stored,
+ * and an offline player meets it on their next read of their gifts.
+ */
+async function announceGift(
+	c: Context<App>,
+	playerId: number,
+	giftId: number,
+	content: GiftContent
+): Promise<void> {
+	const frame: GiftPackagePayload = {
+		Id: giftId,
+		FromPlayerId: content.FromPlayerId ?? COACH_ACCOUNT_ID,
+		ConsumableItemDesc: content.ConsumableItemDesc,
+		AvatarItemType: content.AvatarItemType,
+		AvatarItemDesc: content.AvatarItemDesc,
+		EquipmentPrefabName: content.EquipmentPrefabName,
+		EquipmentModificationGuid: content.EquipmentModificationGuid,
+		CurrencyType: content.CurrencyType,
+		Currency: content.Currency,
+		Xp: content.Xp,
+		GiftContext: content.GiftContext ?? 0,
+		GiftRarity: content.GiftRarity,
+		Message: content.Message,
+		Platform: -1,
+		PlatformsToSpawnOn: -1,
+		BalanceType: ALL_PLATFORMS,
+	}
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			playerId,
+			NotificationType.GiftPackageReceivedImmediate,
+			content.CustomAvatarItemId
+				? { ...frame, CustomAvatarItemId: content.CustomAvatarItemId }
+				: { ...frame }
+		)
+	} catch (err) {
+		logger.error('failed to announce a staff gift', {
+			playerId,
+			giftId,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
@@ -589,64 +688,171 @@ export async function giftTokensHandler(c: Context<App>) {
 		startingTokens
 	)
 
-	const content: GiftContent = {
-		FromPlayerId: COACH_ACCOUNT_ID,
-		GiftContext: 0,
-		ConsumableItemDesc: '',
-		ConsumableCount: 0,
-		AvatarItemDesc: '',
-		AvatarItemType: 0,
+	const content = staffGiftContent({
 		CurrencyType: CurrencyType.RecCenterTokens,
 		Currency: amount,
-		Xp: 0,
-		PackageType: 0,
-		Message: TOKEN_GIFT_MESSAGE,
-		EquipmentPrefabName: '',
-		EquipmentModificationGuid: '',
-		GiftRarity: 0,
-		Platform: -1,
-		PlatformsToSpawnOn: -1,
-		BalanceType: null,
-	}
+	})
 	const gift = await createGift(c.env.DB, playerId, content)
 
 	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, balance, giftId: gift.id })
 	logger.info('staff gifted tokens', { moderatorId: staffId(c), playerId, amount })
 
-	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	// The balance first, so the box's announcement lands on a total that already includes it.
 	try {
-		await hub.notifyPlayer(playerId, NotificationType.StorefrontBalanceUpdate, {
-			Balance: balance,
-			CurrencyType: CurrencyType.RecCenterTokens,
-			Platform: ALL_PLATFORMS,
-		} satisfies BalanceResponsePayload)
-		await hub.notifyPlayer(playerId, NotificationType.GiftPackageReceivedImmediate, {
-			Id: gift.id,
-			FromPlayerId: content.FromPlayerId ?? COACH_ACCOUNT_ID,
-			ConsumableItemDesc: content.ConsumableItemDesc,
-			AvatarItemType: content.AvatarItemType,
-			AvatarItemDesc: content.AvatarItemDesc,
-			EquipmentPrefabName: content.EquipmentPrefabName,
-			EquipmentModificationGuid: content.EquipmentModificationGuid,
-			CurrencyType: content.CurrencyType,
-			Currency: content.Currency,
-			Xp: content.Xp,
-			GiftContext: content.GiftContext ?? 0,
-			GiftRarity: content.GiftRarity,
-			Message: content.Message,
-			Platform: -1,
-			PlatformsToSpawnOn: -1,
-			BalanceType: ALL_PLATFORMS,
-		} satisfies GiftPackagePayload)
-	} catch (err) {
-		logger.error('failed to announce a staff token gift', {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			playerId,
-			giftId: gift.id,
+			NotificationType.StorefrontBalanceUpdate,
+			{
+				Balance: balance,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Platform: ALL_PLATFORMS,
+			} satisfies BalanceResponsePayload
+		)
+	} catch (err) {
+		logger.error('failed to push a staff token gift balance', {
+			playerId,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
+	await announceGift(c, playerId, gift.id, content)
 
 	return c.json({ playerId, amount, balance, giftId: gift.id })
+}
+
+/**
+ * Give a player XP, in a gift box — the way a game reward pays its XP. The XP is banked
+ * here (the box, like every box, grants nothing when opened) and spent on any levels it now
+ * pays for; a `PlayerProgressionLevelUpdate` moves the level bar, and the box is announced
+ * so the player sees what arrived.
+ *
+ * Levels crossed do NOT pay their level-up prize boxes: those are rolled from econ's catalog
+ * (`grantLevelUpGifts`), which lives inside the econ app. The levels themselves are stored.
+ */
+export async function giftXpHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const amount = Number(body.amount)
+	if (!Number.isInteger(amount) || amount <= 0) {
+		return c.json({ error: 'Enter a whole number of XP greater than 0' }, 400)
+	}
+	const maxGift = intVar(c.env.MAX_XP_GIFT, DEFAULT_MAX_XP_GIFT)
+	if (amount > maxGift) {
+		return c.json({ error: `A gift can carry at most ${maxGift.toLocaleString()} XP` }, 400)
+	}
+	if ((await getAccount(c.env.DB, playerId)) === null) {
+		return c.json({ error: 'No such player' }, 404)
+	}
+
+	const { progression, levelsGained } = await addXp(c.env.DB, playerId, amount)
+	const content = staffGiftContent({
+		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+		Xp: amount,
+	})
+	const gift = await createGift(c.env.DB, playerId, content)
+
+	await recordPlayerAudit(c, 'gift_xp', {
+		playerId,
+		amount,
+		level: progression.Level,
+		levelsGained,
+		giftId: gift.id,
+	})
+	logger.info('staff gifted xp', { moderatorId: staffId(c), playerId, amount, levelsGained })
+
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			playerId,
+			NotificationType.PlayerProgressionLevelUpdate,
+			{
+				PlayerId: progression.PlayerId,
+				Level: progression.Level,
+				XP: progression.XP,
+			} satisfies PlayerProgressionLevelPayload
+		)
+	} catch (err) {
+		logger.error('failed to push a staff xp gift progression', {
+			playerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+	await announceGift(c, playerId, gift.id, content)
+
+	return c.json({
+		playerId,
+		amount,
+		level: progression.Level,
+		xp: progression.XP,
+		levelsGained,
+		giftId: gift.id,
+	})
+}
+
+/**
+ * Give a player a custom avatar item, delivered the way a store purchase delivers one:
+ * ownership is a row in `inventory_custom` (what `econ`'s owned read serves the item from),
+ * and the item comes in a gift box naming it by `CustomAvatarItemId` — without the box the
+ * player is shown nothing. Unlike a purchase nobody pays and the creator is not paid: this is
+ * a grant, not a sale.
+ *
+ * Refused as the store refuses a sale to this player: an unknown item or a DRAFT
+ * (`Accessibility` 0, visible to its creator alone — handing it out would publish it for
+ * them), the item's own creator (who owns it already), or a player who already has it.
+ */
+export async function giftCustomItemHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const body = (await c.req.json().catch(() => ({}))) as { customAvatarItemId?: unknown }
+	const requested =
+		typeof body.customAvatarItemId === 'string' ? body.customAvatarItemId.trim() : ''
+	if (requested === '') return c.json({ error: 'Enter a custom item id' }, 400)
+	if ((await getAccount(c.env.DB, playerId)) === null) {
+		return c.json({ error: 'No such player' }, 404)
+	}
+
+	// A GUID's case is not part of its identity, and ids are stored as the export spelled them.
+	const item =
+		(await getCustomAvatarItem(c.env.DB, requested)) ??
+		(await getCustomAvatarItem(c.env.DB, requested.toLowerCase()))
+	if (item === null || item.Accessibility === 0) {
+		return c.json({ error: 'No such custom item' }, 404)
+	}
+	if (item.CreatorAccountId === playerId) {
+		return c.json({ error: 'This player created that item, so they already have it' }, 409)
+	}
+	const owned = await ownedCustomAvatarItemIds(c.env.DB, playerId, [item.CustomAvatarItemId])
+	if (owned.has(item.CustomAvatarItemId.toLowerCase())) {
+		return c.json({ error: 'This player already owns that item' }, 409)
+	}
+
+	await grantCustomAvatarItem(c.env.DB, playerId, item.CustomAvatarItemId)
+	const content = staffGiftContent({
+		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+		CustomAvatarItemId: item.CustomAvatarItemId,
+	})
+	const gift = await createGift(c.env.DB, playerId, content)
+
+	await recordPlayerAudit(c, 'gift_custom_item', {
+		playerId,
+		customAvatarItemId: item.CustomAvatarItemId,
+		name: item.Name,
+		giftId: gift.id,
+	})
+	logger.info('staff gifted a custom item', {
+		moderatorId: staffId(c),
+		playerId,
+		customAvatarItemId: item.CustomAvatarItemId,
+	})
+	await announceGift(c, playerId, gift.id, content)
+
+	return c.json({
+		playerId,
+		customAvatarItemId: item.CustomAvatarItemId,
+		name: item.Name,
+		giftId: gift.id,
+	})
 }
 
 /**

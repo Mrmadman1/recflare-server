@@ -1568,6 +1568,11 @@ button[type='submit']:disabled {
 	max-width: 180px;
 }
 
+/* A custom item id is a GUID, far wider than a token amount. */
+.staff-gift input[type='text'] {
+	max-width: 360px;
+}
+
 .staff-actions {
 	flex-wrap: wrap;
 	margin-top: 8px;

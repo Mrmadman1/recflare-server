@@ -40,7 +40,9 @@ import {
 	clearPasswordHandler,
 	createReportHandler,
 	getReportHandler,
+	giftCustomItemHandler,
 	giftTokensHandler,
+	giftXpHandler,
 	linkedAccountsHandler,
 	playerHistoryHandler,
 	requireStaff,
@@ -480,6 +482,8 @@ const app = new Hono<App>()
 	.get('/api/staff/players/:id/linked', linkedAccountsHandler)
 	// The staff card on a player's profile page — account fixes the game has no endpoint for.
 	.post('/api/staff/players/:id/gift-tokens', giftTokensHandler)
+	.post('/api/staff/players/:id/gift-custom-item', giftCustomItemHandler)
+	.post('/api/staff/players/:id/gift-xp', giftXpHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 

@@ -1172,7 +1172,11 @@ function PlayerPage({
 function StaffPlayerActions({ account, navigate }: { account: PublicAccount; navigate: Navigate }) {
 	const [tokens, setTokens] = useState('')
 	const [confirmingClear, setConfirmingClear] = useState(false)
+	const [customItemId, setCustomItemId] = useState('')
+	const [xp, setXp] = useState('')
 	const gift = useAction()
+	const xpGift = useAction()
+	const customGift = useAction()
 	const usernameChange = useAction()
 	const clearPassword = useAction()
 	const base = `/api/staff/players/${account.accountId}`
@@ -1216,6 +1220,86 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 				</label>
 				{gift.error && <p className="error">{gift.error}</p>}
 				{gift.done && <p className="ok">{gift.done}</p>}
+			</form>
+
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void xpGift.run(async () => {
+						const amount = Number(xp)
+						const res = await call<{ level: number; levelsGained: number }>(`${base}/gift-xp`, {
+							authed: true,
+							json: { amount },
+						})
+						setXp('')
+						const levels =
+							res.levelsGained > 0
+								? ` They went up ${res.levelsGained} level${res.levelsGained === 1 ? '' : 's'}, to ${res.level}.`
+								: ` They're level ${res.level}.`
+						return `Sent ${amount.toLocaleString()} XP.${levels}`
+					})
+				}}
+			>
+				<label>
+					Gift XP
+					<span className="staff-gift">
+						<input
+							type="number"
+							min={1}
+							step={1}
+							inputMode="numeric"
+							value={xp}
+							required
+							onChange={(e) => setXp(e.target.value)}
+						/>
+						<button type="submit" disabled={xpGift.pending}>
+							{xpGift.pending ? 'Sending…' : 'Send'}
+						</button>
+					</span>
+					<span className="hint">
+						Arrives as a gift box. Levels it crosses count, but don&apos;t pay their level-up
+						rewards.
+					</span>
+				</label>
+				{xpGift.error && <p className="error">{xpGift.error}</p>}
+				{xpGift.done && <p className="ok">{xpGift.done}</p>}
+			</form>
+
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void customGift.run(async () => {
+						const res = await call<{ name: string }>(`${base}/gift-custom-item`, {
+							authed: true,
+							json: { customAvatarItemId: customItemId.trim() },
+						})
+						setCustomItemId('')
+						return `Sent “${res.name}” to @${account.username}.`
+					})
+				}}
+			>
+				<label>
+					Gift custom item
+					<span className="staff-gift">
+						<input
+							type="text"
+							value={customItemId}
+							placeholder="Custom avatar item id"
+							spellCheck={false}
+							required
+							onChange={(e) => setCustomItemId(e.target.value)}
+						/>
+						<button type="submit" disabled={customGift.pending}>
+							{customGift.pending ? 'Sending…' : 'Send'}
+						</button>
+					</span>
+					<span className="hint">
+						Arrives as a gift box, as if bought from the store. Free to them, and the creator
+						isn&apos;t paid.
+					</span>
+				</label>
+				{customGift.error && <p className="error">{customGift.error}</p>}
+				{customGift.done && <p className="ok">{customGift.done}</p>}
 			</form>
 
 			<div className="mod-filter-actions staff-actions">
