@@ -661,8 +661,8 @@ export async function deleteRoomLeaderboard(
  * name, and the new owner. The clone starts with an empty tag set — the source's
  * tags (including the `base` template tag) do not carry over, so the owner tags the
  * clone from scratch — `IsRRO` is cleared so the client doesn't render a virtual
- * "RRO" tag on it, and it starts PRIVATE rather than inheriting the source's
- * visibility. Returns the new room, or null when the source isn't in D1 or disallows
+ * "RRO" tag on it, `IsDeveloperOwned`/`CloningAllowed` are cleared, its `Stats` start
+ * at zero, and it starts PRIVATE rather than inheriting the source's visibility. Returns the new room, or null when the source isn't in D1 or disallows
  * cloning.
  */
 export async function cloneRoom(
@@ -702,15 +702,20 @@ export async function cloneRoom(
 		// A user clone is not a Rec Room Original — clear the inherited flag, or the
 		// client renders a virtual "RRO" tag on the clone.
 		IsRRO: false,
+		// Neither is the cloner a developer, and a copy doesn't inherit the source's consent
+		// to be copied: the new owner opts their room into cloning themselves.
+		IsDeveloperOwned: false,
+		CloningAllowed: false,
 		// A brand-new room is unpublished: the owner publishes it by setting the room's
 		// accessibility. Inheriting the source's would put the clone straight into the
 		// public feeds (hot/search/recommendations/similar all key on Accessibility === 1)
 		// the moment it was made — every clone of a PUBLIC source, template or player room.
 		Accessibility: Accessibility.Private,
 		Roles: roles,
-		// A fresh room has no engagement of its own — don't inherit the source's counters
-		// (the derived ones are recomputed per read, but the clone is returned as-is here).
-		Stats: storedStats(source.Stats),
+		// A fresh room has no engagement of its own — don't inherit any of the source's
+		// counters. `storedStats` alone would keep the blob-owned `VisitorCount`, which
+		// `hotScore` ranks on.
+		Stats: { ...ZERO_STATS },
 		CreatedAt: new Date().toISOString(),
 	}
 

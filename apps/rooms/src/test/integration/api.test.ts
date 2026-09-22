@@ -1309,10 +1309,19 @@ describe('rooms endpoints', () => {
 					CreatorAccountId: number
 					Tags?: Array<{ Tag: string }>
 					IsRRO: boolean
+					IsDeveloperOwned: boolean
+					CloningAllowed: boolean
 					Accessibility: number
 					Roles: Array<{ AccountId: number; Role: number; InvitedRole: number }>
+					Stats: Record<string, number>
 				} | null
 			}
+
+		// Give the source every flag and counter the clone must NOT inherit.
+		await env.DB.prepare(
+			`UPDATE room SET data = json_set(data, '$.IsDeveloperOwned', json('true'),
+				'$.CloningAllowed', json('true'), '$.Stats.VisitorCount', 42) WHERE room_id = 24`
+		).run()
 
 		// Clone MakerRoom (base, RoomId 24) → a fresh room owned by the caller (801).
 		const ok = await post(24, 'MyMakerClone')
@@ -1327,6 +1336,16 @@ describe('rooms endpoints', () => {
 		expect(ok.value!.Tags).toEqual([])
 		// IsRRO is cleared so the client doesn't render a virtual "RRO" tag on the clone.
 		expect(ok.value!.IsRRO).toBe(false)
+		// Nor is it developer-owned, and the new owner opts it into cloning themselves.
+		expect(ok.value!.IsDeveloperOwned).toBe(false)
+		expect(ok.value!.CloningAllowed).toBe(false)
+		// No engagement carries over — not even the blob-stored VisitorCount.
+		expect(ok.value!.Stats).toEqual({
+			CheerCount: 0,
+			FavoriteCount: 0,
+			VisitorCount: 0,
+			VisitCount: 0,
+		})
 		// A new room is unpublished: Private (0), never the source's visibility.
 		expect(ok.value!.Accessibility).toBe(0)
 		// Ownership is reset to the cloner: sole owner (Role 255), and none of the
@@ -1338,8 +1357,16 @@ describe('rooms endpoints', () => {
 		// It persists and is fetchable by its new id.
 		const fetched = (await (await SELF.fetch(`${ORIGIN}/rooms/${ok.value!.RoomId}`)).json()) as {
 			Name: string
+			Tags: unknown[]
+			IsDeveloperOwned: boolean
+			CloningAllowed: boolean
+			Stats: Record<string, number>
 		}
 		expect(fetched.Name).toBe('MyMakerClone')
+		expect(fetched.Tags).toEqual([])
+		expect(fetched.IsDeveloperOwned).toBe(false)
+		expect(fetched.CloningAllowed).toBe(false)
+		expect(fetched.Stats.VisitorCount).toBe(0)
 
 		// Duplicate name is rejected.
 		const dup = await post(24, 'MyMakerClone')

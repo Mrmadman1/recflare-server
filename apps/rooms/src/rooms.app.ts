@@ -1719,7 +1719,7 @@ const app = new Hono<App>()
 				'caller. Cloning is the only way to make a room, so the per-account room cap is',
 				'enforced here — it counts the rooms the account created, minus their auto-provisioned',
 				'dorm (`MAX_ROOMS_PER_ACCOUNT`; 0 lifts the cap). The clone starts with no tags,',
-				'`IsRRO` cleared, and PRIVATE accessibility — a new room is unpublished until its',
+				'zeroed `Stats`, `IsRRO`/`IsDeveloperOwned`/`CloningAllowed` cleared, and PRIVATE accessibility — a new room is unpublished until its',
 				'owner sets its accessibility, so it never lands in the public feeds on creation.',
 				'',
 				'Rejections — a blank or taken name, the cap, a source that disallows cloning — are',
