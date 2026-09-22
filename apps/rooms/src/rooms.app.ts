@@ -1858,7 +1858,8 @@ const app = new Hono<App>()
 					Error: 'This room does not exist!',
 				})
 			}
-			if (room.CreatorAccountId !== accountId) {
+			const isOwner = room.CreatorAccountId === accountId
+			if (!isOwner && !(await isStaff(c))) {
 				return roomResult(c, {
 					Success: false,
 					ErrorId: 'Rooms.NotOwner',
@@ -2063,7 +2064,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Delete a room. Auth-gated (401) and owner-only (the room's CreatorAccountId).
+	// Delete a room. Auth-gated (401); owners and staff (developers/moderators) may delete.
 	// Removes the room record (and per-player interactions with it) and the room's
 	// image object from the shared CDN bucket. Images players *took* in the room are
 	// left alone — they live in the api/img world and outlast the room.
@@ -2073,7 +2074,7 @@ const app = new Hono<App>()
 			tags: ['Room settings'],
 			summary: 'Delete a room',
 			description: [
-				'Owner-only. Removes the room record, the per-player interactions with it, and the',
+				'Owner or staff. Removes the room record, the per-player interactions with it, and the',
 				'room’s image object from the shared CDN bucket. Photos players TOOK in the room are',
 				'left alone — those live in the api/img world and outlive the room.',
 			].join(' '),

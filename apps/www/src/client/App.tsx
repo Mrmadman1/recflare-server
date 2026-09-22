@@ -23,6 +23,7 @@ import {
 	setHosts,
 	setToken,
 	useAction,
+	usernamesFor,
 	where,
 } from './api'
 import { ModerationPage } from './Moderation'
@@ -113,6 +114,8 @@ interface OwnedRoom {
 	RoomId: number
 	Name: string
 	Description: string
+	/** Who made it — the account the public page links to, and whom the owner view is for. */
+	CreatorAccountId: number
 	/** A key on the `img` worker; a room with no image of its own gets the fallback. */
 	ImageName: string
 	/** The `Accessibility` ordinal, NOT the enum name — see ACCESSIBILITY_LABEL. */
@@ -819,7 +822,9 @@ interface PublicRoom {
 /** Prefix-search accounts by username — backs the header search bar. */
 async function searchPlayers(query: string): Promise<PublicAccount[]> {
 	if (query.trim() === '') return []
-	return call<PublicAccount[]>(`${where().accounts}/account/search?name=${encodeURIComponent(query.trim())}`)
+	return call<PublicAccount[]>(
+		`${where().accounts}/account/search?name=${encodeURIComponent(query.trim())}`
+	)
 }
 
 const fetchPublicAccount = (username: string): Promise<PublicAccount | null> =>
@@ -833,15 +838,54 @@ const fetchPublicPhotos = (accountId: number): Promise<PublicPhoto[]> =>
 const fetchPublicRooms = (accountId: number): Promise<PublicRoom[]> =>
 	call<PublicRoom[]>(`${where().rooms}/rooms/ownedby/${accountId}`)
 
+/**
+ * One room by id, through the public lookup. `{}` (not a 404) when there's no such room —
+ * the client reads an empty object as "no room", and so does this: null.
+ */
+async function fetchPublicRoom(roomId: number): Promise<OwnedRoom | null> {
+	const room = await call<OwnedRoom | Record<string, never>>(`${where().rooms}/rooms?id=${roomId}`)
+	return 'RoomId' in room ? (room as OwnedRoom) : null
+}
+
+/**
+ * The public photos taken in a room. The feed serves the raw `SavedImage` record (`Id`,
+ * not `SavedImageId` — see the api worker's note on why the two lists differ), so it's
+ * narrowed here to the shape the photo grid draws.
+ */
+const fetchRoomPhotos = (roomId: number): Promise<PublicPhoto[]> =>
+	call<Array<{ Id: number; ImageName: string; CreatedAt: string; CheerCount: number }>>(
+		`${where().api}/api/images/v4/room/${roomId}`
+	).then((images) =>
+		images.map((i) => ({
+			SavedImageId: i.Id,
+			ImageName: i.ImageName,
+			CreatedAt: i.CreatedAt,
+			CheerCount: i.CheerCount,
+		}))
+	)
+
+/**
+ * Delete a room outright — the staff takedown. `rooms` lets the owner or a developer /
+ * moderator through and refuses everyone else; it answers a refusal as a 200 carrying
+ * `Success: false` (the game's envelope), so the check is on the body, not the status.
+ */
+async function deleteRoom(roomId: number): Promise<void> {
+	const result = await call<{ Success: boolean; Error: string | null }>(
+		`${where().rooms}/rooms/${roomId}`,
+		{ method: 'DELETE', authed: true }
+	)
+	if (!result.Success) throw new Error(result.Error || 'The room couldn’t be deleted.')
+}
+
 /** The `/u/<username>` path, or null for any other path. */
 function usernameFromPath(path: string): string | null {
 	const match = /^\/u\/([^/]+)$/.exec(path)
 	return match ? decodeURIComponent(match[1]) : null
 }
 
-// Off for now, not gone: the search bar is hidden from the nav while `/u/:name` profiles
-// stay reachable by URL. Flip this to put it back — nothing else was removed.
-const SHOW_PLAYER_SEARCH: boolean = false
+// The nav's player search. `/u/:name` profiles stay reachable by URL either way; this only
+// decides whether the search bar that leads to them is shown.
+const SHOW_PLAYER_SEARCH: boolean = true
 
 /**
  * The header search bar — a rec.net-style bubble dropdown of matching players as you
@@ -902,8 +946,16 @@ function PlayerSearch({ navigate }: { navigate: Navigate }) {
 			{open && results.length > 0 && (
 				<div className="player-search-bubble">
 					{results.map((r) => (
-						<button key={r.accountId} className="player-search-result" onClick={() => go(r.username)}>
-							<img className="player-search-avatar" src={`${where().img}/${r.profileImage}?width=64`} alt="" />
+						<button
+							key={r.accountId}
+							className="player-search-result"
+							onClick={() => go(r.username)}
+						>
+							<img
+								className="player-search-avatar"
+								src={`${where().img}/${r.profileImage}?width=64`}
+								alt=""
+							/>
 							<span>
 								<span className="player-search-name">{r.displayName || r.username}</span>
 								<span className="player-search-handle">@{r.username}</span>
@@ -940,15 +992,30 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
 		<>
 			<div className="photo-grid">
 				{photos.map((p) => (
-					<button key={p.SavedImageId} className="photo-button" onClick={() => setOpen(p)} aria-label="View photo">
-						<img className="photo-thumb" src={`${where().img}/${p.ImageName}?width=256`} alt="" loading="lazy" />
+					<button
+						key={p.SavedImageId}
+						className="photo-button"
+						onClick={() => setOpen(p)}
+						aria-label="View photo"
+					>
+						<img
+							className="photo-thumb"
+							src={`${where().img}/${p.ImageName}?width=256`}
+							alt=""
+							loading="lazy"
+						/>
 					</button>
 				))}
 			</div>
 			{/* Mounted only while open, so the full-size image isn't fetched until asked for.
 			    `onClose` covers Escape, which closes the dialog without going through us. */}
 			{open && (
-				<dialog ref={dialogRef} className="photo-modal" onClose={() => setOpen(null)} onClick={() => setOpen(null)}>
+				<dialog
+					ref={dialogRef}
+					className="photo-modal"
+					onClose={() => setOpen(null)}
+					onClick={() => setOpen(null)}
+				>
 					<img src={`${where().img}/${open.ImageName}`} alt="" />
 				</dialog>
 			)}
@@ -962,13 +1029,26 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
  * "rec.net-style profile" other players browse to, not the owner's own dashboard
  * (that stays on `/account`).
  */
-function PlayerPage({ username, navigate }: { username: string; navigate: Navigate }) {
+function PlayerPage({
+	username,
+	config,
+	navigate,
+}: {
+	username: string
+	config: SiteConfig | undefined
+	navigate: Navigate
+}) {
 	const [account, setAccount] = useState<PublicAccount | null | undefined>(undefined)
 	const [rooms, setRooms] = useState<PublicRoom[] | null>(null)
 	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
 	const [error, setError] = useState('')
 
 	useEffect(() => {
+		// Waits for the config, not the session: this page is public, but every fetch on it
+		// goes through `where()`, which has no hostnames until `/api/config` lands. On a cold
+		// load of `/u/<name>` the effect would otherwise fire first and the page would be
+		// stuck on "Still starting up".
+		if (config === undefined) return
 		setAccount(undefined)
 		setRooms(null)
 		setPhotos(null)
@@ -976,12 +1056,16 @@ function PlayerPage({ username, navigate }: { username: string; navigate: Naviga
 			.then((a) => {
 				setAccount(a)
 				if (a) {
-					void fetchPublicRooms(a.accountId).then(setRooms).catch(() => setRooms([]))
-					void fetchPublicPhotos(a.accountId).then(setPhotos).catch(() => setPhotos([]))
+					void fetchPublicRooms(a.accountId)
+						.then(setRooms)
+						.catch(() => setRooms([]))
+					void fetchPublicPhotos(a.accountId)
+						.then(setPhotos)
+						.catch(() => setPhotos([]))
 				}
 			})
 			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
-	}, [username])
+	}, [username, config])
 
 	if (error) {
 		return (
@@ -1011,10 +1095,18 @@ function PlayerPage({ username, navigate }: { username: string; navigate: Naviga
 		<main className="shell wide">
 			<section className="card player-hero">
 				{account.bannerImage && (
-					<img className="player-banner" src={`${where().img}/${account.bannerImage}?width=1024`} alt="" />
+					<img
+						className="player-banner"
+						src={`${where().img}/${account.bannerImage}?width=1024`}
+						alt=""
+					/>
 				)}
 				<div className="player-hero-body">
-					<img className="player-avatar" src={`${where().img}/${account.profileImage}?width=256`} alt="" />
+					<img
+						className="player-avatar"
+						src={`${where().img}/${account.profileImage}?width=256`}
+						alt=""
+					/>
 					<div>
 						<h1>{account.displayName || account.username}</h1>
 						<p className="handle">
@@ -1036,7 +1128,12 @@ function PlayerPage({ username, navigate }: { username: string; navigate: Naviga
 						{rooms.map((room) => (
 							<li className="room" key={room.RoomId}>
 								<Link to={`/rooms/${room.RoomId}`} navigate={navigate} className="room-link">
-									<img className="room-thumb" src={`${where().img}/${room.ImageName}?width=256`} alt="" loading="lazy" />
+									<img
+										className="room-thumb"
+										src={`${where().img}/${room.ImageName}?width=256`}
+										alt=""
+										loading="lazy"
+									/>
 									<div className="room-body">
 										<span className="room-name">^{room.Name}</span>
 										<p className="room-stats">{room.Stats.VisitCount.toLocaleString()} visits</p>
@@ -1146,9 +1243,9 @@ export function App() {
 				// entry already sends to the Worker.
 				<StatsPage search={search} navigate={navigate} />
 			) : lookupUsername !== null ? (
-				<PlayerPage username={lookupUsername} navigate={navigate} />
+				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
 			) : roomId !== null ? (
-				<RoomPage account={account} roomId={roomId} navigate={navigate} />
+				<RoomPage account={account} config={config} roomId={roomId} navigate={navigate} />
 			) : (
 				<HomePage account={account} config={config} navigate={navigate} />
 			)}
@@ -1604,71 +1701,302 @@ function AccountPage({
  */
 function RoomPage({
 	account,
+	config,
 	roomId,
 	navigate,
 }: {
 	account: SelfAccount | null | undefined
+	config: SiteConfig | undefined
 	roomId: number
 	navigate: Navigate
 }) {
-	const [rooms, setRooms] = useState<OwnedRoom[] | null>(null)
+	// undefined = not fetched yet; null = no such room.
+	const [room, setRoom] = useState<OwnedRoom | null | undefined>(undefined)
+	// The signed-in player's own rooms, or null while unknown. Decides which view this is:
+	// a room in this list gets the owner's editable page, anything else the public one.
+	const [mine, setMine] = useState<OwnedRoom[] | null>(null)
+	// Set by the staff takedown. The room is gone by then, so the page says so rather than
+	// re-fetching and answering with the "private or missing" line, which would be a lie.
+	const [takenDown, setTakenDown] = useState<string | null>(null)
 	const [error, setError] = useState('')
 	const accountId = account?.accountId
 
 	useEffect(() => {
-		if (account === null) navigate('/login')
-	}, [account, navigate])
+		// Waits for the config (`where()` has no hostnames before it), not the session —
+		// the lookup is public, and a signed-out visitor is this page's main reader.
+		if (config === undefined) return
+		setRoom(undefined)
+		void fetchPublicRoom(roomId)
+			.then(setRoom)
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [roomId, config])
 
 	useEffect(() => {
-		// Waits for the session: the list is auth-gated, and `account === undefined` only
-		// means the stored token hasn't been checked yet.
+		// `account === undefined` only means the stored token hasn't been checked yet.
 		if (accountId === undefined) return
 		void fetchMyRooms()
-			.then(setRooms)
-			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+			.then(setMine)
+			// The owner's list failing to load must not hide a public room — it just reads
+			// as somebody else's.
+			.catch(() => setMine([]))
 	}, [accountId])
 
-	if (!account) {
+	// Whose page this is isn't known until both the room and (for a signed-in player) the
+	// owner's list are in. Choosing early would flash the public view at an owner.
+	const owned = mine?.find((r) => r.RoomId === roomId)
+	const settled =
+		room !== undefined && (account === null || (account !== undefined && mine !== null))
+
+	if (takenDown !== null) {
 		return (
-			<main className="shell">
-				<p className="muted">{account === undefined ? 'Loading…' : 'Redirecting…'}</p>
+			<main className="shell wide">
+				<p className="ok">^{takenDown} was deleted.</p>
+				<p className="backlink">
+					<Link to="/" navigate={navigate}>
+						← Home
+					</Link>
+				</p>
+			</main>
+		)
+	}
+	if (error) {
+		return (
+			<main className="shell wide">
+				<p className="error">{error}</p>
+			</main>
+		)
+	}
+	if (!settled) {
+		return (
+			<main className="shell wide">
+				<p className="muted">Loading…</p>
 			</main>
 		)
 	}
 
-	const room = rooms?.find((r) => r.RoomId === roomId)
-
-	return (
-		<main className="shell wide">
-			<p className="backlink">
-				<Link to="/account" navigate={navigate}>
-					← My rooms
-				</Link>
-			</p>
-			{error ? (
-				<p className="error">{error}</p>
-			) : rooms === null ? (
-				<p className="muted">Loading…</p>
-			) : room === undefined ? (
-				// Covers both "no such room" and "someone else's" — deliberately the same
-				// sentence, since telling a stranger which of the two it is answers a question
-				// they have no business asking.
-				<p className="muted">That isn&apos;t one of your rooms.</p>
-			) : (
+	if (owned) {
+		return (
+			<main className="shell wide">
+				<p className="backlink">
+					<Link to="/account" navigate={navigate}>
+						← My rooms
+					</Link>
+				</p>
 				<RoomDetail
-					room={room}
+					room={owned}
 					imgHost={where().img}
 					cdnHost={where().cdn}
 					// A save answers with the whole updated room, so swapping it into the list
 					// is enough — no re-fetch, and the other rooms keep their place.
 					onRoomChange={(updated) =>
-						setRooms((current) =>
+						setMine((current) =>
 							(current ?? []).map((r) => (r.RoomId === updated.RoomId ? updated : r))
 						)
 					}
 				/>
+			</main>
+		)
+	}
+
+	// Unlisted rooms are reachable by link, which is what a URL is. Everything else that
+	// isn't Public is somebody's private space, and gets the same sentence a missing room
+	// does: which of the two it is answers a question a stranger has no business asking.
+	const visible =
+		room !== null &&
+		(room.Accessibility === Accessibility.Public || room.Accessibility === Accessibility.Unlisted)
+
+	return (
+		<main className="shell wide">
+			{visible ? (
+				<PublicRoomView
+					room={room}
+					navigate={navigate}
+					onTakenDown={() => setTakenDown(room.Name)}
+				/>
+			) : (
+				<p className="muted">
+					There&apos;s no room here — it&apos;s private, or it doesn&apos;t exist.
+				</p>
 			)}
 		</main>
+	)
+}
+
+/**
+ * A room as anyone sees it: the same hero the owner's page draws, with the creator linked
+ * to their profile in place of the upload control, then the room's public facts, the
+ * photos players took in it, and its subrooms — read-only, since nothing here is the
+ * viewer's to change.
+ */
+function PublicRoomView({
+	room,
+	navigate,
+	onTakenDown,
+}: {
+	room: OwnedRoom
+	navigate: Navigate
+	onTakenDown: () => void
+}) {
+	const [creator, setCreator] = useState<{ username: string; displayName: string } | null>(null)
+	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
+	const created = new Date(room.CreatedAt)
+	const subRooms = room.SubRooms ?? []
+
+	useEffect(() => {
+		setCreator(null)
+		setPhotos(null)
+		void usernamesFor([room.CreatorAccountId]).then((names) =>
+			setCreator(names.get(room.CreatorAccountId) ?? null)
+		)
+		void fetchRoomPhotos(room.RoomId)
+			.then(setPhotos)
+			.catch(() => setPhotos([]))
+	}, [room.RoomId, room.CreatorAccountId])
+
+	return (
+		<>
+			<section className="card room-hero">
+				<img className="room-hero-img" src={`${where().img}/${room.ImageName}?width=512`} alt="" />
+				<div className="room-hero-body">
+					<div className="room-head">
+						<h1 className="room-hero-name">^{room.Name}</h1>
+						<VisibilityBadge accessibility={room.Accessibility} />
+					</div>
+					{creator && (
+						<p className="room-hero-by">
+							by{' '}
+							<Link to={`/u/${encodeURIComponent(creator.username)}`} navigate={navigate}>
+								{creator.displayName || creator.username}
+							</Link>
+						</p>
+					)}
+					{room.Description ? (
+						<p className="muted room-hero-desc">{room.Description}</p>
+					) : (
+						<p className="muted room-hero-desc">No description.</p>
+					)}
+					<p className="room-stats">
+						{room.Stats.VisitCount.toLocaleString()} visit
+						{room.Stats.VisitCount === 1 ? '' : 's'} · {room.Stats.FavoriteCount.toLocaleString()}{' '}
+						favourite
+						{room.Stats.FavoriteCount === 1 ? '' : 's'} · {room.Stats.CheerCount.toLocaleString()}{' '}
+						cheer{room.Stats.CheerCount === 1 ? '' : 's'}
+					</p>
+				</div>
+			</section>
+
+			<section className="card">
+				<h2>About this room</h2>
+				<dl className="facts">
+					<dt>Max players</dt>
+					<dd>{room.MaxPlayers}</dd>
+					<dt>Cloning</dt>
+					<dd>{room.CloningAllowed ? 'Anyone may clone this room' : 'Not allowed'}</dd>
+					<dt>Tags</dt>
+					<dd>{room.Tags?.length ? room.Tags.map((t) => `#${t.Tag}`).join(' ') : 'None'}</dd>
+					<dt>Created</dt>
+					<dd>{Number.isNaN(created.getTime()) ? room.CreatedAt : created.toLocaleDateString()}</dd>
+				</dl>
+			</section>
+
+			<section className="card">
+				<h2>Photos taken here</h2>
+				{photos === null ? (
+					<p className="muted">Loading…</p>
+				) : photos.length === 0 ? (
+					<p className="muted">Nobody has taken a photo here yet.</p>
+				) : (
+					<PhotoGrid photos={photos} />
+				)}
+			</section>
+
+			<section className="card">
+				<h2>Subrooms</h2>
+				{subRooms.length === 0 ? (
+					<p className="muted">This room has no subrooms.</p>
+				) : (
+					<ul className="subrooms">
+						{subRooms.map((sub) => (
+							<li className="subroom" key={sub.SubRoomId}>
+								<div className="room-head">
+									<span className="subroom-name">{sub.Name}</span>
+									<VisibilityBadge accessibility={sub.Accessibility} />
+								</div>
+								<p className="subroom-meta">
+									Up to {sub.MaxPlayers} player{sub.MaxPlayers === 1 ? '' : 's'}
+									{sub.IsSandbox ? ' · sandbox' : ''}
+								</p>
+							</li>
+						))}
+					</ul>
+				)}
+			</section>
+
+			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
+			    role itself on the DELETE. */}
+			{isAdmin() && <StaffTakedown room={room} onTakenDown={onTakenDown} />}
+		</>
+	)
+}
+
+/**
+ * The staff takedown, at the foot of a public room's page: the room is already on screen,
+ * so there's nothing to look up and nothing to confirm but the deletion itself. Two
+ * steps — a plain card, then the same accent-bordered confirm the ban form uses — since
+ * this is the one thing on the site that can't be undone.
+ */
+function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: () => void }) {
+	const [confirming, setConfirming] = useState(false)
+	const { pending, error, run } = useAction()
+
+	if (!confirming) {
+		return (
+			<section className="card">
+				<h2>Staff</h2>
+				<p className="muted">
+					Deleting a room removes it for everyone: the room, its subrooms and their saves, and its
+					picture. Photos players took in it stay on their profiles.
+				</p>
+				<button type="submit" onClick={() => setConfirming(true)}>
+					Delete room
+				</button>
+			</section>
+		)
+	}
+
+	return (
+		<section className="card mod-dialog">
+			<h2>Delete ^{room.Name}?</h2>
+			<form
+				className="takedown-confirm"
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						await deleteRoom(room.RoomId)
+						onTakenDown()
+						return ''
+					})
+				}}
+			>
+				<p className="muted">
+					This deletes the room for everyone, including its creator, and can&apos;t be undone.
+				</p>
+				{error && <p className="error">{error}</p>}
+				<div className="mod-filter-actions">
+					<button type="submit" disabled={pending}>
+						{pending ? 'Deleting…' : 'Delete room'}
+					</button>
+					<button
+						type="button"
+						className="linkish"
+						onClick={() => setConfirming(false)}
+						disabled={pending}
+					>
+						Cancel
+					</button>
+				</div>
+			</form>
+		</section>
 	)
 }
 

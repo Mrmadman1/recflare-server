@@ -135,6 +135,9 @@ body {
 	font-size: 0.95rem;
 	color: var(--muted);
 	text-decoration: none;
+	/* A link is one or two words; with the search bar in the row it has to give up space
+	   by wrapping the ROW (see the nav rule under player search), not by breaking mid-link. */
+	white-space: nowrap;
 }
 
 .linkish {
@@ -736,6 +739,13 @@ h2 {
 
 /* ---- One room's page ---------------------------------------------------- */
 
+/* The staff card at the foot of a public room's page. Plain until it's asked to do
+   something; the confirm step borrows the moderation panel's accent border (`.mod-dialog`)
+   so it reads as the same kind of thing as a ban form: waiting on you, and consequential. */
+.takedown-confirm p {
+	margin: 8px 0 14px;
+}
+
 /* The way back out, above the page's own heading. */
 .backlink {
 	margin: 0 0 16px;
@@ -844,6 +854,23 @@ h2 {
 .room-hero-desc {
 	margin: 10px 0 0;
 	overflow-wrap: anywhere;
+}
+
+/* Who made it, on the public page — the one link in the hero, so it's the one thing there
+   in the accent. */
+.room-hero-by {
+	margin: 4px 0 0;
+	font-size: 0.9rem;
+	color: var(--muted);
+}
+
+.room-hero-by a {
+	color: var(--accent);
+	text-decoration: none;
+}
+
+.room-hero-by a:hover {
+	text-decoration: underline;
 }
 
 /* Label/value pairs. A two-column grid rather than a list of "Label: value" lines, so
@@ -1724,7 +1751,6 @@ button[type='submit']:disabled {
 	white-space: nowrap;
 }
 
-
 /* The search bar is a third thing in a row built for two, so the nav wraps when it runs
    out of room rather than overflowing. No breakpoint: wrapping only happens when the row
    doesn't fit, so wide screens are untouched. */
@@ -1754,11 +1780,7 @@ button[type='submit']:disabled {
 			color-mix(in srgb, var(--accent) 24%, transparent),
 			transparent 45%
 		),
-		linear-gradient(
-			135deg,
-			var(--surface-hi),
-			var(--surface)
-		);
+		linear-gradient(135deg, var(--surface-hi), var(--surface));
 }
 
 .player-hero-body {
