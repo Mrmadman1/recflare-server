@@ -2045,9 +2045,9 @@ function RoomPage({
 
 /**
  * A room as anyone sees it: the same hero the owner's page draws, with the creator linked
- * to their profile in place of the upload control, then the room's public facts, the
- * photos players took in it, and its subrooms — read-only, since nothing here is the
- * viewer's to change.
+ * to their profile in place of the upload control, then the room's public facts and the
+ * photos players took in it — read-only, since nothing here is the viewer's to change.
+ * Staff also see its subrooms; the owner gets them on their own page instead.
  */
 function PublicRoomView({
 	room,
@@ -2131,27 +2131,31 @@ function PublicRoomView({
 				)}
 			</section>
 
-			<section className="card">
-				<h2>Subrooms</h2>
-				{subRooms.length === 0 ? (
-					<p className="muted">This room has no subrooms.</p>
-				) : (
-					<ul className="subrooms">
-						{subRooms.map((sub) => (
-							<li className="subroom" key={sub.SubRoomId}>
-								<div className="room-head">
-									<span className="subroom-name">{sub.Name}</span>
-									<VisibilityBadge accessibility={sub.Accessibility} />
-								</div>
-								<p className="subroom-meta">
-									Up to {sub.MaxPlayers} player{sub.MaxPlayers === 1 ? '' : 's'}
-									{sub.IsSandbox ? ' · sandbox' : ''}
-								</p>
-							</li>
-						))}
-					</ul>
-				)}
-			</section>
+			{/* Staff only: a visitor has no use for the room's internals. The owner sees them on
+			    their own page (RoomDetail), never this one. */}
+			{isAdmin() && (
+				<section className="card">
+					<h2>Subrooms</h2>
+					{subRooms.length === 0 ? (
+						<p className="muted">This room has no subrooms.</p>
+					) : (
+						<ul className="subrooms">
+							{subRooms.map((sub) => (
+								<li className="subroom" key={sub.SubRoomId}>
+									<div className="room-head">
+										<span className="subroom-name">{sub.Name}</span>
+										<VisibilityBadge accessibility={sub.Accessibility} />
+									</div>
+									<p className="subroom-meta">
+										Up to {sub.MaxPlayers} player{sub.MaxPlayers === 1 ? '' : 's'}
+										{sub.IsSandbox ? ' · sandbox' : ''}
+									</p>
+								</li>
+							))}
+						</ul>
+					)}
+				</section>
+			)}
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
 			    role itself on the DELETE. */}
