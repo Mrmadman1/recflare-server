@@ -128,6 +128,13 @@ describe('img endpoints', () => {
 		expect(jpegSize(new Uint8Array(await res.arrayBuffer())).width).toBe(128)
 	})
 
+	it('honours the 64 width some newer endpoints request', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/3DCharades.jpg?width=64`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('image/jpeg')
+		expect(jpegSize(new Uint8Array(await res.arrayBuffer())).width).toBe(64)
+	})
+
 	it('serves a static asset in preference to an R2 object of the same key', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/3DCharades.jpg`)
 		expect(res.status).toBe(200)
@@ -405,7 +412,7 @@ describe('img endpoints', () => {
 
 	it('ignores a ?width outside the allowed sizes and serves the original', async () => {
 		const full = new Uint8Array(await (await SELF.fetch(`${ORIGIN}/RecCenter.jpg`)).arrayBuffer())
-		// 300 isn't one of 128/256/512/1024, so it's rejected and the source served.
+		// 300 isn't one of 64/128/256/512/1024, so it's rejected and the source served.
 		const res = await SELF.fetch(`${ORIGIN}/RecCenter.jpg?width=300`)
 		expect(res.status).toBe(200)
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(full)

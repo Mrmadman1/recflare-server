@@ -31,7 +31,7 @@ const CACHE_CONTROL = `public, max-age=${86400 * 30}, immutable`
  * number of distinct variants an attacker can request, so they can't blow past
  * the edge cache and force the (expensive) WASM resize on every hit.
  */
-const ALLOWED_DIMENSIONS = new Set([128, 256, 512, 1024])
+const ALLOWED_DIMENSIONS = new Set([64, 128, 256, 512, 1024])
 
 /** JPEG quality used when re-encoding a resized image. */
 const RESIZE_JPEG_QUALITY = 90
@@ -420,10 +420,10 @@ app.get(
 				in: 'query',
 				required: false,
 				description: [
-					'Output width. Only 128, 256, 512 or 1024 are honoured — any other value is',
+					'Output width. Only 64, 128, 256, 512 or 1024 are honoured — any other value is',
 					'ignored and the source served untouched. Given alone, height follows the aspect ratio.',
 				].join(' '),
-				schema: { type: 'integer', enum: [128, 256, 512, 1024], example: 512 },
+				schema: { type: 'integer', enum: [64, 128, 256, 512, 1024], example: 512 },
 			},
 			{
 				name: 'height',
@@ -431,7 +431,7 @@ app.get(
 				required: false,
 				description:
 					'Output height, same allowed set as `width`. Given alone, width follows the aspect ratio.',
-				schema: { type: 'integer', enum: [128, 256, 512, 1024], example: 512 },
+				schema: { type: 'integer', enum: [64, 128, 256, 512, 1024], example: 512 },
 			},
 			{
 				name: 'cropSquare',
