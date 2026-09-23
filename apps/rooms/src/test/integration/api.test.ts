@@ -4819,6 +4819,68 @@ describe('rooms endpoints', () => {
 		})
 	})
 
+	it('PUT /rooms/:id/max_player_calculation_mode stores the mode without touching MaxPlayers', async () => {
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 720,
+			Name: 'CapMode',
+			CreatorAccountId: 5,
+			MaxPlayerCalculationMode: 0,
+			MaxPlayers: 12,
+			Roles: [{ AccountId: 1, Role: 30, LastChangedByAccountId: null, InvitedRole: 0 }],
+			SubRooms: [
+				{ SubRoomId: 920, UnitySceneId: 'x', MaxPlayers: 12 },
+				{ SubRoomId: 921, UnitySceneId: 'x', MaxPlayers: 4 },
+			],
+		})
+		const put = async (roomId: number, mode: string, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/max_player_calculation_mode`, {
+				method: 'PUT',
+				headers: {
+					...(sub ? await bearer(sub) : {}),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ maxPlayerCalculationMode: mode }).toString(),
+			})
+		type Envelope = {
+			Value: { RoomId: number; MaxPlayerCalculationMode: number; MaxPlayers: number } | null
+			Success: boolean
+			Error: string | null
+			error_id: null
+		}
+		const envelope = async (res: Response) => (await res.json()) as Envelope
+
+		// No token → 401; every other refusal is a 200 with Success:false and Value:null.
+		expect((await put(720, 'OnlyEntrySubrooms')).status).toBe(401)
+		for (const res of [
+			await put(720, 'OnlyEntrySubrooms', '999'), // not on the room
+			await put(720, 'Sideways', '1'), // not a mode
+			await put(720, '7', '1'), // not an ordinal in the enum
+			await put(424242, 'OnlyEntrySubrooms', '1'), // no such room
+		]) {
+			expect(res.status).toBe(200)
+			expect(await envelope(res)).toMatchObject({ Value: null, Success: false, error_id: null })
+		}
+
+		// A co-owner sets it by NAME (what the client sends). Stored as the ordinal, and
+		// MaxPlayers is left exactly as it was — the mode is a setting, not a recompute.
+		const res = await put(720, 'OnlyEntrySubrooms', '1')
+		expect(res.status).toBe(200)
+		const body = await envelope(res)
+		expect(body).toMatchObject({ Success: true, Error: null, error_id: null })
+		expect(body.Value).toMatchObject({ RoomId: 720, MaxPlayerCalculationMode: 1, MaxPlayers: 12 })
+		const stored = (await (await SELF.fetch(`${ORIGIN}/rooms/720`)).json()) as {
+			MaxPlayerCalculationMode: number
+			MaxPlayers: number
+		}
+		expect(stored).toMatchObject({ MaxPlayerCalculationMode: 1, MaxPlayers: 12 })
+
+		// Case-insensitive names and the bare ordinal are accepted too.
+		expect(
+			(await envelope(await put(720, 'allsubrooms', '5'))).Value?.MaxPlayerCalculationMode
+		).toBe(0)
+		expect((await envelope(await put(720, '1', '5'))).Value?.MaxPlayerCalculationMode).toBe(1)
+	})
+
 	it('POST /rooms/:id/subrooms/:sid/move re-parents a subroom when the caller manages both rooms', async () => {
 		// Source 710 is owned by 1 with two subrooms; target 711 is owned by 5 with 1 as a
 		// CO-OWNER (the move gate is manage, not own); 712 is somebody else's entirely.
@@ -5313,6 +5375,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/interactionby/me/cheer',
 			'PUT /rooms/{roomId}/interactionby/me/favorite',
 			'PUT /rooms/{roomId}/loadscreen',
+			'PUT /rooms/{roomId}/max_player_calculation_mode',
 			'PUT /rooms/{roomId}/name',
 			'PUT /rooms/{roomId}/restrictions',
 			'PUT /rooms/{roomId}/roles/{accountId}',

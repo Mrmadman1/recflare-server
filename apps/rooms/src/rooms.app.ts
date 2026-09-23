@@ -115,9 +115,9 @@ import {
 	LeaderboardRequest,
 	LeaderboardResultEnvelope,
 	LoadScreenRequest,
+	MaxPlayerCalculationModeRequest,
 	MissingLookupParam,
 	ModifySubRoomRequest,
-	MoveSubRoomEnvelope,
 	MoveSubRoomRequest,
 	NameRequest,
 	NOT_FRIENDS_RESPONSE,
@@ -140,6 +140,7 @@ import {
 	RoomExperiencePlayer,
 	roomIdParam,
 	RoomLookup,
+	RoomPascalEnvelope,
 	RoomResultEnvelope,
 	RoomRoleDto,
 	RoomSaveEnvelope,
@@ -509,6 +510,32 @@ const RESTRICTION_FIELDS: Record<string, string> = {
  * Hub failures are logged and swallowed — the room write has already committed,
  * so a hub hiccup must not fail the request.
  */
+/**
+ * The room's `MaxPlayerCalculationMode` enum: how its player cap is meant to be read.
+ * `AllSubrooms` (0) and `OnlyEntrySubrooms` (1). A stored setting — nothing here derives
+ * `MaxPlayers` from it.
+ */
+const MAX_PLAYER_CALCULATION_MODES: Readonly<Record<string, number>> = {
+	allsubrooms: 0,
+	onlyentrysubrooms: 1,
+}
+
+/**
+ * Parse a `maxPlayerCalculationMode` field into its ordinal. The client sends the enum
+ * NAME (`OnlyEntrySubrooms`), matched case-insensitively; the ordinal is accepted too.
+ * Undefined when it names nothing in the enum, which the route refuses rather than
+ * defaulting — a silently-wrong mode would misreport a room's capacity.
+ */
+function parseMaxPlayerCalculationMode(value: unknown): number | undefined {
+	if (typeof value !== 'string') return undefined
+	const raw = value.trim()
+	const named = MAX_PLAYER_CALCULATION_MODES[raw.toLowerCase()]
+	if (named !== undefined) return named
+	if (!/^\d+$/.test(raw)) return undefined
+	const ordinal = Number.parseInt(raw, 10)
+	return Object.values(MAX_PLAYER_CALCULATION_MODES).includes(ordinal) ? ordinal : undefined
+}
+
 async function pushRoomUpdate(
 	c: Context<App>,
 	playerId: number,
@@ -3124,6 +3151,58 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Set a room's MaxPlayerCalculationMode (form body `maxPlayerCalculationMode`, the enum
+	// NAME). Auth-gated (401) and owner/co-owner-only. A stored setting only: it does not
+	// touch `MaxPlayers`. Answers the room in the PascalCase `{ Value, Success, Error,
+	// error_id }` envelope, like the subroom move — not the lowercase one its neighbours use.
+	.put(
+		'/rooms/:roomId{[0-9]+}/max_player_calculation_mode',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s max-player calculation mode',
+			description: [
+				'Sets `MaxPlayerCalculationMode`: `AllSubrooms` (0) or `OnlyEntrySubrooms` (1). The',
+				'client sends the enum name (`maxPlayerCalculationMode=OnlyEntrySubrooms`); the',
+				'ordinal is accepted too, and anything else is rejected. It is a stored setting:',
+				'`MaxPlayers` is not recomputed from the subrooms here.',
+				'',
+				'Owner or co-owner only. Answers the updated room under `Value` in the PascalCase',
+				'`{ Value, Success, Error, error_id }` envelope — NOT the lowercase',
+				'`{ success, error, value }` the other room-settings routes answer. A rejection is',
+				'HTTP 200 with `Success: false`, `Value: null` and the message in `Error`; only a',
+				'missing token is a 401.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(MaxPlayerCalculationModeRequest, 'The mode'),
+			responses: {
+				200: json(RoomPascalEnvelope, 'The updated room, or a rejection with `Success: false`'),
+				401: { description: 'No bearer token (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return c.body(null, 401)
+			const refuse = (error: string) =>
+				c.json({ Value: null, Success: false, Error: error, error_id: null })
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return refuse('This room does not exist!')
+			if (!canManageRoom(room, accountId)) return refuse('You are not the owner of this room!')
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const mode = parseMaxPlayerCalculationMode(body.maxPlayerCalculationMode)
+			if (mode === undefined) return refuse('You must provide a valid maxPlayerCalculationMode!')
+
+			const updated = await updateRoomFields(c.env.DB, roomId, room, {
+				MaxPlayerCalculationMode: mode,
+			})
+			await pushRoomUpdate(c, accountId, updated)
+			return c.json({ Value: updated, Success: true, Error: null, error_id: null })
+		}
+	)
+
 	// Set a room's platform/movement support flags (its `Supports*` restrictions).
 	// Auth-gated (401) and owner/co-owner-only (403). Body is a form of
 	// `supports*=True|False` fields (see RESTRICTION_FIELDS); only the fields present
@@ -3914,7 +3993,7 @@ const app = new Hono<App>()
 			parameters: [roomIdParam, subRoomIdParam],
 			requestBody: form(MoveSubRoomRequest, 'The destination room'),
 			responses: {
-				200: json(MoveSubRoomEnvelope, 'The source room, or a rejection with `Success: false`'),
+				200: json(RoomPascalEnvelope, 'The source room, or a rejection with `Success: false`'),
 				401: { description: 'No bearer token (empty body)' },
 			},
 		}),

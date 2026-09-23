@@ -324,7 +324,12 @@ export const RoomDto = z.object({
 	RankingContext: z.unknown().nullable(),
 	IsDorm: z.boolean().describe('Auto-provisioned personal room; excluded from every feed'),
 	IsPlacePlay: z.boolean(),
-	MaxPlayerCalculationMode: z.int(),
+	MaxPlayerCalculationMode: z
+		.int()
+		.describe(
+			'0 AllSubrooms, 1 OnlyEntrySubrooms — set by `PUT …/max_player_calculation_mode`. A ' +
+				'stored setting; `MaxPlayers` is not derived from it here'
+		),
 	MaxPlayers: z.int(),
 	CloningAllowed: z.boolean().describe('False blocks `POST /rooms/{roomId}/clone`'),
 	DisableMicAutoMute: z.boolean(),
@@ -828,17 +833,27 @@ export const MoveSubRoomRequest = z.object({
 })
 
 /**
- * What the subroom move answers: the SOURCE room (which no longer lists the subroom) under
- * `Value`, in the PascalCase `{ Value, Success, Error, error_id }` envelope — the same mixed
+ * A room in the PascalCase `{ Value, Success, Error, error_id }` envelope — the same mixed
  * casing the unprefixed isBanned check has ({@link IsBannedPascalEnvelope}), NOT the
- * lowercase `{ success, error, value }` every other subroom mutation answers. Kept apart
- * deliberately: the client decodes this one with a different reader.
+ * lowercase `{ success, error, value }` most room mutations answer. The newer settings
+ * routes (the subroom move, the max-player calculation mode) answer this one; the client
+ * decodes them with a different reader, so the two are kept apart deliberately.
  */
-export const MoveSubRoomEnvelope = z.object({
-	Value: RoomDto.nullable().describe('The source room as it now stands; null on a rejection'),
+export const RoomPascalEnvelope = z.object({
+	Value: RoomDto.nullable().describe('The room as it now stands; null on a rejection'),
 	Success: z.boolean(),
 	Error: z.string().nullable().describe('The message shown on a rejection; null on success'),
 	error_id: z.string().nullable().describe('Null. Lowercase, unlike its siblings'),
+})
+
+/**
+ * `PUT /rooms/{roomId}/max_player_calculation_mode` — how the room's player cap is meant to
+ * be read. The client sends the enum NAME; the ordinal is accepted alongside it.
+ */
+export const MaxPlayerCalculationModeRequest = z.object({
+	maxPlayerCalculationMode: z
+		.string()
+		.describe('`AllSubrooms` (0) or `OnlyEntrySubrooms` (1), case-insensitive, or the ordinal'),
 })
 
 /** `POST /rooms/{roomId}/subrooms`. */
