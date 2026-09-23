@@ -25,8 +25,8 @@ import {
 } from '@repo/domain'
 
 /**
- * Schema DDL (mirror of migrations/0006_event.sql + 0007_event_attendee.sql, sans any
- * seed rows).
+ * Schema DDL (mirror of migrations/0006_event.sql + 0007_event_attendee.sql +
+ * 0010_event_tag.sql + 0028_event_id_seq.sql, sans any seed rows).
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS event (
@@ -58,6 +58,12 @@ export const SCHEMA_DDL: string[] = [
 		PRIMARY KEY (event_id, tag)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_tag_tag ON event_tag (tag)`,
+	// The id sequence: AUTOINCREMENT so an id is never handed out twice, whatever gets
+	// deleted. See {@link nextEventId}. The migration also seeds it past the existing
+	// events; on a fresh database there are none, so the seed is omitted here.
+	`CREATE TABLE IF NOT EXISTS event_id_seq (
+		id INTEGER PRIMARY KEY AUTOINCREMENT
+	)`,
 ]
 
 /**
@@ -67,19 +73,29 @@ export const SCHEMA_DDL: string[] = [
  * Only `going` counts toward an event's `AttendeeCount`: interested is a maybe, and
  * declining is recorded rather than deleted so the client can show the player their own
  * answer (and so changing your mind is an update, not an insert).
+ *
+ * `pending` is not an answer: it's the row a bulk invite writes for the invitee, before
+ * they've said anything. It's what the client shows as an open invitation — an invite
+ * that landed as Going looked like the player had already accepted. Only the server
+ * writes it; `respond` won't take it as a `Type`.
  */
 export const EVENT_RESPONSE = {
 	going: 0,
 	interested: 1,
 	cantGo: 2,
+	pending: 3,
 } as const
 
-/** The response types, for validating an incoming `Type`. */
-const EVENT_RESPONSE_VALUES: number[] = Object.values(EVENT_RESPONSE)
+/** The answers a player may give — every type but `pending`, for validating an incoming `Type`. */
+const EVENT_ANSWER_VALUES: number[] = [
+	EVENT_RESPONSE.going,
+	EVENT_RESPONSE.interested,
+	EVENT_RESPONSE.cantGo,
+]
 
-/** Whether a number is one of the three response types. */
+/** Whether a number is one of the three answers a player can give (never `pending`). */
 export function isEventResponseType(value: number): boolean {
-	return EVENT_RESPONSE_VALUES.includes(value)
+	return EVENT_ANSWER_VALUES.includes(value)
 }
 
 /**
@@ -174,9 +190,9 @@ interface EventRow {
 }
 
 /**
- * A tag as the 2023 build's `v2` envelope carries it: the PascalCase form of the stored
- * `{ tag, type }` pair. NOT the lowercase pair the v1 read serves — three casings of one
- * tag, and the client parses each in exactly one place.
+ * A tag as the `v2` envelope carries it to a build newer than 20230414: the PascalCase
+ * form of the stored `{ tag, type }` pair. NOT the lowercase pair the v1 read serves —
+ * three casings of one tag, and the client parses each in exactly one place.
  */
 export interface PlayerEventEnvelopeTag {
 	Tag: string
@@ -190,9 +206,11 @@ export interface PlayerEventEnvelopeTag {
  *
  * `Tags` is the one field whose shape depends on the caller's BUILD, because Rec Room
  * changed it under the same unversioned path rather than minting a `v3`: the 2023 build
- * parses `[{ Tag, Type }]` and the 2025 build parses `["celebration"]`. Serving either
- * one to the other build leaves the event's tag chips empty — the decoder drops what it
- * can't read rather than erroring. {@link toEventResult} picks; nothing else should.
+ * (20230414 and older) parses `["celebration"]` and anything newer parses
+ * `[{ Tag, Type }]`. Serving either one to the other build leaves the event's tag chips
+ * empty — the decoder drops what it can't read rather than erroring.
+ * {@link toEventResult} picks; nothing else should. `TagModifyResult.Tags` is NOT part of
+ * this: it is a `List<string>` to every build.
  */
 export interface PlayerEventEnvelope extends PlayerEventBase {
 	Tags: string[] | PlayerEventEnvelopeTag[]
@@ -218,17 +236,18 @@ export interface PlayerEventResult {
  * tags — pass what `getEventTags` returns, so the answer reflects what was actually
  * written rather than what was asked for.
  *
- * `legacyTags` picks the shape of `PlayerEvent.Tags` for the caller's build (see
- * {@link PlayerEventEnvelope}): the 2023 pairs when set, the 2025 names when not. It
- * changes nothing else — `TagModifyResult.Tags` is a name list to both builds.
+ * `pairedTags` picks the shape of `PlayerEvent.Tags` for the caller's build (see
+ * {@link PlayerEventEnvelope}): the `{ Tag, Type }` pairs of a build newer than 20230414
+ * when set, the 2023 build's bare names when not. It changes nothing else —
+ * `TagModifyResult.Tags` is a name list to both builds.
  */
 export function toEventResult(
 	event: PlayerEvent,
 	tags: EventTag[] = [],
-	legacyTags = false
+	pairedTags = false
 ): PlayerEventResult {
 	const names = tags.map((t) => t.tag)
-	const carried = legacyTags ? tags.map((t) => ({ Tag: t.tag, Type: t.type })) : names
+	const carried = pairedTags ? tags.map((t) => ({ Tag: t.tag, Type: t.type })) : names
 	return {
 		PlayerEvent: { Tags: carried, ...toEventBase(event) },
 		Result: 0,
@@ -620,14 +639,11 @@ export async function createEvent(
 	creatorPlayerId: number,
 	input: EventInput
 ): Promise<PlayerEvent> {
-	// Sequential id: one past the current max (the table starts empty).
-	const row = await db
-		.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS next FROM event')
-		.first<{ next: number }>()
+	const id = await nextEventId(db)
 	const now = Date.now()
 	const startTime = input.startTime ?? eventTime(now)
 	const event: PlayerEvent = {
-		PlayerEventId: row?.next ?? 1,
+		PlayerEventId: id,
 		CreatorPlayerId: creatorPlayerId,
 		ImageName: input.imageName ?? null,
 		RoomId: input.roomId ?? 0,
@@ -665,46 +681,51 @@ export async function createEvent(
  * per player per event, so changing your mind is an update rather than a second RSVP.
  * The event's `AttendeeCount` is recomputed from the table afterwards.
  *
- * Returns the updated event, or null when there's no such event. Anyone who can see an
- * event may respond to it, the creator included (they're already Going from create, and
- * nothing stops them declining their own event).
+ * Returns the updated event and the player's response row as it now stands (the route
+ * pushes that row on the `PlayerEventResponseChanged` frame), or null when there's no
+ * such event. Anyone who can see an event may respond to it, the creator included
+ * (they're already Going from create, and nothing stops them declining their own event).
  */
 export async function setEventResponse(
 	db: D1Database,
 	eventId: number,
 	playerId: number,
 	status: number
-): Promise<PlayerEvent | null> {
+): Promise<{ event: PlayerEvent; response: EventAttendeeRow } | null> {
 	const event = await getEventById(db, eventId)
 	if (event === null) return null
 
-	await db
+	const response = await db
 		.prepare(
 			`INSERT INTO event_attendee (event_id, player_id, status, responded_at)
 			 VALUES (?1, ?2, ?3, ?4)
-			 ON CONFLICT (event_id, player_id) DO UPDATE SET status = ?3, responded_at = ?4`
+			 ON CONFLICT (event_id, player_id) DO UPDATE SET status = ?3, responded_at = ?4
+			 RETURNING rowid AS id, *`
 		)
 		.bind(eventId, playerId, status, eventTime(Date.now()))
-		.run()
+		.first<EventAttendeeRow>()
 
 	const updated: PlayerEvent = { ...event, AttendeeCount: await countGoing(db, eventId) }
 	await writeEvent(db, updated)
-	return updated
+	// An upsert with RETURNING always yields the row it inserted or updated.
+	return { event: updated, response: response! }
 }
 
 /**
- * Add invited players to an event as Going — the bulk invite. Returns the updated
+ * Add invited players to an event as Pending — the bulk invite. Returns the updated
  * event (with its recounted `AttendeeCount`) and the rows actually created, or null
  * when there's no such event.
  *
  * An invite only ever INSERTS: a player who already has a row keeps the answer they
- * gave, so being invited can't flip a decline back to Going, and re-inviting the same
- * player is a no-op rather than a reset. Since the rows land as Going, the invited
- * count toward `AttendeeCount` from the moment they're invited — see the route.
+ * gave, so being invited can't reset an answer to Pending, and re-inviting the same
+ * player is a no-op. The rows land as Pending (3), not Going: the invitee hasn't
+ * accepted anything yet, so they don't count toward `AttendeeCount` until they answer
+ * through `respond` — see the route.
  *
  * `added` is what `RETURNING` gave back, so it holds exactly the new rows: a conflict
- * inserts nothing and returns nothing. That's what the route notifies on — a player
- * whose existing answer was left alone gets no frame, because nothing changed for them.
+ * inserts nothing and returns nothing. That's who the route sends the invitation Message
+ * to — a player whose existing answer was left alone gets nothing, because nothing
+ * changed for them.
  *
  * Ids are deduplicated by the composite primary key; an empty list is a no-op that
  * still returns the event.
@@ -728,7 +749,7 @@ export async function inviteToEvent(
 					 ON CONFLICT (event_id, player_id) DO NOTHING
 					 RETURNING rowid AS id, *`
 				)
-				.bind(eventId, playerId, EVENT_RESPONSE.going, at)
+				.bind(eventId, playerId, EVENT_RESPONSE.pending, at)
 		)
 	)
 	const added = inserts.flatMap((r) => r.results)
@@ -736,6 +757,22 @@ export async function inviteToEvent(
 	const updated: PlayerEvent = { ...event, AttendeeCount: await countGoing(db, eventId) }
 	await writeEvent(db, updated)
 	return { event: updated, added }
+}
+
+/**
+ * The players who said they're GOING to an event — who the `PlayerEventUpdated` and
+ * `PlayerEventDeleted` frames go to. Interested, declined and Pending rows are left out:
+ * an invitee who hasn't accepted isn't attending, so nothing about the event has changed
+ * for them. The creator is included through their own Going row from create.
+ */
+export async function getGoingPlayerIds(db: D1Database, eventId: number): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			'SELECT player_id FROM event_attendee WHERE event_id = ?1 AND status = ?2 ORDER BY player_id'
+		)
+		.bind(eventId, EVENT_RESPONSE.going)
+		.all<{ player_id: number }>()
+	return results.map((r) => r.player_id)
 }
 
 /** How many players said they're Going — an event's `AttendeeCount`. */
@@ -830,11 +867,30 @@ export async function updateEvent(
 }
 
 /**
+ * Draw the next event id. Sequential and NEVER reused: the id comes from the
+ * `event_id_seq` AUTOINCREMENT counter, which only ever goes up, rather than from
+ * `MAX(id) + 1` over the events themselves — that handed the newest event's id straight
+ * back out once it was deleted, so a replacement event wore the old one's id and
+ * inherited whatever was still filed under it (an invitation message's `PlayerEventId`,
+ * the client's cache). The drawn row is thrown away in the same batch; only the counter
+ * matters, and SQLite keeps that in `sqlite_sequence` regardless of the rows.
+ */
+async function nextEventId(db: D1Database): Promise<number> {
+	const [drawn] = await db.batch<{ id: number }>([
+		db.prepare('INSERT INTO event_id_seq DEFAULT VALUES RETURNING id'),
+		db.prepare('DELETE FROM event_id_seq'),
+	])
+	const id = drawn.results[0]?.id
+	if (id === undefined) throw new Error('event_id_seq returned no id')
+	return id
+}
+
+/**
  * Delete an event and everything hanging off it — its RSVPs (`event_attendee`) and its tags
  * (`event_tag`) — in one batch, so a cancelled event can't leave rows behind that the
- * attendee counts and the `#tag` search would still find. Event ids are assigned in
- * sequence and never reused, but orphan rows would still be counted against whatever id
- * they name.
+ * attendee counts and the `#tag` search would still find. Event ids are drawn from a
+ * sequence that never reuses one (see {@link nextEventId}), so a deleted event's id is
+ * retired with it — but orphan rows would still be counted against whatever id they name.
  *
  * Answers the event as it was, so the caller can report what it deleted; `null` when there
  * was no such event.

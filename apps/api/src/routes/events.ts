@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { Accessibility, GAME_VERSION } from '@repo/domain'
+import { Accessibility, createNotification, GAME_VERSION, MessageType } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 import { validateAndGetVersion } from '@repo/jwt'
 
@@ -21,6 +21,7 @@ import {
 	getEventsByIds,
 	getEventsByRoom,
 	getEventTags,
+	getGoingPlayerIds,
 	getLiveEvents,
 	inviteToEvent,
 	isEventResponseType,
@@ -70,7 +71,11 @@ import {
 import { createReport } from '../reports-db'
 
 import type { Context } from 'hono'
-import type { PlayerEventResponsePayload } from '../../../notify/src/notification-payloads'
+import type { StoredNotification } from '@repo/domain'
+import type {
+	PlayerEventIdPayload,
+	PlayerEventResponsePayload,
+} from '../../../notify/src/notification-payloads'
 import type { App } from '../context'
 import type { EventAttendeeRow, EventInput, EventTag, PlayerEvent } from '../events-db'
 
@@ -105,12 +110,84 @@ async function notifyEventCreated(
 }
 
 /**
- * Push a `PlayerEventResponseChanged` (83) to each player a bulk invite just added —
- * what puts the event on their screen without a refetch, since an invite writes their
- * response row for them.
+ * Push one frame to every player who is GOING to an event — the audience for a change
+ * to the event itself. Only Going rows (see {@link getGoingPlayerIds}): a player who is
+ * merely invited, interested or declined has nothing on screen to update. The creator
+ * is among them through their own Going row, so their own edit or delete reaches their
+ * client too, the way `PlayerEventCreated` does.
  *
- * Only the players who actually gained a row are notified: an invite that hit an
- * existing answer changed nothing, so there is nothing to tell them about.
+ * `playerIds` is passed in rather than read here because a delete has to read them
+ * BEFORE the rows go. Hub failures are logged and swallowed, and one player's failure
+ * doesn't stop the rest: the change is already stored by the time this runs.
+ */
+async function notifyGoing(
+	c: Context<App>,
+	playerIds: number[],
+	type: NotificationType,
+	payload: Record<string, unknown>,
+	playerEventId: number
+): Promise<void> {
+	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	for (const playerId of playerIds) {
+		try {
+			await hub.notifyPlayer(playerId, type, payload)
+		} catch (err) {
+			logger.error('failed to push player event notification', {
+				notificationType: type,
+				playerEventId,
+				playerId,
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
+	}
+}
+
+/**
+ * Push a `PlayerEventUpdated` (81) to everyone Going to an event that was just edited —
+ * the whole-event update and every single-field edit alike — carrying the event as it
+ * now stands, in the same camelCase {@link toEventNotification} projection the
+ * `PlayerEventCreated` frame uses: the two share a payload shape on the client
+ * (`PlayerEventPayload` in notification-payloads.ts documents its fields; the decoder
+ * accepts either casing).
+ */
+async function notifyEventUpdated(
+	c: Context<App>,
+	event: PlayerEvent,
+	tags: EventTag[]
+): Promise<void> {
+	const payload: Record<string, unknown> = { ...toEventNotification(event, tags) }
+	await notifyGoing(
+		c,
+		await getGoingPlayerIds(c.env.DB, event.PlayerEventId),
+		NotificationType.PlayerEventUpdated,
+		payload,
+		event.PlayerEventId
+	)
+}
+
+/**
+ * Push a `PlayerEventDeleted` (82) to everyone who was Going to an event that was just
+ * deleted, so it leaves their screen. The frame is just the id — there is no event left
+ * to carry. `playerIds` must have been read before the delete took the RSVP rows with it.
+ */
+async function notifyEventDeleted(
+	c: Context<App>,
+	playerIds: number[],
+	playerEventId: number
+): Promise<void> {
+	const payload = { PlayerEventId: playerEventId } satisfies PlayerEventIdPayload
+	await notifyGoing(c, playerIds, NotificationType.PlayerEventDeleted, payload, playerEventId)
+}
+
+/**
+ * Push a `PlayerEventResponseChanged` (83) to a player who just ANSWERED an event
+ * (`POST /api/playerevents/v1/respond`) — what puts the event on their screen without a
+ * refetch. This is the responder's own frame, carrying their own row.
+ *
+ * An INVITE does not send this. What an invitee gets is the invitation as a Message
+ * (see {@link pushEventInvitation}); their Pending row is not a response, and the
+ * client populates the event from this frame only once they have actually responded.
+ * Sending it on invite made the event appear as if the player had already answered.
  *
  * The frame carries BOTH nested objects the client's decoder expects. That is not
  * optional — several of its handlers dereference one level down with no null guard, so
@@ -120,30 +197,100 @@ async function notifyEventCreated(
  * response in the PascalCase {@link toEventResponse} one the RSVP list serves; the
  * decoder accepts either casing, so the two need not agree.
  *
- * Hub failures are logged and swallowed, and one player's failure doesn't stop the
- * rest: the invites are already stored by the time this runs.
+ * Hub failures are logged and swallowed: the answer is already stored by the time this
+ * runs.
+ */
+async function notifyResponseChanged(
+	c: Context<App>,
+	event: PlayerEvent,
+	response: EventAttendeeRow
+): Promise<void> {
+	const payload = {
+		PlayerEvent: { ...toEventNotification(event) },
+		PlayerEventResponse: { ...toEventResponse(response) },
+	} satisfies PlayerEventResponsePayload
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			response.player_id,
+			NotificationType.PlayerEventResponseChanged,
+			payload
+		)
+	} catch (err) {
+		logger.error('failed to push PlayerEventResponseChanged notification', {
+			playerEventId: event.PlayerEventId,
+			playerId: response.player_id,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * Tell each player a bulk invite just added about it: the invitation as a Message of
+ * type 81 `PlayerEventInvitation`, stored and pushed as `MessageReceived` — see
+ * {@link pushEventInvitation}. That Message is the whole of what an invitee is sent; the
+ * `PlayerEventResponseChanged` frame is theirs only once they answer.
+ *
+ * Only the players who actually gained a row are notified: an invite that hit an
+ * existing answer changed nothing, so there is nothing to tell them about. One player's
+ * failure doesn't stop the rest: the invites are already stored by the time this runs.
  */
 async function notifyInvited(
 	c: Context<App>,
+	inviterId: number,
 	event: PlayerEvent,
 	added: EventAttendeeRow[]
 ): Promise<void> {
-	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
-	const PlayerEvent = { ...toEventNotification(event) }
 	for (const row of added) {
-		const payload = {
-			PlayerEvent,
-			PlayerEventResponse: { ...toEventResponse(row) },
-		} satisfies PlayerEventResponsePayload
-		try {
-			await hub.notifyPlayer(row.player_id, NotificationType.PlayerEventResponseChanged, payload)
-		} catch (err) {
-			logger.error('failed to push PlayerEventResponseChanged notification', {
-				playerEventId: event.PlayerEventId,
-				playerId: row.player_id,
-				error: err instanceof Error ? err.message : String(err),
-			})
-		}
+		await pushEventInvitation(c, inviterId, row.player_id, event.PlayerEventId)
+	}
+}
+
+/**
+ * Store and push the invitation Message a bulk invite shows the invitee: a Message of
+ * type 81 `PlayerEventInvitation` from the inviter, delivered as `MessageReceived` and
+ * kept in the inbox (`GET /api/messages/v2/get`) so a player who was offline still finds
+ * it. The event is named twice — on the row's own `PlayerEventId` column, and as `Data`,
+ * the event id as a STRING (a Message's `Data` is always a string on the wire).
+ *
+ * The row is committed before the push; a hub failure is logged and swallowed, since the
+ * invite itself is already stored.
+ */
+async function pushEventInvitation(
+	c: Context<App>,
+	fromPlayerId: number,
+	toPlayerId: number,
+	playerEventId: number
+): Promise<void> {
+	let message: StoredNotification
+	try {
+		message = await createNotification(c.env.DB, {
+			FromPlayerId: fromPlayerId,
+			ToPlayerId: toPlayerId,
+			Type: MessageType.PlayerEventInvitation,
+			Data: String(playerEventId),
+			PlayerEventId: playerEventId,
+		})
+	} catch (err) {
+		logger.error('failed to store PlayerEventInvitation message', {
+			playerEventId,
+			toPlayerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+		return
+	}
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			toPlayerId,
+			NotificationType.MessageReceived,
+			{ ...message }
+		)
+	} catch (err) {
+		logger.error('failed to push PlayerEventInvitation MessageReceived notification', {
+			notificationId: message.Id,
+			playerEventId,
+			toPlayerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
 	}
 }
 
@@ -151,12 +298,13 @@ async function notifyInvited(
  * Wrap an event in the v2 envelope for THIS caller's build.
  *
  * Rec Room reshaped `PlayerEvent.Tags` without minting a new path, so the same endpoint
- * owes the 2023 build `[{ Tag, Type }]` and the 2025 build `["celebration"]`. The build
+ * owes the 2023 build `["celebration"]` and anything newer `[{ Tag, Type }]`. The build
  * comes off the token's `rn.ver` claim — the request carries no version of its own — and
  * the split is the one `/api/gameconfigs/v1/all` already makes: anything NEWER than
- * `GAME_VERSION` (20230414) is the 2025 client; that build, anything older, and a request
- * with no readable token version all get the 2023 shape. Builds are date-stamped, so they
- * order as strings.
+ * `GAME_VERSION` (20230414) gets the pairs; that build, anything older, and a request
+ * with no readable token version all get the 2023 names. Builds are date-stamped, so they
+ * order as strings. `TagModifyResult.Tags` is a name list to every build — only the
+ * inline field moves.
  *
  * Like the other version gates here the claim is unverified — a client that lies about its
  * build only empties its own tag chips.
@@ -164,7 +312,7 @@ async function notifyInvited(
 async function eventResult(c: Context<App>, event: PlayerEvent, tags: EventTag[]) {
 	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
 	const isModernBuild = version !== null && version > GAME_VERSION
-	return toEventResult(event, tags, !isModernBuild)
+	return toEventResult(event, tags, isModernBuild)
 }
 
 /**
@@ -180,6 +328,7 @@ async function eventResult(c: Context<App>, event: PlayerEvent, tags: EventTag[]
  *
  * These edits are creator-only like the whole-event update, and they go through the same
  * {@link updateEvent}, so a patch touching one field leaves the rest of the event alone.
+ * Like it, each pushes a `PlayerEventUpdated` to everyone Going.
  */
 function editEventField(
 	parse: (c: Context<App>, event: PlayerEvent) => Promise<EventInput | null>
@@ -199,7 +348,9 @@ function editEventField(
 		if (input === null) return c.body(null, 400)
 		const updated = await updateEvent(c.env.DB, eventId, input)
 		// updateEvent only returns null when the row vanished, which the read above rules out.
-		return c.json(await eventResult(c, updated!, await getEventTags(c.env.DB, eventId)))
+		const tags = await getEventTags(c.env.DB, eventId)
+		await notifyEventUpdated(c, updated!, tags)
+		return c.json(await eventResult(c, updated!, tags))
 	}
 }
 
@@ -546,8 +697,13 @@ export const eventRoutes = new Hono<App>({ strict: false })
 				'event. Answers the same `{ Result, TagModifyResult, PlayerEvent }` envelope the ' +
 				'v2 writes do, carrying the event with its updated count, so the client can ' +
 				're-render from the response.\n\n' +
-				'A body with no usable `PlayerEventId`, or a `Type` outside 0–2, is a 400; an ' +
-				'unknown event is a 404.',
+				'The caller is also pushed a `PlayerEventResponseChanged` frame carrying the event ' +
+				'and their new response row — this frame, not the invite, is what populates the ' +
+				'event on the client. An invitee answering Pending → Going gets it here like ' +
+				'anyone else.\n\n' +
+				'A body with no usable `PlayerEventId`, or a `Type` outside 0–2, is a 400 — 3 ' +
+				'Pending is the server’s own mark for an unanswered invite, not an answer a ' +
+				'player can give; an unknown event is a 404.',
 			security: AUTHED,
 			requestBody: jsonBody(PlayerEventRespondRequest, 'The event and the answer'),
 			responses: {
@@ -570,9 +726,10 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			// Going would silently inflate the count.
 			if (!Number.isInteger(eventId) || !isEventResponseType(type)) return c.body(null, 400)
 
-			const updated = await setEventResponse(c.env.DB, eventId, id, type)
-			if (updated === null) return c.body(null, 404)
-			return c.json(await eventResult(c, updated, await getEventTags(c.env.DB, eventId)))
+			const result = await setEventResponse(c.env.DB, eventId, id, type)
+			if (result === null) return c.body(null, 404)
+			await notifyResponseChanged(c, result.event, result.response)
+			return c.json(await eventResult(c, result.event, await getEventTags(c.env.DB, eventId)))
 		}
 	)
 
@@ -640,20 +797,30 @@ export const eventRoutes = new Hono<App>({ strict: false })
 	)
 
 	// Bulk invite — the "invite friends" button on an event. Adds the invited players to
-	// the same `event_attendee` table an RSVP writes to, as Going.
+	// the same `event_attendee` table an RSVP writes to, as Pending (3) — an open
+	// invitation, not an acceptance.
 	.post(
 		'/api/playerevents/v1/bulkInvite',
 		describeRoute({
 			tags: ['Events'],
 			summary: 'Invite players to an event',
 			description:
-				'Adds the invited players to the event as Going — the same `event_attendee` rows ' +
-				'an RSVP writes, so an invited player shows up in `…/responses` and counts toward ' +
-				'`AttendeeCount` immediately, without having answered.\n\n' +
+				'Adds the invited players to the event as Pending (`Type` 3) — the same ' +
+				'`event_attendee` rows an RSVP writes, so an invited player shows up in ' +
+				'`…/responses` with an open invitation. Pending is not Going: the invitee does not ' +
+				'count toward `AttendeeCount` until they answer through `…/respond`. (Inviting as ' +
+				'Going made the invitation look already accepted on the client.)\n\n' +
 				'An invite never overwrites an answer: a player who already responded keeps what ' +
-				'they said, so inviting someone who declined does not flip them back to Going, and ' +
+				'they said, so inviting someone who declined does not reset them to Pending, and ' +
 				're-inviting is a no-op. The caller is skipped (they are already on the list), as ' +
 				'are duplicate ids.\n\n' +
+				'Each newly invited player is sent the invitation as a Message of type 81 ' +
+				'`PlayerEventInvitation` from the caller — stored in their inbox ' +
+				'(`GET /api/messages/v2/get`) and pushed as `MessageReceived`, with the event id ' +
+				'on `PlayerEventId` and, as a string, in `Data`. That is all an invitee gets: no ' +
+				'`PlayerEventResponseChanged` is pushed on invite — that frame is what `…/respond` ' +
+				'sends once they answer, and is what populates the event on their client. ' +
+				'Players whose existing answer was left alone get nothing.\n\n' +
 				'The caller must be on the event themselves — its creator, or a player with a ' +
 				'response row of any kind. Anyone else gets 403: an invite adds attendees, so it ' +
 				'is not something a passer-by can do. Answers the same ' +
@@ -662,7 +829,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			security: AUTHED,
 			requestBody: jsonBody(PlayerEventBulkInviteRequest, 'The event and who to invite'),
 			responses: {
-				200: json(PlayerEventResultDto, 'The event, with its updated attendee count'),
+				200: json(PlayerEventResultDto, 'The event (its attendee count is unchanged by an invite)'),
 				400: { description: 'Missing `PlayerEventId` or `InvitedPlayerIds` (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 				403: { description: 'The caller is not on the event (empty body)' },
@@ -702,7 +869,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			]
 			const result = await inviteToEvent(c.env.DB, eventId, invited)
 			// inviteToEvent only returns null when the row vanished, which the read above rules out.
-			await notifyInvited(c, result!.event, result!.added)
+			await notifyInvited(c, id, result!.event, result!.added)
 			return c.json(await eventResult(c, result!.event, await getEventTags(c.env.DB, eventId)))
 		}
 	)
@@ -781,6 +948,9 @@ export const eventRoutes = new Hono<App>({ strict: false })
 				'Deletes an event the caller created, along with its RSVPs and its tags — an event ' +
 				'whose attendee rows outlived it would still be counted, and its tags would still ' +
 				'answer `#tag` searches.\n\n' +
+				'Everyone who was GOING to the event (the creator included) is pushed a ' +
+				'`PlayerEventDeleted` frame naming the event id, so it leaves their screen; ' +
+				'interested, declined and still-Pending invitees are not.\n\n' +
 				'Creator only: anyone else gets 403, and an unknown event 404. Answers the v2 ' +
 				'envelope with `PlayerEvent` and `TagModifyResult` both null — the event is gone, ' +
 				'so there is nothing for the client to redraw from, and it reads only `Result`. ' +
@@ -804,7 +974,10 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			if (existing === null) return c.body(null, 404)
 			if (existing.CreatorPlayerId !== id) return c.body(null, 403)
 
+			// Who to tell has to be read BEFORE the delete: it takes the RSVP rows with it.
+			const going = await getGoingPlayerIds(c.env.DB, eventId)
 			await deleteEvent(c.env.DB, eventId)
+			await notifyEventDeleted(c, going, eventId)
 			// Both payload fields are null here — the delete envelope is not the one the other
 			// v2 routes answer with. Nothing is left to redraw, and the client reads `Result`.
 			return c.json(EVENT_DELETED_RESULT)
@@ -857,6 +1030,9 @@ export const eventRoutes = new Hono<App>({ strict: false })
 				'The id, the creator and the attendee count are not editable: ownership doesn’t ' +
 				'transfer and RSVPs aren’t set by hand. Creator only — anyone else gets 403, and ' +
 				'an unknown event is 404. Answers the same envelope as create.\n\n' +
+				'Everyone who is GOING to the event (the creator included) is pushed a ' +
+				'`PlayerEventUpdated` frame carrying the edited event; interested, declined and ' +
+				'still-Pending invitees are not. The single-field edits push the same frame.\n\n' +
 				'The 24-hour window cap applies to what the post RESOLVES to, not to what it ' +
 				'carries: moving the start alone still has to leave a window that ends after it ' +
 				'and runs no longer than a day against the STORED end.',
@@ -891,7 +1067,9 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			if (eventInputRejection(input, existing) !== null) return c.body(null, 400)
 			const updated = await updateEvent(c.env.DB, eventId, input)
 			// updateEvent only returns null when the row vanished, which the read above rules out.
-			return c.json(await eventResult(c, updated!, await getEventTags(c.env.DB, eventId)))
+			const tags = await getEventTags(c.env.DB, eventId)
+			await notifyEventUpdated(c, updated!, tags)
+			return c.json(await eventResult(c, updated!, tags))
 		}
 	)
 

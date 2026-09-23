@@ -8034,10 +8034,10 @@ describe('player events', () => {
 		expect(body.Result).toBe(0)
 		expect(body.PlayerEvent.Name).toBe('Enveloped')
 		// The tags ride inline on the event AND in TagModifyResult. Inline they take the
-		// caller's build shape — this token names no build, so the 2023 `{ Tag, Type }` pairs
-		// (PascalCase: not the lowercase pairs the v1 read's `tags` serves). TagModifyResult
-		// is names to every build.
-		expect(body.PlayerEvent.Tags).toEqual([{ Tag: 'music', Type: 0 }])
+		// caller's build shape — this token names no build, so the 2023 bare names (a newer
+		// build gets the PascalCase `{ Tag, Type }` pairs). TagModifyResult is names to every
+		// build.
+		expect(body.PlayerEvent.Tags).toEqual(['music'])
 		expect(body.TagModifyResult).toEqual({ Result: 0, Tags: ['music'] })
 		// No `State`, and the broadcast instance is present and null.
 		expect(body.PlayerEvent).not.toHaveProperty('State')
@@ -8046,7 +8046,7 @@ describe('player events', () => {
 
 	test('the v2 envelope shapes PlayerEvent.Tags per the caller’s build', async () => {
 		// Rec Room reshaped this field without minting a new path, so one endpoint owes two
-		// shapes: the 2023 build parses `{ Tag, Type }` pairs, the 2025 build bare names.
+		// shapes: the 2023 build parses bare names, anything newer `{ Tag, Type }` pairs.
 		// Serving either to the wrong build empties the event's chips instead of erroring.
 		// A tag of this test's own: the `#tag` search tests assert exact result sets, and the
 		// four events below would join any set they share a tag with.
@@ -8066,16 +8066,18 @@ describe('player events', () => {
 			return (await res.json()) as PlayerEventResult
 		}
 
-		// Newer than 20230414 is the 2025 client; that build, an older one, and a token naming
-		// no build at all are all the 2023 client. Builds are date-stamped, so they compare as
-		// strings.
-		expect((await created('20250718.01')).PlayerEvent.Tags).toEqual(NAMES)
-		expect((await created('20230414')).PlayerEvent.Tags).toEqual(PAIRS)
-		expect((await created('20220101')).PlayerEvent.Tags).toEqual(PAIRS)
+		// Newer than 20230414 gets the pairs; that build, an older one, and a token naming
+		// no build at all are all the 2023 client and get names. Builds are date-stamped, so
+		// they compare as strings.
+		expect((await created('20250718.01')).PlayerEvent.Tags).toEqual(PAIRS)
+		expect((await created('20230414')).PlayerEvent.Tags).toEqual(NAMES)
+		expect((await created('20220101')).PlayerEvent.Tags).toEqual(NAMES)
 		const legacy = await created()
-		expect(legacy.PlayerEvent.Tags).toEqual(PAIRS)
-		// Only the inline field moves: TagModifyResult carries names to both builds.
+		expect(legacy.PlayerEvent.Tags).toEqual(NAMES)
+		// Only the inline field moves: TagModifyResult carries names to both builds — it
+		// really is a List<string> on the client, so the pairs must never land there.
 		expect(legacy.TagModifyResult).toEqual({ Result: 0, Tags: NAMES })
+		expect((await created('20250718.01')).TagModifyResult).toEqual({ Result: 0, Tags: NAMES })
 
 		// The gate is on the ENVELOPE, not on the create: the read and the field edits answer
 		// the same shape, so a client that made an event and one opening it cold agree.
@@ -8088,8 +8090,8 @@ describe('player events', () => {
 					})
 				).json()) as PlayerEventResult
 			).PlayerEvent.Tags
-		expect(await read('20250718.01')).toEqual(NAMES)
-		expect(await read()).toEqual(PAIRS)
+		expect(await read('20250718.01')).toEqual(PAIRS)
+		expect(await read()).toEqual(NAMES)
 	})
 
 	test('GET /api/playerevents/v2/:eventId serves the same envelope as the write', async () => {
@@ -8682,7 +8684,7 @@ describe('player events', () => {
 		).toBe(401)
 	})
 
-	test('POST /api/playerevents/v1/bulkInvite adds invitees as Going without overwriting answers', async () => {
+	test('POST /api/playerevents/v1/bulkInvite adds invitees as Pending without overwriting answers', async () => {
 		const event = await create({ RoomId: 3, Name: 'Invite Test', StartTime: at(HOUR) })
 		const id = event.PlayerEventId
 
@@ -8698,8 +8700,9 @@ describe('player events', () => {
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as PlayerEventResult
 		expect(body.Result).toBe(0)
-		// The creator plus the two newly invited — 43 keeps their decline, so isn't counted.
-		expect(body.PlayerEvent.AttendeeCount).toBe(3)
+		// Only the creator: an invite is Pending, not Going, so the two newly invited don't
+		// count until they answer — and 43 keeps their decline.
+		expect(body.PlayerEvent.AttendeeCount).toBe(1)
 
 		const responses = (await (await get(`/api/playerevents/v1/${id}/responses`)).json()) as Array<{
 			PlayerId: number
@@ -8708,10 +8711,10 @@ describe('player events', () => {
 		expect(
 			responses.sort((a, b) => a.PlayerId - b.PlayerId).map((r) => [r.PlayerId, r.Type])
 		).toEqual([
-			[2, 0],
+			[2, 3],
 			[42, 0],
 			[43, 2],
-			[187, 0],
+			[187, 3],
 		])
 
 		// Re-inviting is a no-op, not a reset: 43 still declines and the count holds.
@@ -8720,14 +8723,23 @@ describe('player events', () => {
 			{ PlayerEventId: id, InvitedPlayerIds: [187, 43] },
 			'42'
 		)
-		expect(((await again.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(3)
+		expect(((await again.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(1)
 
 		// An empty list is a no-op that still answers the event.
 		const none = await post('/api/playerevents/v1/bulkInvite', {
 			PlayerEventId: id,
 			InvitedPlayerIds: [],
 		})
-		expect(((await none.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(3)
+		expect(((await none.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(1)
+
+		// Accepting the invite is an ordinary respond: Pending becomes Going and counts.
+		const accepted = await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 0 }, '2')
+		expect(((await accepted.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(2)
+
+		// Pending is the server's mark, not an answer a player can give.
+		expect(
+			(await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 3 }, '187')).status
+		).toBe(400)
 	})
 
 	test('POST /api/playerevents/v1/bulkInvite notifies only the players it actually added', async () => {
@@ -8745,17 +8757,57 @@ describe('player events', () => {
 			data: Record<string, Record<string, unknown>>
 		}>
 
-		// One frame, to the one player who gained a row. 43 kept their answer, so nothing
+		// ONE frame, to the one player who gained a row: the invitation Message. No
+		// PlayerEventResponseChanged — a Pending row is not a response; that frame is the
+		// responder's, sent by `respond` once they answer. 43 kept their answer, so nothing
 		// changed for them and nothing is pushed.
+		expect(sent).toHaveLength(1)
+		expect(sent[0]!.playerId).toBe(2)
+		expect(sent[0]!.notificationType).toBe(2) // MessageReceived
+
+		// A PlayerEventInvitation (81) Message from the inviter, naming the event on
+		// PlayerEventId and as a string in Data.
+		expect(sent[0]!.data).toMatchObject({
+			FromPlayerId: 42,
+			ToPlayerId: 2,
+			Type: 81,
+			Data: String(id),
+			PlayerEventId: id,
+		})
+		// Stored under the same id, so an offline invitee finds it on login.
+		const frameId = (sent[0]!.data as unknown as { Id: number }).Id
+		expect(frameId).toBeGreaterThan(0)
+		const inbox = (await (
+			await exports.default.fetch(`${ORIGIN}/api/messages/v2/get`, { headers: await bearer('2') })
+		).json()) as Array<{ Id: number; Type: number; PlayerEventId: number | null }>
+		expect(inbox.find((m) => m.Id === frameId)).toMatchObject({ Type: 81, PlayerEventId: id })
+	})
+
+	test('POST /api/playerevents/v1/respond pushes PlayerEventResponseChanged to the responder', async () => {
+		const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const event = await create({ RoomId: 3, Name: 'RSVP Frames', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		await post('/api/playerevents/v1/bulkInvite', { PlayerEventId: id, InvitedPlayerIds: [2] })
+
+		// The invitee accepts: THIS is where their response frame comes from — the frame
+		// that populates the event on their client — carrying their row as it now stands.
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 0 }, '2')
+		const sent = (await (await hub.fetch('http://do/all')).json()) as Array<{
+			playerId: number
+			notificationType: number
+			data: Record<string, Record<string, unknown>>
+		}>
 		expect(sent).toHaveLength(1)
 		expect(sent[0]!.playerId).toBe(2)
 		expect(sent[0]!.notificationType).toBe(83) // PlayerEventResponseChanged
 
 		// BOTH nested objects are present — the client dereferences them without a null
 		// guard, so a missing one is a NullReferenceException rather than a blank field.
+		// The event carries the count as recomputed AFTER the answer.
 		expect(sent[0]!.data.PlayerEvent).toMatchObject({
 			playerEventId: id,
-			name: 'Invite Frames',
+			name: 'RSVP Frames',
 			attendeeCount: 2,
 		})
 		expect(sent[0]!.data.PlayerEventResponse).toEqual({
@@ -8765,6 +8817,106 @@ describe('player events', () => {
 			CreatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
 			Type: 0,
 		})
+
+		// Changing the answer pushes again, with the same row id and the new Type — the
+		// upsert updates in place, so the frame's id matches what the RSVP list serves.
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 2 }, '2')
+		const again = (await (await hub.fetch('http://do/all')).json()) as typeof sent
+		expect(again).toHaveLength(1)
+		expect(again[0]!.data.PlayerEventResponse).toMatchObject({
+			PlayerEventResponseId: sent[0]!.data.PlayerEventResponse!.PlayerEventResponseId,
+			Type: 2,
+		})
+		expect(again[0]!.data.PlayerEvent).toMatchObject({ attendeeCount: 1 })
+	})
+
+	test('a deleted event’s id is never reused by a later create', async () => {
+		// Ids used to be MAX(id) + 1 over the table, so deleting the newest event handed its
+		// id to the next one created — which then inherited everything still filed under
+		// that id outside the event's own rows (an invitation message, the client's cache).
+		const first = await create({ RoomId: 3, Name: 'First', StartTime: at(HOUR) })
+		expect(
+			(await post(`/api/playerevents/v2/delete/${first.PlayerEventId}`, undefined)).status
+		).toBe(200)
+		const second = await create({ RoomId: 3, Name: 'Second', StartTime: at(HOUR) })
+		expect(second.PlayerEventId).toBeGreaterThan(first.PlayerEventId)
+		// And the replacement starts with its own guest list: just its creator.
+		const responses = (await (
+			await get(`/api/playerevents/v1/${second.PlayerEventId}/responses`)
+		).json()) as Array<{ PlayerId: number }>
+		expect(responses.map((r) => r.PlayerId)).toEqual([42])
+	})
+
+	test('editing an event pushes PlayerEventUpdated to everyone Going, and only them', async () => {
+		const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const event = await create({ RoomId: 3, Name: 'Before', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		// 2 is Going, 43 is Interested, 44 declined, 45 is invited and still Pending.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 0 }, '2')
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 1 }, '43')
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 2 }, '44')
+		await post('/api/playerevents/v1/bulkInvite', { PlayerEventId: id, InvitedPlayerIds: [45] })
+
+		const frames = async () =>
+			(await (await hub.fetch('http://do/all')).json()) as Array<{
+				playerId: number
+				notificationType: number
+				data: Record<string, unknown>
+			}>
+
+		// The whole-event update: the creator (Going from create) and 2 hear about it, with
+		// the event as it now stands in the camelCase projection PlayerEventCreated uses.
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		const res = await post(`/api/playerevents/v2/${id}`, { Name: 'After' })
+		expect(res.status).toBe(200)
+		const sent = await frames()
+		expect(sent.map((s) => [s.playerId, s.notificationType])).toEqual([
+			[2, 81], // PlayerEventUpdated
+			[42, 81],
+		])
+		for (const frame of sent) {
+			expect(frame.data).toMatchObject({ playerEventId: id, name: 'After', attendeeCount: 2 })
+		}
+
+		// A single-field edit pushes the same frame to the same audience.
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		const renamed = await exports.default.fetch(`${ORIGIN}/api/playerevents/v2/${id}/name`, {
+			method: 'PUT',
+			headers: { ...(await bearer('42')), 'content-type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ name: 'Renamed' }),
+		})
+		expect(renamed.status).toBe(200)
+		const again = await frames()
+		expect(again.map((s) => [s.playerId, s.notificationType])).toEqual([
+			[2, 81],
+			[42, 81],
+		])
+		expect(again[0]!.data).toMatchObject({ name: 'Renamed' })
+	})
+
+	test('deleting an event pushes PlayerEventDeleted to everyone who was Going, and only them', async () => {
+		const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const event = await create({ RoomId: 3, Name: 'Doomed', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 0 }, '2')
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 1 }, '43')
+		await post('/api/playerevents/v1/bulkInvite', { PlayerEventId: id, InvitedPlayerIds: [45] })
+
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		const res = await post(`/api/playerevents/v2/delete/${id}`, undefined)
+		expect(res.status).toBe(200)
+		const sent = (await (await hub.fetch('http://do/all')).json()) as Array<{
+			playerId: number
+			notificationType: number
+			data: Record<string, unknown>
+		}>
+		// The audience is read before the RSVP rows are deleted with the event; the frame
+		// is just the id, there being no event left to carry.
+		expect(sent).toEqual([
+			{ playerId: 2, notificationType: 82, data: { PlayerEventId: id } }, // PlayerEventDeleted
+			{ playerId: 42, notificationType: 82, data: { PlayerEventId: id } },
+		])
 	})
 
 	test('POST /api/playerevents/v1/bulkInvite is gated on the caller being on the event', async () => {
@@ -9031,11 +9183,9 @@ describe('player events', () => {
 		const path = `/api/playerevents/v2/${event.PlayerEventId}/tags`
 
 		// A bare JSON array, not an object — and a replace, not a merge, so `meetup` goes.
+		// Names, since this token names no build (a newer build would get the pairs).
 		const tagged = await edited(await putJson(path, ['tag1', '#Class']))
-		expect(tagged.Tags).toEqual([
-			{ Tag: 'class', Type: 0 },
-			{ Tag: 'tag1', Type: 0 },
-		])
+		expect(tagged.Tags).toEqual(['class', 'tag1'])
 		// The envelope's TagModifyResult reports the same set the client redraws chips from.
 		const body = (await (await putJson(path, ['workshops'])).json()) as PlayerEventResult
 		expect(body.TagModifyResult).toEqual({ Result: 0, Tags: ['workshops'] })

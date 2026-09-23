@@ -4,9 +4,9 @@
 -- normal relational table rather than a JSON blob. Owned by the `api` worker;
 -- generated from src/events-db.ts (SCHEMA_DDL) — keep in sync.
 --
--- `status` is the response type: 0 Going, 1 Interested, 2 Can't go. Only Going
--- counts toward the event's `AttendeeCount`, which is recomputed from this table on
--- every response. A decline is recorded rather than deleted, so the client can show
+-- `status` is the response type: 0 Going, 1 Interested, 2 Can't go, 3 Pending (a bulk
+-- invite's row for a player who hasn't answered yet). Only Going counts toward the
+-- event's `AttendeeCount`, which is recomputed from this table on every response. A decline is recorded rather than deleted, so the client can show
 -- a player their own answer and changing your mind is an UPDATE (the composite
 -- primary key is what makes the upsert a replace).
 --

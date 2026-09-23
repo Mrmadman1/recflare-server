@@ -1150,15 +1150,16 @@ export const PlayerEventBaseDto = PlayerEventDto.omit({ State: true, ImageName: 
  * image.
  *
  * `Tags` has two shapes, picked from the caller's build: Rec Room reshaped it without
- * minting a new path, so a build newer than `20230414` gets the tag NAMES and every older
- * one (and any caller whose token names no build) gets the `{ Tag, Type }` pairs. Neither
- * is the lowercase `{ tag, type }` the v1 read serves.
+ * minting a new path, so a build newer than `20230414` gets the `{ Tag, Type }` pairs and
+ * that build, every older one, and any caller whose token names no build get the tag
+ * NAMES. Neither is the lowercase `{ tag, type }` the v1 read serves. `TagModifyResult.Tags`
+ * is a name list to every build.
  */
 export const PlayerEventEnvelopeDto = PlayerEventBaseDto.extend({
 	Tags: z
 		.union([z.array(z.string()), z.array(z.object({ Tag: z.string(), Type: z.int() }))])
 		.describe(
-			'The event’s tags: names for a build newer than 20230414, `{ Tag, Type }` pairs for ' +
+			'The event’s tags: `{ Tag, Type }` pairs for a build newer than 20230414, names for ' +
 				'that build and older'
 		),
 })
@@ -1176,7 +1177,7 @@ export const PlayerEventResultDto = z.object({
 	Result: z.int().describe('0 = success'),
 	TagModifyResult: z.object({
 		Result: z.int().describe('0 = success'),
-		Tags: z.array(z.string()).describe('The tags the event now carries'),
+		Tags: z.array(z.string()).describe('The tags the event now carries — names to every build'),
 	}),
 })
 
@@ -1264,7 +1265,9 @@ export const PlayerEventResponseDto = z.object({
 			'When the answer that stands was given — a changed answer updates the row, so this ' +
 				'moves with it rather than recording the player’s first response'
 		),
-	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
+	Type: z
+		.int()
+		.describe('0 Going, 1 Interested, 2 Can’t go, 3 Pending (invited, not yet answered)'),
 })
 
 /** `POST /api/playerevents/v1/respond` JSON body — how the caller is answering. */
