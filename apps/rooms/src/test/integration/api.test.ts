@@ -4819,6 +4819,84 @@ describe('rooms endpoints', () => {
 		})
 	})
 
+	it('POST /rooms/:id/subrooms/:sid/move re-parents a subroom when the caller manages both rooms', async () => {
+		// Source 710 is owned by 1 with two subrooms; target 711 is owned by 5 with 1 as a
+		// CO-OWNER (the move gate is manage, not own); 712 is somebody else's entirely.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 710,
+			Name: 'MoveSource',
+			CreatorAccountId: 1,
+			SubRooms: [
+				{ SubRoomId: 910, UnitySceneId: 'x', MaxPlayers: 4 },
+				{ SubRoomId: 911, UnitySceneId: 'x', MaxPlayers: 4 },
+			],
+		})
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 711,
+			Name: 'MoveTarget',
+			CreatorAccountId: 5,
+			Roles: [{ AccountId: 1, Role: 30, LastChangedByAccountId: null, InvitedRole: 0 }],
+			SubRooms: [{ SubRoomId: 912, UnitySceneId: 'x', MaxPlayers: 4 }],
+		})
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 712,
+			Name: 'NotMine',
+			CreatorAccountId: 999,
+			SubRooms: [{ SubRoomId: 913, UnitySceneId: 'x', MaxPlayers: 4 }],
+		})
+		const move = async (roomId: number, subRoomId: number, newRoomId: string, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/move`, {
+				method: 'POST',
+				headers: {
+					...(sub ? await bearer(sub) : {}),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ newRoomId }).toString(),
+			})
+		type Envelope = {
+			Value: { RoomId: number; SubRooms: Array<{ SubRoomId: number; RoomId: number }> } | null
+			Success: boolean
+			Error: string | null
+			error_id: null
+		}
+		const envelope = async (res: Response) => (await res.json()) as Envelope
+
+		// No token → 401. Every other refusal is a 200 with Success:false and Value:null.
+		expect((await move(710, 910, '711')).status).toBe(401)
+		const refused = async (res: Response) => {
+			expect(res.status).toBe(200)
+			const body = await envelope(res)
+			expect(body).toMatchObject({ Value: null, Success: false, error_id: null })
+			expect(typeof body.Error).toBe('string')
+		}
+		await refused(await move(710, 910, '711', '999')) // can't manage the source
+		await refused(await move(710, 910, '712', '1')) // can't manage the target
+		await refused(await move(710, 910, '424242', '1')) // no such target
+		await refused(await move(710, 910, '710', '1')) // already there
+		await refused(await move(710, 910, '', '1')) // no newRoomId
+		await refused(await move(710, 99999, '711', '1')) // no such subroom
+		await refused(await move(712, 913, '711', '999')) // 999 owns 712 but not 711
+		// Nothing moved on any of those.
+		expect(await subRoomOf(710, 910)).toBeDefined()
+		expect(await subRoomOf(711, 910)).toBeUndefined()
+
+		// Owner of the source and co-owner of the target → moved. Value is the SOURCE room,
+		// which no longer lists the subroom, in the PascalCase envelope.
+		const res = await move(710, 910, '711', '1')
+		expect(res.status).toBe(200)
+		const body = await envelope(res)
+		expect(body).toMatchObject({ Success: true, Error: null, error_id: null })
+		expect(body.Value?.RoomId).toBe(710)
+		expect(body.Value?.SubRooms.map((s) => s.SubRoomId)).toEqual([911])
+		// It now reads as the target's, with its RoomId re-injected from the column.
+		expect(await subRoomOf(710, 910)).toBeUndefined()
+		expect(await subRoomOf(711, 910)).toMatchObject({ SubRoomId: 910, RoomId: 711 })
+
+		// The source's last subroom can't leave — the room would have no scene to load.
+		await refused(await move(710, 911, '711', '1'))
+		expect(await subRoomOf(710, 911)).toBeDefined()
+	})
+
 	it('subroom clone mints a globally-unique SubRoomId (no cross-room clash)', async () => {
 		// The old per-room `max(SubRoomId)+1` allocator would mint id 3 for room 2's clone —
 		// colliding with another room that already owns subroom 3. The subroom table's
@@ -5225,6 +5303,7 @@ describe('rooms endpoints', () => {
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',
+			'POST /rooms/{roomId}/subrooms/{subRoomId}/move',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save',
 			'PUT /rooms/{roomId}/accessibility',
 			'PUT /rooms/{roomId}/cloning',

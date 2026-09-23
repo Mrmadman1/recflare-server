@@ -822,6 +822,25 @@ export const PublishSaveRequest = z.object({
 	subRoomDataSaveId: z.string().describe('The `SubRoomDataSaveId` to make live'),
 })
 
+/** `POST /rooms/{roomId}/subrooms/{subRoomId}/move` — form body naming the destination. */
+export const MoveSubRoomRequest = z.object({
+	newRoomId: z.string().describe('The `RoomId` to move the subroom into'),
+})
+
+/**
+ * What the subroom move answers: the SOURCE room (which no longer lists the subroom) under
+ * `Value`, in the PascalCase `{ Value, Success, Error, error_id }` envelope — the same mixed
+ * casing the unprefixed isBanned check has ({@link IsBannedPascalEnvelope}), NOT the
+ * lowercase `{ success, error, value }` every other subroom mutation answers. Kept apart
+ * deliberately: the client decodes this one with a different reader.
+ */
+export const MoveSubRoomEnvelope = z.object({
+	Value: RoomDto.nullable().describe('The source room as it now stands; null on a rejection'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('The message shown on a rejection; null on success'),
+	error_id: z.string().nullable().describe('Null. Lowercase, unlike its siblings'),
+})
+
 /** `POST /rooms/{roomId}/subrooms`. */
 export const CreateSubRoomRequest = z.object({
 	name: z.string().describe('The new subroom’s name'),

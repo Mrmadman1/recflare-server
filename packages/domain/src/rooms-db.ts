@@ -1632,6 +1632,41 @@ export async function deleteSubRoom(
 	return { ok: true, room }
 }
 
+/**
+ * Move a subroom from one room to another (`POST …/subrooms/{subRoomId}/move`). A subroom
+ * is its own row keyed by a globally-unique id, and its saves and permission overrides hang
+ * off that id rather than the room's, so the move is one column: `room_id`. The saves,
+ * the current/staged pointers and the permissions all travel with it untouched. The
+ * subroom's `RoomId` is re-injected from the column on read, so the blob needs nothing.
+ *
+ * Refuses to move a room's only subroom, for the reason {@link deleteSubRoom} refuses to
+ * delete it: the room would be left with no scene to load. The caller checks the target
+ * room exists and that it may manage both rooms — this only checks the subroom's side.
+ *
+ * Returns the SOURCE room, hydrated, which no longer lists the subroom — that is what the
+ * client re-renders from — or a reason: `not_found` (no such subroom in that room) /
+ * `last_subroom`.
+ */
+export async function moveSubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	newRoomId: number
+): Promise<{ ok: true; room: Room } | { ok: false; reason: 'not_found' | 'last_subroom' }> {
+	const subRooms = await getSubRooms(db, roomId)
+	if (!subRooms.some((s) => s.SubRoomId === subRoomId)) return { ok: false, reason: 'not_found' }
+	if (subRooms.length <= 1) return { ok: false, reason: 'last_subroom' }
+
+	await db
+		.prepare('UPDATE subroom SET room_id = ?3 WHERE room_id = ?1 AND sub_room_id = ?2')
+		.bind(roomId, subRoomId, newRoomId)
+		.run()
+
+	const room = await getRoomById(db, roomId)
+	if (!room) return { ok: false, reason: 'not_found' }
+	return { ok: true, room }
+}
+
 interface RoomRow {
 	data: string
 	visits: number

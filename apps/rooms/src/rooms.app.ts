@@ -10,6 +10,7 @@ import {
 	autocompleteRoomSearch,
 	banPlayerFromRoom,
 	canManageRoom,
+	canManageRoomById,
 	cloneRoom,
 	cloneSubRoom,
 	countRoomsByCreator,
@@ -50,6 +51,7 @@ import {
 	MessageType,
 	modifySubRoom,
 	movePlayerToDorm,
+	moveSubRoom,
 	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
@@ -115,6 +117,8 @@ import {
 	LoadScreenRequest,
 	MissingLookupParam,
 	ModifySubRoomRequest,
+	MoveSubRoomEnvelope,
+	MoveSubRoomRequest,
 	NameRequest,
 	NOT_FRIENDS_RESPONSE,
 	PagedRooms,
@@ -3878,6 +3882,76 @@ const app = new Hono<App>()
 
 			await pushRoomUpdate(c, accountId, result.room)
 			return roomEnvelope(c, result.room)
+		}
+	)
+
+	// Move a subroom into another room (form body `newRoomId`). Auth-gated (401), and the
+	// caller must be able to MANAGE both rooms — owner or co-owner, unlike the creator-only
+	// gate on the other subroom mutations. Answers the SOURCE room in the PascalCase
+	// `{ Value, Success, Error, error_id }` envelope, not the lowercase one its siblings use.
+	.post(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/move',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Move a subroom to another room',
+			description: [
+				'Re-parents a subroom onto another room. The subroom keeps its `SubRoomId`, its',
+				'save history and its permission overrides — all keyed by that globally-unique id',
+				'— and only its `RoomId` changes. It refuses to move a room’s only subroom, for the',
+				'reason delete refuses it: the room would be left with no scene to load. Moving a',
+				'subroom onto the room it is already in is refused as well.',
+				'',
+				'The caller must be able to manage BOTH rooms — owner or co-owner (`CreatorAccountId`',
+				'or a Creator/CoOwner role) — not just the one the subroom leaves.',
+				'',
+				'Answers the SOURCE room, which no longer lists the subroom, under `Value` in the',
+				'PascalCase `{ Value, Success, Error, error_id }` envelope: NOT the lowercase',
+				'`{ success, error, value }` the other subroom mutations answer. A rejection is HTTP',
+				'200 with `Success: false`, `Value: null` and the message in `Error`; only a missing',
+				'token is a 401.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: form(MoveSubRoomRequest, 'The destination room'),
+			responses: {
+				200: json(MoveSubRoomEnvelope, 'The source room, or a rejection with `Success: false`'),
+				401: { description: 'No bearer token (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return c.body(null, 401)
+			const refuse = (error: string) =>
+				c.json({ Value: null, Success: false, Error: error, error_id: null })
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const newRoomId = Number.parseInt(String(body.newRoomId ?? ''), 10)
+			if (!Number.isInteger(newRoomId)) return refuse('You must provide a valid newRoomId!')
+			if (newRoomId === roomId) return refuse('This subroom is already in that room!')
+
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return refuse('This room does not exist!')
+			if (!canManageRoom(room, accountId)) return refuse('You are not the owner of this room!')
+			const canManageTarget = await canManageRoomById(c.env.DB, newRoomId, accountId)
+			if (canManageTarget === null) return refuse('The destination room does not exist!')
+			if (!canManageTarget) return refuse('You are not the owner of the destination room!')
+
+			const result = await moveSubRoom(c.env.DB, roomId, subRoomId, newRoomId)
+			if (!result.ok) {
+				return refuse(
+					result.reason === 'last_subroom'
+						? "You can't move a room's only subroom!"
+						: 'This subroom does not exist!'
+				)
+			}
+
+			// Both rooms changed shape for the caller's other sessions.
+			await pushRoomUpdate(c, accountId, result.room)
+			const target = await getRoomById(c.env.DB, newRoomId)
+			if (target) await pushRoomUpdate(c, accountId, target)
+			return c.json({ Value: result.room, Success: true, Error: null, error_id: null })
 		}
 	)
 
