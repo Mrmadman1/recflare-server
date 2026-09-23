@@ -720,7 +720,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
 	]
-	writes.push('/api/staff/rooms/1/gift-tokens')
+	writes.push('/api/staff/rooms/1/gift-tokens', '/api/staff/online/gift-tokens')
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
 		const res = await SELF.fetch(`https://example.com${path}`, {
@@ -1475,6 +1475,75 @@ it('refuses a room gift with nobody in the room, and a bad amount', async () => 
 	expect(
 		(await devPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 10_001 })).status
 	).toBe(400)
+})
+
+// Everyone online is the audience — a player in a room, a player in another room and a
+// player sat in the lobby with no instance at all — and the box carries the operator's message
+// rather than the staff default.
+it('drops tokens on everyone online, lobby included, with the message on the box', async () => {
+	const online = async (
+		accountId: number,
+		roomInstance: { roomId: number; roomInstanceId: number } | null
+	) =>
+		setPresence(env.DB, {
+			accountId,
+			roomInstance,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	await online(8380, { roomId: 7710, roomInstanceId: 77201 })
+	await online(8381, { roomId: 7711, roomInstanceId: 77202 })
+	await online(8382, null)
+	// Expired presence is offline: the row is still there until the sweep, but they left.
+	await online(8383, { roomId: 7710, roomInstanceId: 77201 })
+	await env.DB.prepare(
+		`UPDATE presence SET data = json_set(data, '$.expiresAt', 1) WHERE account_id = 8383`
+	).run()
+
+	const res = await devPost('/api/staff/online/gift-tokens', 8110, {
+		amount: 100,
+		message: 'Thanks for playing!',
+	})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { amount: number; message: string; paid: number[] }
+	expect(body.amount).toBe(100)
+	expect(body.message).toBe('Thanks for playing!')
+	expect(body.paid).toEqual(expect.arrayContaining([8380, 8381, 8382]))
+	expect(body.paid).not.toContain(8383)
+
+	for (const playerId of [8380, 8381, 8382]) {
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS + 100)
+		const gifts = await getPendingGifts(env.DB, playerId)
+		expect(gifts).toHaveLength(1)
+		expect(gifts[0]).toMatchObject({ Currency: 100, Message: 'Thanks for playing!' })
+	}
+	expect(await getPendingGifts(env.DB, 8383)).toEqual([])
+
+	const { results } = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'gift_tokens_online'`
+	).all<{ player_id: number; data: string }>()
+	expect(results).toHaveLength(1)
+	expect(results[0].player_id).toBe(8110)
+	expect(JSON.parse(results[0].data)).toMatchObject({ amount: 100, message: 'Thanks for playing!' })
+})
+
+// The drop is narrower than the other gifts: positive only, capped at 1,000 each whatever
+// MAX_TOKEN_GIFT allows, and the box needs a message — that is what the players see of it.
+it('refuses a token drop over the cap, without a message, or with nobody online', async () => {
+	const drop = (body: unknown) => devPost('/api/staff/online/gift-tokens', 8110, body)
+	expect((await drop({ amount: 1_001, message: 'hi' })).status).toBe(400)
+	expect((await drop({ amount: 0, message: 'hi' })).status).toBe(400)
+	expect((await drop({ amount: -5, message: 'hi' })).status).toBe(400)
+	expect((await drop({ amount: 10, message: '   ' })).status).toBe(400)
+	expect((await drop({ amount: 10 })).status).toBe(400)
+	// An empty server is a 404 rather than a silent success, as an empty room is.
+	await env.DB.prepare('DELETE FROM presence').run()
+	expect((await drop({ amount: 1_000, message: 'hi' })).status).toBe(404)
 })
 
 // Zero is a real gift here: nothing moves, and the player gets an empty box.

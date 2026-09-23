@@ -4,6 +4,7 @@ import {
 	clearPasswordHash,
 	createGift,
 	getAccount,
+	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
 	movePlayerToDorm,
@@ -546,6 +547,17 @@ export const DEFAULT_MAX_TOKEN_GIFT = 10_000
 export const DEFAULT_MAX_XP_GIFT = 100
 
 /**
+ * The most a token DROP — the gift to everyone online at once — can carry per player. Fixed
+ * rather than an operator knob like `MAX_TOKEN_GIFT`, and far under it: this one is multiplied
+ * by however many players are on, and the drop is meant for a small thank-you to the whole
+ * server, not a payout.
+ */
+export const MAX_TOKEN_DROP = 1_000
+
+/** The longest message a token drop's box may carry — the same cap a client message has. */
+const MAX_TOKEN_DROP_MESSAGE = 256
+
+/**
  * `GiftContext.Purchased_Gift_A` — what a staff box says it came from.
  *
  * The client classifies a box by its context and only tests a small set (500–503
@@ -735,12 +747,16 @@ function tokenAmountRefusal(c: Context<App>, amount: number): string | null {
  *
  * The signup grant is seeded first, as econ does before every credit: `creditCurrency`
  * upserts the row, so a never-touched balance would otherwise start from this gift.
+ *
+ * `message` is what the box says; the staff default unless the caller wrote one (the drop
+ * to everyone online does).
  */
 async function sendTokens(
 	c: Context<App>,
 	playerId: number,
 	amount: number,
-	startingTokens: number
+	startingTokens: number,
+	message: string = STAFF_GIFT_MESSAGE
 ): Promise<{ balance: number; giftId: number } | null> {
 	await ensureStartingBalances(c.env.DB, playerId, startingTokens)
 	if (amount < 0) {
@@ -767,6 +783,7 @@ async function sendTokens(
 	const content = staffGiftContent({
 		CurrencyType: CurrencyType.RecCenterTokens,
 		Currency: amount,
+		Message: message,
 	})
 	const gift = await createGift(c.env.DB, playerId, content)
 
@@ -839,6 +856,60 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 		skippedCount: skipped.length,
 	})
 	return c.json({ roomId, amount, paid, skipped })
+}
+
+/**
+ * Send tokens to EVERYONE ONLINE right now — the server-wide drop behind the account page's
+ * "Token drop" tab, beside the coach broadcast and the maintenance notice.
+ *
+ * The audience is every unexpired `presence` row, lobby included (see `getOnlinePlayerIds`),
+ * read when the button is pressed: the same population the coach broadcast reaches and the
+ * status page counts. Each player is paid exactly as the one-player and room gifts pay them
+ * (banked, then a balance frame and an announced box), one after another for the same reason
+ * the room gift is — a full server is a lot of writes, and they should not all open at once.
+ *
+ * Narrower than the other gifts on purpose: the amount is POSITIVE and capped at
+ * {@link MAX_TOKEN_DROP} per player, whatever `MAX_TOKEN_GIFT` says — a stray zero here is
+ * multiplied by everyone online, and there is no way to take a drop back. The message on the
+ * box is the operator's, required, since the box is what the players actually see of it.
+ */
+export async function giftOnlineTokensHandler(c: Context<App>) {
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown; message?: unknown }
+	const amount = Number(body.amount)
+	if (!Number.isInteger(amount) || amount <= 0) {
+		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
+	}
+	if (amount > MAX_TOKEN_DROP) {
+		return c.json(
+			{ error: `A token drop can carry at most ${MAX_TOKEN_DROP.toLocaleString()} tokens each` },
+			400
+		)
+	}
+	const message = typeof body.message === 'string' ? body.message.trim() : ''
+	if (message === '') return c.json({ error: 'Enter the message for the gift box' }, 400)
+	if (message.length > MAX_TOKEN_DROP_MESSAGE) {
+		return c.json({ error: `Keep the message under ${MAX_TOKEN_DROP_MESSAGE} characters` }, 400)
+	}
+
+	const playerIds = await getOnlinePlayerIds(c.env.DB)
+	if (playerIds.length === 0) return c.json({ error: 'Nobody is online right now' }, 404)
+
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const paid: number[] = []
+	for (const playerId of playerIds) {
+		// A positive amount never comes back null: nothing to skip.
+		if ((await sendTokens(c, playerId, amount, startingTokens, message)) !== null) {
+			paid.push(playerId)
+		}
+	}
+
+	await recordPlayerAudit(c, 'gift_tokens_online', { amount, message, paid })
+	logger.info('staff dropped tokens on everyone online', {
+		moderatorId: staffId(c),
+		amount,
+		paidCount: paid.length,
+	})
+	return c.json({ amount, message, paid })
 }
 
 /**

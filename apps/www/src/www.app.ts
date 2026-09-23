@@ -41,6 +41,7 @@ import {
 	createReportHandler,
 	getReportHandler,
 	giftCustomItemHandler,
+	giftOnlineTokensHandler,
 	giftRoomTokensHandler,
 	giftTokensHandler,
 	giftXpHandler,
@@ -489,6 +490,8 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)
+	// The account page's token drop: the same gift to everyone online at once.
+	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 

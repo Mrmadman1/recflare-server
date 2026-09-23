@@ -239,6 +239,25 @@ export async function getPlayerIdsInRoom(
 }
 
 /**
+ * Everyone online right now, anywhere — the same population {@link countOnlinePlayers}
+ * counts, as ids. Unexpired presence only, one row per account, lobby (null-instance)
+ * presence included: a player sat in a menu is as online as one in a room, and a gift to
+ * "everyone online" that skipped them would look to them like being skipped on purpose.
+ * Ordered so a pass over it is deterministic.
+ */
+export async function getOnlinePlayerIds(db: D1Database, now = nowSeconds()): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT account_id AS accountId FROM presence
+			 WHERE expires_at > ?1
+			 ORDER BY account_id`
+		)
+		.bind(now)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
  * How many players are online right now, anywhere — one row per account, so this is
  * the player count a status page means. Counts unexpired presence only: rows outlive
  * the player by up to the TTL until the sweep purges them, and reads elsewhere ignore

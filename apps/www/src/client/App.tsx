@@ -3068,6 +3068,10 @@ function Dashboard({
 					{ id: 'coach', label: 'Coach message', render: () => <CoachMessageForm /> },
 				]
 			: []),
+		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
+		...(isDeveloper()
+			? [{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> }]
+			: []),
 	]
 	const [active, setActive] = useState(sections[0].id)
 	const current = sections.find((s) => s.id === active) ?? sections[0]
@@ -3349,6 +3353,84 @@ function MaintenanceForm() {
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
 					{pending ? 'Broadcasting…' : 'Broadcast maintenance'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+/**
+ * The most a token drop carries per player — a mirror of www's `MAX_TOKEN_DROP`, which is
+ * the one that decides. Not imported: the staff module pulls hono and the JWT code into the
+ * page bundle for one number.
+ */
+const MAX_TOKEN_DROP = 1_000
+
+/**
+ * Developer-only: give every player online right now the same number of tokens, in a gift
+ * box carrying the operator's message — the server-wide cousin of the room page's staff gift.
+ *
+ * The audience is read by the server when the button is pressed, so it is whoever is on at
+ * that moment, lobby included; the button says as much. The cap is the server's
+ * (`MAX_TOKEN_DROP`, 1,000 each) and is repeated on the input so a typo is caught before the
+ * round trip — the server is still the one that refuses.
+ */
+function TokenDropForm() {
+	const [message, setMessage] = useState('')
+	const [tokens, setTokens] = useState('')
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Token drop</h2>
+			<p className="muted">
+				Give everyone online right now the same number of tokens. Each player gets a gift box with
+				your message on it; a player who isn&apos;t signed in when you press the button gets
+				nothing. Up to {MAX_TOKEN_DROP.toLocaleString()} tokens each.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const amount = Number(tokens)
+						const res = await call<{ paid: number[] }>('/api/staff/online/gift-tokens', {
+							authed: true,
+							json: { amount, message: message.trim() },
+						})
+						setTokens('')
+						setMessage('')
+						const n = res.paid.length
+						return `Sent ${amount.toLocaleString()} tokens to ${n} online player${n === 1 ? '' : 's'}.`
+					})
+				}}
+			>
+				<label>
+					Gift box message
+					<textarea
+						value={message}
+						rows={3}
+						maxLength={256}
+						placeholder="Thanks for playing this weekend!"
+						onChange={(e) => setMessage(e.target.value)}
+						required
+					/>
+				</label>
+				<label>
+					Tokens per player
+					<input
+						type="number"
+						min={1}
+						max={MAX_TOKEN_DROP}
+						step={1}
+						value={tokens}
+						required
+						onChange={(e) => setTokens(e.target.value)}
+					/>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+				<button type="submit" disabled={pending}>
+					{pending ? 'Sending…' : 'Send to everyone online'}
 				</button>
 			</form>
 		</section>
