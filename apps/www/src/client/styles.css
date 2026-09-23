@@ -1863,11 +1863,23 @@ button[type='submit']:disabled {
 /* The thumbnail's click target: a real button, for the keyboard, with none of its looks. */
 .photo-button {
 	display: block;
+	position: relative;
 	padding: 0;
 	border: 0;
 	border-radius: 9px;
 	background: none;
 	cursor: zoom-in;
+}
+
+/* The Private mark on one of the owner's own photos, pinned to the thumbnail's corner.
+   Same pill as a room's visibility badge, on a solid background so it reads over the
+   picture. */
+.photo-private {
+	position: absolute;
+	top: 6px;
+	left: 6px;
+	background: var(--surface);
+	pointer-events: none;
 }
 
 .photo-thumb {

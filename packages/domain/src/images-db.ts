@@ -233,9 +233,10 @@ const IMAGE_ID_LIMIT = 100
  * for; an id with no record, or one that isn't public, is simply absent rather than a
  * hole in the list.
  *
- * Public-only, like every other image read here ({@link getImagesByPlayer},
- * {@link getImagesByRoom}). Image ids are sequential, so serving whatever an id names
- * would make a private photo readable by anyone who counts.
+ * Public-only, like the room feed ({@link getImagesByRoom}) and the player lists when
+ * anyone but the owner reads them ({@link getImagesByPlayer}). Image ids are sequential,
+ * so serving whatever an id names would make a private photo readable by anyone who
+ * counts.
  */
 export async function getImagesByIds(db: D1Database, ids: number[]): Promise<SavedImage[]> {
 	if (ids.length === 0) return []
@@ -333,7 +334,28 @@ const newestFirst = (a: SavedImage, b: SavedImage) =>
 	b.CreatedAt.localeCompare(a.CreatedAt) || b.Id - a.Id
 
 /**
- * The public images a player has taken — their photo list, newest first.
+ * Whether a read of `playerId`'s photos should include the ones they keep private:
+ * only when the viewer IS that player. Nobody else — not a friend, not a co-owner,
+ * not staff — sees a private photo through the player lists; the owner's own view is
+ * the one exception to "every image read here is public-only", and it exists because
+ * the profile a player opens on themselves (in game and on the website) is where they
+ * find the photos they haven't shared yet.
+ */
+const ownView = (playerId: number, viewerId: number | null | undefined): boolean =>
+	viewerId != null && viewerId === playerId
+
+/**
+ * Whether an image belongs in a player's photo list: a camera photo, not one of the
+ * thumbnails filed under the same player (their outfits, room and invention pictures,
+ * profile shots — every other {@link SavedImageType}). Those are stored as images too,
+ * and until this was applied they surfaced in the list beside the real photos.
+ */
+const isPhoto = (img: SavedImage): boolean => img.Type === SavedImageType.ShareCamera
+
+/**
+ * The camera photos a player has taken ({@link isPhoto}) — their photo list, newest
+ * first. Public only, unless `viewerId` is the player themself (see {@link ownView}),
+ * in which case their private photos are in the list too.
  * Paginated via skip/take; returns a bare array of SavedImage. Uses the
  * player_id index; the per-player set is small, so filtering/sorting is in memory.
  */
@@ -342,15 +364,17 @@ export async function getImagesByPlayer(
 	playerId: number,
 	sort: number,
 	skip: number,
-	take: number
+	take: number,
+	viewerId?: number | null
 ): Promise<SavedImage[]> {
 	const { results } = await db
 		.prepare('SELECT data FROM image WHERE player_id = ?1')
 		.bind(playerId)
 		.all<ImageRow>()
+	const own = ownView(playerId, viewerId)
 	return results
 		.map((r) => JSON.parse(r.data) as SavedImage)
-		.filter((img) => img.Accessibility === 1)
+		.filter((img) => isPhoto(img) && (own || img.Accessibility === 1))
 		.sort(sort === 1 ? (a, b) => b.CheerCount - a.CheerCount || newestFirst(a, b) : newestFirst)
 		.slice(skip, skip + take)
 }
@@ -535,16 +559,22 @@ export async function getSlideshowImages(
 }
 
 /**
- * A player's photo feed — the public images they took plus the ones they're
- * tagged in (TaggedPlayerIds). Newest first, paginated via skip/take; returns a
+ * A player's photo feed — the public camera photos ({@link isPhoto}) they took plus the
+ * ones they're tagged in (TaggedPlayerIds). Newest first, paginated via skip/take; returns a
  * bare array of SavedImage. The tagged-in match uses json_each over the stored
  * TaggedPlayerIds array (there's no index for it).
+ *
+ * When `viewerId` is the player themself ({@link ownView}) the photos they TOOK come
+ * through private ones included, as on {@link getImagesByPlayer}. A photo someone
+ * else took and tagged them in stays public-only either way: its privacy is the
+ * taker's to decide, and being tagged in it doesn't grant a view of it.
  */
 export async function getPlayerFeed(
 	db: D1Database,
 	playerId: number,
 	skip: number,
-	take: number
+	take: number,
+	viewerId?: number | null
 ): Promise<SavedImage[]> {
 	const { results } = await db
 		.prepare(
@@ -554,9 +584,11 @@ export async function getPlayerFeed(
 		)
 		.bind(playerId)
 		.all<ImageRow>()
+	const own = ownView(playerId, viewerId)
 	return results
 		.map((r) => JSON.parse(r.data) as SavedImage)
-		.filter((img) => img.Accessibility === 1)
+		.filter(isPhoto)
+		.filter((img) => img.Accessibility === 1 || (own && img.PlayerId === playerId))
 		.sort(newestFirst)
 		.slice(skip, skip + take)
 }

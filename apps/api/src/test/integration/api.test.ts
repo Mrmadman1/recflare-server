@@ -6845,6 +6845,10 @@ describe('images', () => {
 			}),
 			// Unrelated to 700 → in neither.
 			seed({ Id: 205, PlayerId: 999, TaggedPlayerIds: [111] }),
+			// 700's outfit thumbnail: an image under their id, but not a photo → in neither,
+			// not even in their own view (207 is private, as the client stores such things).
+			seed({ Id: 200, PlayerId: 700, Type: 2, CreatedAt: '2026-06-01T00:00:00.000Z' }),
+			seed({ Id: 207, PlayerId: 700, Type: 3, Accessibility: 0 }),
 		])
 
 		// The lists serve the client's ImagesPlayer projection: the id and type are
@@ -6896,6 +6900,44 @@ describe('images', () => {
 		expect(
 			await (await exports.default.fetch(`${ORIGIN}/api/images/v3/feed/player/424242`)).json()
 		).toEqual([])
+
+		// The owner's view: 700 asking for their own list gets the private 203 too, on v4,
+		// v5 and the feed alike. 203 has the seed's default CreatedAt (January), so it sorts
+		// last — the private photo takes its place in the order, it isn't pinned anywhere.
+		const own = await bearer('700')
+		for (const path of ['v4/player/700', 'v5/player/700?sort=0']) {
+			const list = (await (
+				await exports.default.fetch(`${ORIGIN}/api/images/${path}`, { headers: own })
+			).json()) as Array<ImagesPlayer & { Accessibility: number }>
+			expect(list.map((i) => i.SavedImageId)).toEqual([202, 201, 203])
+			expect(list[2]?.Accessibility).toBe(0)
+		}
+		const ownFeed = (await (
+			await exports.default.fetch(`${ORIGIN}/api/images/v3/feed/player/700`, { headers: own })
+		).json()) as ImagesPlayer[]
+		expect(ownFeed.map((i) => i.SavedImageId)).toEqual([204, 202, 201, 203])
+
+		// Being tagged in someone else's private photo does NOT surface it in the feed —
+		// the taker decides its privacy, not the tag.
+		await seed({ Id: 206, PlayerId: 999, TaggedPlayerIds: [700], Accessibility: 0 }).run()
+		const ownFeedAgain = (await (
+			await exports.default.fetch(`${ORIGIN}/api/images/v3/feed/player/700`, { headers: own })
+		).json()) as ImagesPlayer[]
+		expect(ownFeedAgain.map((i) => i.SavedImageId)).not.toContain(206)
+
+		// Anyone else's token — a friend, staff — is the public list, same as no token.
+		const other = await bearer('999', ['developer', 'moderator'])
+		const asOther = (await (
+			await exports.default.fetch(`${ORIGIN}/api/images/v4/player/700`, { headers: other })
+		).json()) as ImagesPlayer[]
+		expect(asOther.map((i) => i.SavedImageId)).toEqual([202, 201])
+
+		// A garbage token isn't a 401 on a public list; it reads as nobody.
+		const junk = await exports.default.fetch(`${ORIGIN}/api/images/v4/player/700`, {
+			headers: { Authorization: 'Bearer not.a.jwt' },
+		})
+		expect(junk.status).toBe(200)
+		expect(((await junk.json()) as ImagesPlayer[]).map((i) => i.SavedImageId)).toEqual([202, 201])
 	})
 })
 

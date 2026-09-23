@@ -804,12 +804,17 @@ interface PublicAccount {
 	createdAt: string
 }
 
-/** A player's public photo, from the `ImagesPlayer` projection. */
+/**
+ * A player's photo, from the `ImagesPlayer` projection. Public unless the list was the
+ * viewer's own (see fetchPlayerPhotos), which is the one way a private one gets here —
+ * `Accessibility` is what tells the grid to mark it.
+ */
 interface PublicPhoto {
 	SavedImageId: number
 	ImageName: string
 	CreatedAt: string
 	CheerCount: number
+	Accessibility: number
 }
 
 /** A player's public room — the narrow shape `/rooms/createdby/:id` serves. */
@@ -833,8 +838,15 @@ const fetchPublicAccount = (username: string): Promise<PublicAccount | null> =>
 		(matches) => matches.find((m) => m.username.toLowerCase() === username.toLowerCase()) ?? null
 	)
 
-const fetchPublicPhotos = (accountId: number): Promise<PublicPhoto[]> =>
-	call<PublicPhoto[]>(`${where().api}/api/images/v4/player/${accountId}`)
+/**
+ * The photos a player has taken. Sent WITH the session token when there is one: `api`
+ * reads it and, only when the list is the caller's own, includes the photos they keep
+ * private — so a signed-in player sees all of theirs, on `/account` and on their own
+ * `/u/<name>`, while everyone else's profile is the public list either way. Nothing
+ * here decides who the viewer is; the worker does, from the token.
+ */
+const fetchPlayerPhotos = (accountId: number): Promise<PublicPhoto[]> =>
+	call<PublicPhoto[]>(`${where().api}/api/images/v4/player/${accountId}`, { authed: true })
 
 const fetchPublicRooms = (accountId: number): Promise<PublicRoom[]> =>
 	call<PublicRoom[]>(`${where().rooms}/rooms/ownedby/${accountId}`)
@@ -849,19 +861,27 @@ async function fetchPublicRoom(roomId: number): Promise<OwnedRoom | null> {
 }
 
 /**
- * The public photos taken in a room. The feed serves the raw `SavedImage` record (`Id`,
- * not `SavedImageId` — see the api worker's note on why the two lists differ), so it's
- * narrowed here to the shape the photo grid draws.
+ * The public photos taken in a room. Asked for with `filter=1` (camera photos), as the
+ * game asks: without it the feed also carries the room's own thumbnail. The feed serves
+ * the raw `SavedImage` record (`Id`, not `SavedImageId` — see the api worker's note on
+ * why the two lists differ), so it's narrowed here to the shape the photo grid draws.
  */
 const fetchRoomPhotos = (roomId: number): Promise<PublicPhoto[]> =>
-	call<Array<{ Id: number; ImageName: string; CreatedAt: string; CheerCount: number }>>(
-		`${where().api}/api/images/v4/room/${roomId}`
-	).then((images) =>
+	call<
+		Array<{
+			Id: number
+			ImageName: string
+			CreatedAt: string
+			CheerCount: number
+			Accessibility: number
+		}>
+	>(`${where().api}/api/images/v4/room/${roomId}?filter=1`).then((images) =>
 		images.map((i) => ({
 			SavedImageId: i.Id,
 			ImageName: i.ImageName,
 			CreatedAt: i.CreatedAt,
 			CheerCount: i.CheerCount,
+			Accessibility: i.Accessibility,
 		}))
 	)
 
@@ -997,7 +1017,9 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
 						key={p.SavedImageId}
 						className="photo-button"
 						onClick={() => setOpen(p)}
-						aria-label="View photo"
+						aria-label={
+							p.Accessibility === Accessibility.Public ? 'View photo' : 'View private photo'
+						}
 					>
 						<img
 							className="photo-thumb"
@@ -1005,6 +1027,12 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
 							alt=""
 							loading="lazy"
 						/>
+						{/* Only the owner's own list ever carries a private photo (see
+						    fetchPlayerPhotos), so this is the mark that tells them which of theirs
+						    nobody else can see. */}
+						{p.Accessibility !== Accessibility.Public && (
+							<span className="badge photo-private">Private</span>
+						)}
 					</button>
 				))}
 			</div>
@@ -1060,7 +1088,7 @@ function PlayerPage({
 					void fetchPublicRooms(a.accountId)
 						.then(setRooms)
 						.catch(() => setRooms([]))
-					void fetchPublicPhotos(a.accountId)
+					void fetchPlayerPhotos(a.accountId)
 						.then(setPhotos)
 						.catch(() => setPhotos([]))
 				}
@@ -3178,18 +3206,20 @@ function MyRooms({ navigate }: { navigate: Navigate }) {
 }
 
 /**
- * The photos the signed-in player has taken — the same grid their public profile shows.
+ * The photos the signed-in player has taken — the same grid their profile shows, private
+ * ones included.
  *
- * Public photos only, because it reads the same list the profile does
- * (`/api/images/v4/player/:id`, which serves nothing private). Unlike "My rooms" there is
- * no owner's view behind it yet: a photo kept private in game doesn't appear here.
+ * It reads the same list the profile does (`/api/images/v4/player/:id`); what makes it the
+ * owner's view is the session token going with the request, which `api` matches against
+ * the id (see fetchPlayerPhotos). The private ones are marked in the grid; there is no
+ * way to change a photo's privacy here yet — that's still done in game.
  */
 function MyPhotos({ accountId }: { accountId: number }) {
 	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
 	const [error, setError] = useState('')
 
 	useEffect(() => {
-		void fetchPublicPhotos(accountId)
+		void fetchPlayerPhotos(accountId)
 			.then(setPhotos)
 			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
 	}, [accountId])
@@ -3197,15 +3227,16 @@ function MyPhotos({ accountId }: { accountId: number }) {
 	return (
 		<section className="card">
 			<h2>My photos</h2>
-			<p className="muted">The public photos you&apos;ve taken in game, newest first.</p>
+			<p className="muted">
+				The photos you&apos;ve taken in game, newest first. Ones you keep private are marked; only
+				you can see them here.
+			</p>
 			{error ? (
 				<p className="error">{error}</p>
 			) : photos === null ? (
 				<p className="muted">Loading…</p>
 			) : photos.length === 0 ? (
-				<p className="muted">
-					No public photos yet. Photos you take in game and share publicly show up here.
-				</p>
+				<p className="muted">No photos yet. Photos you take in game show up here.</p>
 			) : (
 				<PhotoGrid photos={photos} />
 			)}

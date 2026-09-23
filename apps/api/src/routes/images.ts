@@ -74,6 +74,17 @@ const typeFolder: Record<number, string> = {
 const PHOTO_TAGGING_KEY = 'playerPhotoTaggingSetting'
 
 /**
+ * The owner's-view clause the player photo lists share in their docs. The lists are
+ * public, but they read a Bearer token if one is sent, and the one player it can unlock
+ * anything for is the player whose list it is.
+ */
+const OWN_VIEW_NOTE =
+	'Public, but reads a Bearer token if one is sent: a player asking for THEIR OWN list ' +
+	'gets their private photos in it too (`Accessibility` 0 — that is where the photos they ' +
+	'have not shared yet live). Any other player’s token, no token, or an invalid one serves ' +
+	'the public list; none of those is a 401.'
+
+/**
  * The preference a player has before they have ever set one. The value is an opaque enum
  * ordinal to this server (see `PhotoTaggingSettingRequest`), and 0 is what an unset .NET
  * enum reads as — the reference's own default.
@@ -373,15 +384,22 @@ export const imageRoutes = new Hono<App>({ strict: false })
 	// A player's photos — the public images that player has taken, newest first.
 	// Paginated via skip/take (take defaults to 100). Returns a bare array of the
 	// client's ImagesPlayer projection (SavedImageId/SavedImageType, not Id/Type).
+	//
+	// Public, but a token is READ if one is sent: a player asking for their own list gets
+	// their private photos in it too (the profile they open on themselves is where those
+	// live), while anyone else's token — or none — serves the public list. A bad token is
+	// not a 401 here; it just reads as nobody.
 	.get(
 		'/api/images/v4/player/:playerId{[0-9]+}',
 		describeRoute({
 			tags: ['Images'],
 			summary: 'A player’s photos',
 			description:
-				'The public images that player has taken, newest first. Serves the client’s ' +
+				'The public camera photos (`SavedImageType` 1) that player has taken, newest first — ' +
+				'not the outfit, room, invention or profile thumbnails filed under them. Serves the client’s ' +
 				'`ImagesPlayer` projection (`SavedImageId`/`SavedImageType`, no `TaggedPlayerIds`) ' +
-				'— the raw `SavedImage` renders blank thumbnails here.',
+				'— the raw `SavedImage` renders blank thumbnails here.\n\n' +
+				OWN_VIEW_NOTE,
 			parameters: [idParam('playerId', 'Account id'), ...pageParams(100)],
 			responses: { 200: json(ImagesPlayerDto.array(), 'The player’s photos') },
 		}),
@@ -389,7 +407,8 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const playerId = Number.parseInt(c.req.param('playerId'), 10)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			const images = await getImagesByPlayer(c.env.DB, playerId, 0, skip, take)
+			const viewer = await authedId(c)
+			const images = await getImagesByPlayer(c.env.DB, playerId, 0, skip, take, viewer)
 			return c.json(images.map(toImagesPlayer))
 		}
 	)
@@ -401,7 +420,9 @@ export const imageRoutes = new Hono<App>({ strict: false })
 		describeRoute({
 			tags: ['Images'],
 			summary: 'A player’s photos, sortable',
-			description: 'v4 plus a `sort` option. Same `ImagesPlayer` projection — see the note on v4.',
+			description:
+				'v4 plus a `sort` option. Same `ImagesPlayer` projection, and the same owner’s view — ' +
+				'see the notes on v4.',
 			parameters: [
 				idParam('playerId', 'Account id'),
 				intQuery('sort', '1 = most cheered; anything else = newest first'),
@@ -414,7 +435,8 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const sort = Number.parseInt(c.req.query('sort') ?? '0', 10) || 0
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			const images = await getImagesByPlayer(c.env.DB, playerId, sort, skip, take)
+			const viewer = await authedId(c)
+			const images = await getImagesByPlayer(c.env.DB, playerId, sort, skip, take, viewer)
 			return c.json(images.map(toImagesPlayer))
 		}
 	)
@@ -428,8 +450,11 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			tags: ['Images'],
 			summary: 'A player’s photo feed',
 			description:
-				'The public images they took PLUS the ones they are tagged in, newest first — the ' +
-				'photo tab on a profile. Same `ImagesPlayer` projection as the player photo lists.',
+				'The public camera photos they took PLUS the ones they are tagged in, newest first — the ' +
+				'photo tab on a profile. Same `ImagesPlayer` projection as the player photo lists.\n\n' +
+				OWN_VIEW_NOTE +
+				' A photo someone else took and tagged them in stays public-only either way: its ' +
+				'privacy is the taker’s.',
 			parameters: [idParam('playerId', 'Account id'), ...pageParams(100)],
 			responses: { 200: json(ImagesPlayerDto.array(), 'The player’s feed') },
 		}),
@@ -437,7 +462,8 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const playerId = Number.parseInt(c.req.param('playerId'), 10)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			const images = await getPlayerFeed(c.env.DB, playerId, skip, take)
+			const viewer = await authedId(c)
+			const images = await getPlayerFeed(c.env.DB, playerId, skip, take, viewer)
 			return c.json(images.map(toImagesPlayer))
 		}
 	)
