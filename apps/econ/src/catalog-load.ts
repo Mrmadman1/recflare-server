@@ -25,10 +25,11 @@ export type CatalogKindValue = (typeof CatalogKind)[keyof typeof CatalogKind]
 /**
  * The capture's avatar-item record (`static/db/avatar-items.json`).
  *
- * Everything from `TagList` down is absent on some rows — the 22 permanent hair dyes carry
- * only the first six fields — so those are optional rather than nullable. The distinction
- * matters: a missing key and a null value both land as NULL, but only one of them is a field
- * the capture actually recorded.
+ * Everything from `TagList` down is absent on some rows — the 22 permanent hair dyes, copied
+ * in from the 2025 storefront dump (`static/db/Watch_EnumValue_3.json`), carry no `CreatedAt`
+ * because a store listing records none — so those are optional rather than nullable. The
+ * distinction matters: a missing key and a null value both land as NULL, but only one of them
+ * is a field the capture actually recorded.
  */
 export interface AvatarItemCapture {
 	AvatarItemDesc: string
