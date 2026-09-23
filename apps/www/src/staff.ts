@@ -554,8 +554,8 @@ export const DEFAULT_MAX_XP_GIFT = 100
  */
 export const MAX_TOKEN_DROP = 1_000
 
-/** The longest message a token drop's box may carry — the same cap a client message has. */
-const MAX_TOKEN_DROP_MESSAGE = 256
+/** The longest message a staff token box may carry — the same cap a client message has. */
+const MAX_GIFT_MESSAGE = 256
 
 /**
  * `GiftContext.Purchased_Gift_A` — what a staff box says it came from.
@@ -683,7 +683,8 @@ async function announceGift(
  * `StorefrontBalanceUpdate` carrying the resulting total sets the client's bucket, and the box
  * is stored and announced with `GiftPackageReceivedImmediate` so the player sees what arrived.
  * The box is from the Coach, as every box the server hands over on nobody's behalf is; who
- * really sent it is on the audit row.
+ * really sent it is on the audit row. It says what the body's optional `message` says, or
+ * the staff default when there is none.
  *
  * Both frames are best-effort: the tokens are banked by the time they go out, and an offline
  * player meets the box in `GET /api/avatar/v2/gifts` and the balance on their next read.
@@ -697,22 +698,24 @@ export async function giftTokensHandler(c: Context<App>) {
 	const playerId = playerIdParam(c)
 	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
 
-	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown; message?: unknown }
 	const amount = Number(body.amount)
 	const refusal = tokenAmountRefusal(c, amount)
 	if (refusal !== null) return c.json({ error: refusal }, 400)
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
 	if ((await getAccount(c.env.DB, playerId)) === null) {
 		return c.json({ error: 'No such player' }, 404)
 	}
 
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-	const sent = await sendTokens(c, playerId, amount, startingTokens)
+	const sent = await sendTokens(c, playerId, amount, startingTokens, message)
 	if (sent === null) {
 		const held = await getBalance(c.env.DB, playerId, CurrencyType.RecCenterTokens, startingTokens)
 		return c.json({ error: `They only have ${held.toLocaleString()} tokens to take` }, 400)
 	}
 
-	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, ...sent })
+	await recordPlayerAudit(c, 'gift_tokens', { playerId, amount, message, ...sent })
 	logger.info(amount < 0 ? 'staff took tokens back' : 'staff gifted tokens', {
 		moderatorId: staffId(c),
 		playerId,
@@ -734,6 +737,22 @@ function tokenAmountRefusal(c: Context<App>, amount: number): string | null {
 	}
 	return null
 }
+
+/**
+ * The message a token box should carry, from the body's optional `message`: the staffer's
+ * own words, trimmed, or {@link STAFF_GIFT_MESSAGE} when they wrote none. `undefined` means
+ * a message was written but is too long to send — the caller refuses rather than truncating
+ * what the player is going to read.
+ */
+function giftMessage(body: { message?: unknown }): string | undefined {
+	const message = typeof body.message === 'string' ? body.message.trim() : ''
+	if (message === '') return STAFF_GIFT_MESSAGE
+	if (message.length > MAX_GIFT_MESSAGE) return undefined
+	return message
+}
+
+/** The refusal {@link giftMessage} stands for when it answers `undefined`. */
+const GIFT_MESSAGE_TOO_LONG = `Keep the message under ${MAX_GIFT_MESSAGE} characters`
 
 /**
  * Move one player's token balance by `amount`, box it and tell them — the whole of a token
@@ -816,8 +835,8 @@ async function sendTokens(
  * button is pressed. Someone who arrives a second later gets nothing; someone whose presence
  * has lapsed is already gone from it.
  *
- * Each player is paid exactly as the one-player gift pays them, one after another rather than
- * at once: this is a handful of writes per player, and a busy room would otherwise open a
+ * Each player is paid exactly as the one-player gift pays them — the same box, with the same
+ * optional `message` on it — one after another rather than at once: this is a handful of writes per player, and a busy room would otherwise open a
  * hundred at a time. A player a negative amount can't be taken from is SKIPPED rather than
  * failing the room — the ones who could afford it have already been debited by then — and the
  * response says who was missed.
@@ -828,10 +847,12 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 		return c.json({ error: 'A numeric room id is required' }, 400)
 	}
 
-	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown; message?: unknown }
 	const amount = Number(body.amount)
 	const refusal = tokenAmountRefusal(c, amount)
 	if (refusal !== null) return c.json({ error: refusal }, 400)
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
 
 	const playerIds = await getPlayerIdsInRoom(c.env.DB, roomId)
 	if (playerIds.length === 0) {
@@ -842,12 +863,12 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 	const paid: number[] = []
 	const skipped: number[] = []
 	for (const playerId of playerIds) {
-		const sent = await sendTokens(c, playerId, amount, startingTokens)
+		const sent = await sendTokens(c, playerId, amount, startingTokens, message)
 		if (sent === null) skipped.push(playerId)
 		else paid.push(playerId)
 	}
 
-	await recordPlayerAudit(c, 'gift_tokens_room', { roomId, amount, paid, skipped })
+	await recordPlayerAudit(c, 'gift_tokens_room', { roomId, amount, message, paid, skipped })
 	logger.info('staff gifted tokens to a room', {
 		moderatorId: staffId(c),
 		roomId,
@@ -885,11 +906,13 @@ export async function giftOnlineTokensHandler(c: Context<App>) {
 			400
 		)
 	}
-	const message = typeof body.message === 'string' ? body.message.trim() : ''
-	if (message === '') return c.json({ error: 'Enter the message for the gift box' }, 400)
-	if (message.length > MAX_TOKEN_DROP_MESSAGE) {
-		return c.json({ error: `Keep the message under ${MAX_TOKEN_DROP_MESSAGE} characters` }, 400)
+	// Required here, where the other gifts fall back to the staff default: a server-wide drop
+	// with nothing to say about itself is a mistake more often than not.
+	if (typeof body.message !== 'string' || body.message.trim() === '') {
+		return c.json({ error: 'Enter the message for the gift box' }, 400)
 	}
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
 
 	const playerIds = await getOnlinePlayerIds(c.env.DB)
 	if (playerIds.length === 0) return c.json({ error: 'Nobody is online right now' }, 404)

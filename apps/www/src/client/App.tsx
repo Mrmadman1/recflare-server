@@ -1172,6 +1172,7 @@ function PlayerPage({
  */
 function StaffPlayerActions({ account, navigate }: { account: PublicAccount; navigate: Navigate }) {
 	const [tokens, setTokens] = useState('')
+	const [tokenMessage, setTokenMessage] = useState('')
 	const [confirmingClear, setConfirmingClear] = useState(false)
 	const [customItemId, setCustomItemId] = useState('')
 	const [xp, setXp] = useState('')
@@ -1195,9 +1196,10 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 								const amount = Number(tokens)
 								const res = await call<{ balance: number }>(`${base}/gift-tokens`, {
 									authed: true,
-									json: { amount },
+									json: { amount, message: tokenMessage.trim() },
 								})
 								setTokens('')
+								setTokenMessage('')
 								const what =
 									amount < 0
 										? `Took ${Math.abs(amount).toLocaleString()} tokens back`
@@ -1227,6 +1229,17 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 								takes tokens back instead — it still sends a box, and it can&apos;t take more than
 								they have. Zero sends an empty box and moves nothing.
 							</span>
+						</label>
+						<label>
+							Gift box message
+							<input
+								type="text"
+								value={tokenMessage}
+								maxLength={256}
+								placeholder="A gift from the staff!"
+								onChange={(e) => setTokenMessage(e.target.value)}
+							/>
+							<span className="hint">Optional. Blank sends the default.</span>
 						</label>
 						{gift.error && <p className="error">{gift.error}</p>}
 						{gift.done && <p className="ok">{gift.done}</p>}
@@ -2188,6 +2201,7 @@ function PublicRoomView({
  */
 function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 	const [tokens, setTokens] = useState('')
+	const [message, setMessage] = useState('')
 	const { pending, error, done, run } = useAction()
 
 	return (
@@ -2200,9 +2214,10 @@ function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 						const amount = Number(tokens)
 						const res = await call<{ paid: number[]; skipped: number[] }>(
 							`/api/staff/rooms/${room.RoomId}/gift-tokens`,
-							{ authed: true, json: { amount } }
+							{ authed: true, json: { amount, message: message.trim() } }
 						)
 						setTokens('')
+						setMessage('')
 						const n = res.paid.length
 						const missed =
 							res.skipped.length > 0
@@ -2230,6 +2245,17 @@ function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 						Everyone in the room right now, across all of its instances. A negative amount takes
 						tokens back, skipping anyone who can&apos;t spare it.
 					</span>
+				</label>
+				<label>
+					Gift box message
+					<input
+						type="text"
+						value={message}
+						maxLength={256}
+						placeholder="A gift from the staff!"
+						onChange={(e) => setMessage(e.target.value)}
+					/>
+					<span className="hint">Optional. Blank sends the default.</span>
 				</label>
 				{error && <p className="error">{error}</p>}
 				{done && <p className="ok">{done}</p>}

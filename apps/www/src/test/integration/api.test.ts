@@ -1340,6 +1340,7 @@ it('gifts a player tokens in a gift box', async () => {
 			data: {
 				playerId: 8300,
 				amount: 500,
+				message: 'A gift from the staff!',
 				balance: DEFAULT_STARTING_TOKENS + 500,
 				giftId: body.giftId,
 			},
@@ -1395,6 +1396,7 @@ it('takes tokens back on a negative gift, and cannot overdraw', async () => {
 			data: {
 				playerId: 8360,
 				amount: -400,
+				message: 'A gift from the staff!',
 				balance: DEFAULT_STARTING_TOKENS - 400,
 				giftId: body.giftId,
 			},
@@ -1461,6 +1463,7 @@ it('sends tokens to everyone in a room, across its instances', async () => {
 	expect(JSON.parse(results[0].data)).toEqual({
 		roomId: 7700,
 		amount: 250,
+		message: 'A gift from the staff!',
 		paid: [8370, 8371, 8372],
 		skipped: [],
 	})
@@ -1474,6 +1477,65 @@ it('refuses a room gift with nobody in the room, and a bad amount', async () => 
 	)
 	expect(
 		(await devPost('/api/staff/rooms/7700/gift-tokens', 8110, { amount: 10_001 })).status
+	).toBe(400)
+})
+
+// The box says what the staffer wrote, when they wrote something: the one-player and room
+// gifts take the same optional `message` the drop requires. Blank keeps the staff default,
+// and one too long to send is refused rather than cut.
+it('puts a custom message on a one-player and a room token gift', async () => {
+	await updateAccount(env.DB, 8362, { username: 'Messaged' })
+	let res = await devPost('/api/staff/players/8362/gift-tokens', 8110, {
+		amount: 50,
+		message: '  Well played!  ',
+	})
+	expect(res.status).toBe(200)
+	expect(await getPendingGifts(env.DB, 8362)).toMatchObject([
+		{ Currency: 50, Message: 'Well played!' },
+	])
+	expect(await auditRows('gift_tokens', 8362)).toMatchObject([
+		{ data: { message: 'Well played!' } },
+	])
+
+	res = await devPost('/api/staff/players/8362/gift-tokens', 8110, { amount: 5, message: '' })
+	expect(res.status).toBe(200)
+	expect((await getPendingGifts(env.DB, 8362)).map((g) => g.Message)).toEqual([
+		'Well played!',
+		'A gift from the staff!',
+	])
+	expect(
+		(
+			await devPost('/api/staff/players/8362/gift-tokens', 8110, {
+				amount: 5,
+				message: 'x'.repeat(257),
+			})
+		).status
+	).toBe(400)
+
+	await setPresence(env.DB, {
+		accountId: 8363,
+		roomInstance: { roomId: 7720, roomInstanceId: 77301 },
+		statusVisibility: 0,
+		deviceClass: 0,
+		vrMovementMode: 0,
+		platform: 4,
+		appVersion: 'test',
+	})
+	res = await devPost('/api/staff/rooms/7720/gift-tokens', 8110, {
+		amount: 25,
+		message: 'Thanks for coming!',
+	})
+	expect(res.status).toBe(200)
+	expect(await getPendingGifts(env.DB, 8363)).toMatchObject([
+		{ Currency: 25, Message: 'Thanks for coming!' },
+	])
+	expect(
+		(
+			await devPost('/api/staff/rooms/7720/gift-tokens', 8110, {
+				amount: 25,
+				message: 'x'.repeat(257),
+			})
+		).status
 	).toBe(400)
 })
 
