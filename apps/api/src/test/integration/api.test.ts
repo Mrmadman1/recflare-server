@@ -1238,6 +1238,41 @@ describe('public endpoints', () => {
 			all.map((i) => i.Name)
 		)
 
+		// `creatorAccountId` is one author's published items — a player's creations list. It
+		// was once ignored, and every player's shelf showed the whole player-made catalog.
+		const spec2: Array<[name: string, creator: number]> = [['Hat C', 206]]
+		for (const [name, creator] of spec2) {
+			await createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: creator,
+					name,
+					description: '',
+					price: 0,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility: 1,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				new Date(Date.UTC(2026, 7, 20))
+			)
+		}
+		expect((await search('?creatorAccountId=206')).map((i) => i.Name)).toEqual(['Hat C'])
+		// The query the client sends for a player's creations: theirs alone, `Hidden` still out.
+		expect(
+			(
+				await search(
+					'?creatorAccountId=205&includePurchaseInfos=True&includeCoachItems=False&skip=0' +
+						'&take=1000&unityAssetTarget=0&unityAssetVersion=3'
+				)
+			).map((i) => i.Name)
+		).toEqual(['Trousers A', 'Shirt B', 'Shirt A', 'Hat A'])
+		expect(await search('?creatorAccountId=1&includeCoachItems=False')).toEqual([])
+		expect(await search('?creatorAccountId=424242')).toEqual([])
+		await env.DB.prepare('DELETE FROM custom_avatar_item WHERE creator_account_id = 206').run()
+
 		// The whole storefront query the client actually sends, unchanged — the parameters that
 		// aren't acted on yet must be accepted rather than 400 or throw, and `includeCoachItems=True`
 		// narrows it to the stock content.

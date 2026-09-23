@@ -413,6 +413,13 @@ export interface CustomAvatarItemSearch {
 	 * between them, never as a superset.
 	 */
 	includeCoachItems?: boolean
+	/**
+	 * Only items this account authored — how the client lists what one player has made (a
+	 * profile's creations, `creatorAccountId=<id>&includeCoachItems=False&take=1000`). Combines
+	 * with the rest as one more AND; naming the Coach here with `includeCoachItems=false`
+	 * matches nothing, as the two conditions read.
+	 */
+	creatorAccountId?: number
 	/** Lowest price to include, inclusive. */
 	minPrice?: number
 	/** Highest price to include, inclusive. */
@@ -446,6 +453,9 @@ export const SEARCH_MAX_TAKE = 200
  * items alone, `false` everyone else's alone, absent both. The client's storefront tab sends
  * `True` and its user-generated-content tab sends `False`, and the two must not overlap — read
  * as "stock plus players'", the storefront would show every player's item too.
+ *
+ * `creatorAccountId` narrows to one author. It was ignored until it was noticed that a player's
+ * creations list (which sends it) was serving the whole player-made catalog under every name.
  *
  * Ordered by recency because there is nothing else to order by — no purchase counts, no wear
  * counts, no ratings are recorded — which is the same stand-in the `hot` feed makes. The
@@ -488,6 +498,9 @@ export async function searchCustomAvatarItems(
 		where.push(`creator_account_id = ${bind(COACH_ACCOUNT_ID)}`)
 	} else if (search.includeCoachItems === false) {
 		where.push(`creator_account_id != ${bind(COACH_ACCOUNT_ID)}`)
+	}
+	if (search.creatorAccountId !== undefined) {
+		where.push(`creator_account_id = ${bind(search.creatorAccountId)}`)
 	}
 	if (search.minPrice !== undefined) where.push(`price >= ${bind(search.minPrice)}`)
 	if (search.maxPrice !== undefined) where.push(`price <= ${bind(search.maxPrice)}`)
