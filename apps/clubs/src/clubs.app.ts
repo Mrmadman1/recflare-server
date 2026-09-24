@@ -8,6 +8,7 @@ import {
 	ClubMembershipType,
 	ClubVisibility,
 	countClubsByCreator,
+	countClubSubscribers,
 	createClub,
 	createClubAnnouncement,
 	deleteClub,
@@ -19,6 +20,9 @@ import {
 	getClubsByMember,
 	getHomeClub,
 	getMembership,
+	getOrCreateSubscriptionClub,
+	getSubscriptionClub,
+	getSubscriptionMemberships,
 	glyphLength,
 	joinClub,
 	leaveClub,
@@ -30,6 +34,7 @@ import {
 	setClubAdditionalImage,
 	setHomeClub,
 	setMemberType,
+	subscribeToClub,
 	updateClub,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
@@ -62,7 +67,11 @@ import {
 	ModifyClubRequest,
 	NullEnvelope,
 	SubscriberCountResponse,
+	SubscribeRequest,
 	SubscriptionDetailsResponse,
+	SubscriptionErrorEnvelope,
+	SubscriptionIdEnvelope,
+	SubscriptionMembershipsResponse,
 	UNAUTHORIZED_RESPONSE,
 } from './openapi'
 
@@ -73,8 +82,11 @@ import type { App } from './context'
  * Clubs Worker. Hosts the club endpoints the game client calls on the `clubs` host:
  * club creation and editing, membership (join / ask-to-join / leave / ban tiers),
  * search, announcements, the club gallery, a club's clubhouse room, and each player's
- * home club. Everything is D1-backed (the shared `recflare` database); the
- * `/subscription/*` routes are stubs, since there are no subscription clubs yet.
+ * home club, plus subscriptions. A creator's subscribers are the members of their
+ * SUBSCRIPTION CLUB (`ClubType` 1, one per account, reached only through
+ * `/subscription/*`): subscribing is joining it. Everything is D1-backed (the shared
+ * `recflare` database). A subscription club is provisioned by the first
+ * `/subscription/details/:accountId` read or `POST /subscription/:accountId` for that account.
  *
  * Auth-gated routes validate the Bearer JWT issued by the `auth` worker.
  */
@@ -103,7 +115,6 @@ async function authedId(c: Context<App>): Promise<number | null> {
  * are never touched: lowering the cap just stops new ones.
  */
 const DEFAULT_MAX_CLUBS_PER_ACCOUNT = 10
-
 
 /**
  * The tiers `members/invite` may grant — the real member roles only. Creator (100) is
@@ -310,33 +321,56 @@ const app = new Hono<App>()
 		}
 	)
 
-	// A real Rec Room client endpoint with no backing implementation yet. The
-	// client calls it on the clubs host at /subscription/mine/member (no /club
-	// prefix) and sends no auth header, so it isn't gated. Returns an empty
-	// array = no club subscription memberships (the client chokes on null).
+	// The caller's subscriptions — the subscription clubs they're a member of, one row
+	// each with the creator, the club and its subscriber count; the subscription-club
+	// counterpart of `/club/mine/member`. The client calls it on the clubs host with no
+	// /club prefix, and has been seen calling it WITHOUT an auth header: a missing or
+	// invalid token answers `[]` rather than 401, since the client chokes on null and
+	// this is not worth failing a launch over.
 	.get(
 		'/subscription/mine/member',
 		describeRoute({
 			tags: ['Subscriptions'],
-			summary: 'The caller’s club-subscription memberships',
+			summary: 'The caller’s subscriptions',
 			description: [
-				'A real client endpoint with no backing implementation yet. The client calls it on',
-				'the clubs host at `/subscription/mine/member` (no `/club` prefix) and sends no auth',
-				'header, so it isn’t gated. Always `[]` — no subscription memberships (the client',
-				'chokes on null).',
+				'The subscription clubs the caller is a member of (`POST /subscription/{accountId}`),',
+				'oldest first — the creator, the club and its subscriber count; the subscription-club',
+				'counterpart of `/club/mine/member`. A creator is a member of their own subscription',
+				'club, so it is listed for them too. The client has been seen calling this without',
+				'an auth header, so a missing or invalid token answers `[]` rather than 401 (the',
+				'client chokes on null).',
 			].join(' '),
-			responses: { 200: json(JsonArray, 'Always empty for now') },
+			security: AUTHED,
+			responses: {
+				200: json(
+					SubscriptionMembershipsResponse,
+					'The caller’s subscriptions; `[]` when unauthenticated'
+				),
+			},
 		}),
-		(c) => c.json([])
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return c.json([])
+			return c.json(await getSubscriptionMemberships(c.env.DB, id))
+		}
 	)
 
-	// Subscription details for an account (numeric id) — simulated: no club, no subs.
+	// Subscription details for an account: their subscription club and its subscriber
+	// count. This is where subscription clubs come from — the first read for an account
+	// that has none PROVISIONS it (named after the creator, with them as its Creator-tier
+	// member), so the client's "subscribe" button always has a club to post to. Only a
+	// real account gets one; an unknown id reads as club 0. Public.
 	.get(
 		'/subscription/details/:accountId{[0-9]+}',
 		describeRoute({
 			tags: ['Subscriptions'],
 			summary: 'Subscription details for an account',
-			description: 'Simulated — no subscription club, no subscribers.',
+			description: [
+				'The account’s subscription club and its subscriber count (the creator not counted).',
+				'The first read for an account with no subscription club PROVISIONS one — a',
+				'`ClubType` 1 club named after the creator — so `clubId` is only 0 for an id that',
+				'isn’t an account. Public.',
+			].join(' '),
 			parameters: [
 				{
 					name: 'accountId',
@@ -346,14 +380,17 @@ const app = new Hono<App>()
 					schema: { type: 'string' },
 				},
 			],
-			responses: { 200: json(SubscriptionDetailsResponse, 'Zeroed subscription details') },
+			responses: { 200: json(SubscriptionDetailsResponse, 'The account’s subscription details') },
 		}),
-		(c) =>
-			c.json({
-				accountId: Number.parseInt(c.req.param('accountId'), 10),
-				clubId: 0,
-				subscriberCount: 0,
+		async (c) => {
+			const accountId = Number.parseInt(c.req.param('accountId'), 10)
+			const club = await getOrCreateSubscriptionClub(c.env.DB, accountId)
+			return c.json({
+				accountId,
+				clubId: club?.ClubId ?? 0,
+				subscriberCount: club ? await countClubSubscribers(c.env.DB, club.ClubId) : 0,
 			})
+		}
 	)
 
 	// Details for a named subscription (e.g. `rrplus`). The client deserializes this
@@ -381,13 +418,85 @@ const app = new Hono<App>()
 		(c) => c.json({})
 	)
 
-	// Subscriber count for an account. No club subscriptions yet → 0.
+	// Subscribe to a creator: the caller joins the SUBSCRIPTION CLUB of the account
+	// `accountId` — the `ClubType` 1 club provisioned for them (here too, if nobody has
+	// read their `details` yet) — becoming a Member of it outright. Idempotent:
+	// resubscribing answers the existing membership's id. Refused for one's own club and
+	// for a banned account; an id that isn't an account is a 404. The `roomId` form field
+	// (the room the subscribe was posted from) is accepted and unused. The envelope is the
+	// reference's, with `error` NULL on success rather than the club routes' `""`; `value`
+	// is the membership row's id, which is a guess at what the reference's opaque id was.
+	.post(
+		'/subscription/:accountId{[0-9]+}',
+		describeRoute({
+			tags: ['Subscriptions'],
+			summary: 'Subscribe to a creator',
+			description: [
+				'The caller joins the subscription club of the account `accountId` as a Member,',
+				'provisioning the club first if that account has none yet. Idempotent: subscribing',
+				'again answers the existing membership’s id. Refused for the caller’s own club and',
+				'for a banned account; an id that isn’t an account is a 404. `roomId` is accepted',
+				'and unused. Note the envelope is the reference’s — `error` and `errorId` are null',
+				'on success, not `""`.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'accountId',
+					in: 'path',
+					required: true,
+					description: 'The creator to subscribe to (digits only)',
+					schema: { type: 'string' },
+				},
+			],
+			requestBody: form(SubscribeRequest, 'The room the subscribe was posted from'),
+			responses: {
+				200: json(SubscriptionIdEnvelope, 'The subscription’s id'),
+				400: json(
+					SubscriptionErrorEnvelope,
+					'The caller’s own club, or the caller is banned from it'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such account' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return c.body(null, 401)
+
+			const club = await getOrCreateSubscriptionClub(
+				c.env.DB,
+				Number.parseInt(c.req.param('accountId'), 10)
+			)
+			if (club === null) return c.notFound()
+			const result = await subscribeToClub(c.env.DB, club.ClubId, id)
+			if (result === null) return c.notFound()
+
+			const refusal: Record<string, string | undefined> = {
+				notSubscriptionClub: 'That is not a subscription club.',
+				own: 'You cannot subscribe to yourself.',
+				banned: 'You cannot subscribe to this creator.',
+			}
+			const message = refusal[result.outcome]
+			if (message !== undefined) {
+				return c.json({ value: null, success: false, errorId: null, error: message }, 400)
+			}
+			return c.json({ value: result.membershipId ?? 0, success: true, errorId: null, error: null })
+		}
+	)
+
+	// Subscriber count for an account: their subscription club's members, the creator
+	// not counted. Public, a bare JSON integer; an account with no subscription club yet
+	// (nobody has read its `details` or subscribed) has 0 — this read doesn't provision one.
 	.get(
 		'/subscription/subscriberCount/:accountId{[0-9]+}',
 		describeRoute({
 			tags: ['Subscriptions'],
 			summary: 'Subscriber count for an account',
-			description: 'No club subscriptions yet, so this is always 0. A bare JSON integer.',
+			description: [
+				'How many subscribers the account’s subscription club has, its creator not counted.',
+				'Public. A bare JSON integer; an account with no subscription club has 0.',
+			].join(' '),
 			parameters: [
 				{
 					name: 'accountId',
@@ -397,9 +506,15 @@ const app = new Hono<App>()
 					schema: { type: 'string' },
 				},
 			],
-			responses: { 200: json(SubscriberCountResponse, 'Always 0') },
+			responses: { 200: json(SubscriberCountResponse, 'The subscriber count') },
 		}),
-		(c) => c.json(0)
+		async (c) => {
+			const club = await getSubscriptionClub(
+				c.env.DB,
+				Number.parseInt(c.req.param('accountId'), 10)
+			)
+			return c.json(club ? await countClubSubscribers(c.env.DB, club.ClubId) : 0)
+		}
 	)
 
 	// The player's clubs that have unread announcements (MyClubsWithUnread-
@@ -1566,7 +1681,9 @@ app.get(
 						'membership (join / ask-to-join / leave, with the ban and pending tiers),',
 						'search, announcements, the club gallery and clubhouse room, and each player’s home',
 						'club. Everything is D1-backed on the shared `recflare` database; the',
-						'`/subscription/*` routes are stubs, since there are no subscription clubs yet.',
+						'A creator’s subscribers are the members of their subscription club (`ClubType` 1,',
+						'one per account, provisioned by the first `details` read or subscribe for that account);',
+						'the `/subscription/*` routes read and join those.',
 						'',
 						'Most writes answer the `{ error, success, value }` envelope with HTTP 200, and the',
 						'ones the client re-renders a club screen from carry the club’s FULL details as',

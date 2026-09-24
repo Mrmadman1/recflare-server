@@ -84,29 +84,256 @@ describe('clubs endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
-	test('GET /subscription/mine/member returns an empty array without a token', async () => {
-		// The client calls this on the clubs host with no /club prefix and no auth.
-		const res = await exports.default.fetch(`${ORIGIN}/subscription/mine/member`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
-	})
-
 	test('GET /subscription/details/:subscription returns an empty object', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/subscription/details/rrplus`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({})
 	})
 
-	test('GET /subscription/details/:accountId returns simulated details', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/subscription/details/2`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ accountId: 2, clubId: 0, subscriberCount: 0 })
-	})
+	describe('subscriptions', () => {
+		// A creator's subscribers are the members of their SUBSCRIPTION CLUB (ClubType 1).
+		// Nothing provisions those yet, so the tests seed them the way the eventual
+		// provisioner will: a ClubType 1 club with the creator as its Creator-tier member.
+		let clubId = 0
+		const CREATOR = 8800
+		beforeAll(async () => {
+			const idRow = await env.DB.prepare(
+				'SELECT COALESCE(MAX(club_id), 0) + 1 AS next FROM club'
+			).first<{
+				next: number
+			}>()
+			clubId = idRow?.next ?? 1
+			await env.DB.prepare('INSERT INTO club (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						ClubId: clubId,
+						Name: 'Player8800 subscribers',
+						Description: '',
+						Category: '',
+						Visibility: 1,
+						Joinability: 0,
+						AllowJuniors: true,
+						MainImageName: '',
+						ClubType: 1,
+						ClubhouseRoomId: null,
+						CreatorAccountId: CREATOR,
+						IsRRO: false,
+						MinLevel: 0,
+						State: 0,
+						MemberCount: 1,
+						CreatedAt: '2026-07-01T00:00:00Z',
+					})
+				)
+				.run()
+			await env.DB.prepare(
+				'INSERT INTO club_member (club_id, account_id, membership_type, created_at) VALUES (?1, ?2, ?3, ?4)'
+			)
+				.bind(clubId, CREATOR, 100, '2026-07-01T00:00:00Z')
+				.run()
+		})
 
-	test('GET /subscription/subscriberCount/:id returns 0', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/subscription/subscriberCount/2`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toBe(0)
+		type Envelope = { value: number | null; success: boolean; errorId: null; error: string | null }
+		type Membership = { AccountId: number; ClubId: number; SubscriberCount: number }
+		type Details = { accountId: number; clubId: number; subscriberCount: number }
+
+		const subscribe = async (sub: string, id: number | string = CREATOR, body = 'roomId=78') =>
+			exports.default.fetch(`${ORIGIN}/subscription/${id}`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const details = async (accountId: number): Promise<Details> => {
+			const res = await exports.default.fetch(`${ORIGIN}/subscription/details/${accountId}`)
+			expect(res.status).toBe(200)
+			return (await res.json()) as Details
+		}
+		const count = async (accountId: number): Promise<number> => {
+			const res = await exports.default.fetch(`${ORIGIN}/subscription/subscriberCount/${accountId}`)
+			expect(res.status).toBe(200)
+			return (await res.json()) as number
+		}
+		const mine = async (headers: Record<string, string> = {}): Promise<Membership[]> => {
+			const res = await exports.default.fetch(`${ORIGIN}/subscription/mine/member`, { headers })
+			expect(res.status).toBe(200)
+			return (await res.json()) as Membership[]
+		}
+
+		test('an id that isn’t an account reads as club 0 and never gets one', async () => {
+			expect(await details(2)).toEqual({ accountId: 2, clubId: 0, subscriberCount: 0 })
+			expect(await details(2)).toEqual({ accountId: 2, clubId: 0, subscriberCount: 0 })
+			expect(await count(2)).toBe(0)
+			const { results } = await env.DB.prepare(
+				'SELECT club_id FROM club WHERE creator_account_id = 2'
+			).all()
+			expect(results).toEqual([])
+		})
+
+		test('the first details read for an account provisions its subscription club', async () => {
+			// Account 9101 exists (seeded) but has no subscription club: the count read
+			// doesn't make one …
+			expect(await count(9101)).toBe(0)
+			expect(
+				await env.DB.prepare('SELECT club_id FROM club WHERE creator_account_id = 9101').first()
+			).toBeNull()
+
+			// … the details read does, and every read after agrees on it.
+			const first = await details(9101)
+			expect(first.clubId).toBeGreaterThan(0)
+			expect(first).toEqual({ accountId: 9101, clubId: first.clubId, subscriberCount: 0 })
+			expect(await details(9101)).toEqual(first)
+			expect(await count(9101)).toBe(0)
+
+			// A ClubType 1 club named after the creator, Private, Open, with the creator as its
+			// Creator-tier (and only) member; out of the creator's own club lists and search.
+			const club = (await env.DB.prepare('SELECT data FROM club WHERE club_id = ?1')
+				.bind(first.clubId)
+				.first<{ data: string }>())!
+			expect(JSON.parse(club.data)).toMatchObject({
+				ClubId: first.clubId,
+				Name: 'Player9101',
+				ClubType: 1,
+				Visibility: 0,
+				Joinability: 0,
+				CreatorAccountId: 9101,
+				MemberCount: 1,
+			})
+			const { results: members } = await env.DB.prepare(
+				'SELECT account_id, membership_type FROM club_member WHERE club_id = ?1'
+			)
+				.bind(first.clubId)
+				.all()
+			expect(members).toEqual([{ account_id: 9101, membership_type: 100 }])
+			expect(await mine(await bearer('9101'))).toEqual([
+				{ AccountId: 9101, ClubId: first.clubId, SubscriberCount: 0 },
+			])
+			const created = await exports.default.fetch(`${ORIGIN}/club/mine/created`, {
+				headers: await bearer('9101'),
+			})
+			expect(await created.json()).toEqual([])
+			const search = await exports.default.fetch(`${ORIGIN}/club/search?query=Player9101`)
+			expect(((await search.json()) as { Clubs: unknown[] }).Clubs).toEqual([])
+
+			// Subscribing to the creator lands in the provisioned club.
+			expect((await subscribe('9100', 9101)).status).toBe(200)
+			expect(await details(9101)).toEqual({
+				accountId: 9101,
+				clubId: first.clubId,
+				subscriberCount: 1,
+			})
+		})
+
+		test('a fresh subscription club has its creator as a member but no subscribers', async () => {
+			expect(await details(CREATOR)).toEqual({ accountId: CREATOR, clubId, subscriberCount: 0 })
+			expect(await count(CREATOR)).toBe(0)
+			// The creator is a Creator-tier member of their own club, so it's listed for them.
+			expect(await mine(await bearer(String(CREATOR)))).toEqual([
+				{ AccountId: CREATOR, ClubId: clubId, SubscriberCount: 0 },
+			])
+		})
+
+		test('GET /subscription/mine/member answers [] without a token', async () => {
+			// The client has been seen calling this with no auth header: `[]`, not 401 (it
+			// chokes on null). A garbage token is the same; so is a player with none.
+			expect(await mine()).toEqual([])
+			expect(await mine({ Authorization: 'Bearer nope' })).toEqual([])
+			expect(await mine(await bearer('8801'))).toEqual([])
+		})
+
+		test('POST /subscription/:accountId joins the creator’s subscription club and the reads follow', async () => {
+			// Auth-gated.
+			const anon = await exports.default.fetch(`${ORIGIN}/subscription/${CREATOR}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'roomId=78',
+			})
+			expect(anon.status).toBe(401)
+
+			// The reference envelope: `error`/`errorId` null on success, `value` an id.
+			const first = await subscribe('8801')
+			expect(first.status).toBe(200)
+			const created = (await first.json()) as Envelope
+			expect(created).toMatchObject({ success: true, errorId: null, error: null })
+			expect(created.value).toBeGreaterThan(0)
+
+			// The subscriber is a plain Member of the club; the club's count moved.
+			const row = await env.DB.prepare(
+				'SELECT club_member_id, membership_type FROM club_member WHERE club_id = ?1 AND account_id = 8801'
+			)
+				.bind(clubId)
+				.first<{ club_member_id: number; membership_type: number }>()
+			expect(row).toEqual({ club_member_id: created.value, membership_type: 10 })
+
+			// Idempotent: subscribing again (from another room, in the other casing) answers
+			// the same id and nothing doubles.
+			const again = await subscribe('8801', CREATOR, 'RoomId=99')
+			expect(again.status).toBe(200)
+			expect(((await again.json()) as Envelope).value).toBe(created.value)
+
+			// A second subscriber; every read agrees, and the creator isn't counted.
+			expect((await subscribe('8802', CREATOR, '')).status).toBe(200)
+			expect(await count(CREATOR)).toBe(2)
+			expect(await details(CREATOR)).toEqual({ accountId: CREATOR, clubId, subscriberCount: 2 })
+			expect(await mine(await bearer('8801'))).toEqual([
+				{ AccountId: CREATOR, ClubId: clubId, SubscriberCount: 2 },
+			])
+			expect(await mine(await bearer('8802'))).toEqual([
+				{ AccountId: CREATOR, ClubId: clubId, SubscriberCount: 2 },
+			])
+
+			// The club's MemberCount counts the creator too, and the subscription club stays
+			// out of the ordinary my-clubs lists.
+			const club = await env.DB.prepare('SELECT data FROM club WHERE club_id = ?1')
+				.bind(clubId)
+				.first<{ data: string }>()
+			expect((JSON.parse(club?.data ?? '{}') as { MemberCount: number }).MemberCount).toBe(3)
+			const listed = await exports.default.fetch(`${ORIGIN}/club/mine/member`, {
+				headers: await bearer('8801'),
+			})
+			expect(await listed.json()).toEqual([])
+		})
+
+		test('POST /subscription/:accountId refuses the creator and the banned, 404s a non-account', async () => {
+			const refused = async (res: Response, error: string): Promise<void> => {
+				expect(res.status).toBe(400)
+				expect(await res.json()).toEqual({ value: null, success: false, errorId: null, error })
+			}
+			await refused(await subscribe(String(CREATOR)), 'You cannot subscribe to yourself.')
+
+			// A ban sticks.
+			await env.DB.prepare(
+				'INSERT INTO club_member (club_id, account_id, membership_type, created_at) VALUES (?1, 8804, -1, ?2)'
+			)
+				.bind(clubId, '2026-07-01T00:00:00Z')
+				.run()
+			await refused(await subscribe('8804'), 'You cannot subscribe to this creator.')
+
+			// An id that isn't an account is a 404 and mints no club; a non-numeric id
+			// doesn't match the route.
+			expect((await subscribe('8801', 999999)).status).toBe(404)
+			expect(
+				await env.DB.prepare('SELECT club_id FROM club WHERE creator_account_id = 999999').first()
+			).toBeNull()
+			expect((await subscribe('8801', 'abc')).status).toBe(404)
+		})
+
+		test('subscribing to an account with no club yet provisions it', async () => {
+			// Account 9100 exists (seeded) and nobody has read its details.
+			expect(
+				await env.DB.prepare('SELECT club_id FROM club WHERE creator_account_id = 9100').first()
+			).toBeNull()
+			const res = await subscribe('8801', 9100)
+			expect(res.status).toBe(200)
+			expect(((await res.json()) as Envelope).success).toBe(true)
+
+			const d = await details(9100)
+			expect(d.clubId).toBeGreaterThan(0)
+			expect(d).toEqual({ accountId: 9100, clubId: d.clubId, subscriberCount: 1 })
+			expect(await mine(await bearer('8801'))).toContainEqual({
+				AccountId: 9100,
+				ClubId: d.clubId,
+				SubscriberCount: 1,
+			})
+		})
 	})
 
 	test('GET /announcements/v2/mine/unread returns []', async () => {
@@ -1441,6 +1668,7 @@ describe('clubs endpoints', () => {
 			'POST /club/{clubId}/join',
 			'POST /club/{clubId}/leave',
 			'POST /club/{clubId}/members/leave',
+			'POST /subscription/{accountId}',
 			'PUT /club/home/me',
 			'PUT /club/{clubId}/additionalimage/{index}',
 			'PUT /club/{clubId}/clubhouse',

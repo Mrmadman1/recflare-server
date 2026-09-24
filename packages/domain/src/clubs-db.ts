@@ -16,6 +16,7 @@
  * {@link getClubSummary} and gates entry on {@link isClubMember}.
  */
 
+import { getAccount } from './accounts-db'
 import { getSavedImagesByNames, placeholderSavedImage } from './images-db'
 
 import type { SavedImage } from './images-db'
@@ -98,6 +99,13 @@ export enum ClubJoinability {
 
 /** Membership types at/above which a row counts as an actual member (not pending/banned). */
 const MEMBER_THRESHOLD = ClubMembershipType.Member
+
+/**
+ * Subscription clubs (`ClubType` 1) are a creator's paid-subscriber club, not a
+ * club you browse or list among your own — they're excluded from the "my clubs"
+ * lists (the client reaches them through the `/subscription/*` endpoints instead).
+ */
+const SUBSCRIPTION_CLUB_TYPE = 1
 
 /**
  * Client-facing club shape (PascalCase, mirror of the Go `Club` JSON tags). The
@@ -442,6 +450,169 @@ export async function createClubAnnouncement(
 		)
 		.first<{ announcement_id: number }>()
 	return row?.announcement_id ?? 0
+}
+
+// ---- Subscriptions ---------------------------------------------------------
+//
+// Rec Room had no per-player "follow": a creator's subscribers are the members of a
+// SUBSCRIPTION CLUB (`ClubType` 1) provisioned for that creator, one per account, which
+// the client reaches only through `/subscription/*`. Subscribing is joining that club;
+// the subscriber count is its membership minus the creator, who is its Creator-tier
+// member but not their own subscriber.
+
+/**
+ * A creator's subscription club — the `ClubType` 1 club they created — or null when
+ * none has been provisioned for them (nothing creates them yet).
+ */
+export async function getSubscriptionClub(db: D1Database, accountId: number): Promise<Club | null> {
+	const row = await db
+		.prepare(
+			`SELECT data FROM club
+			 WHERE creator_account_id = ?1
+			   AND json_extract(data, '$.ClubType') = ?2
+			 ORDER BY json_extract(data, '$.CreatedAt') ASC
+			 LIMIT 1`
+		)
+		.bind(accountId, SUBSCRIPTION_CLUB_TYPE)
+		.first<ClubRow>()
+	return row ? toDto(JSON.parse(row.data) as StoredClub) : null
+}
+
+/**
+ * The account's subscription club, provisioned on first sight: when `accountId` has
+ * none, one is created for them — a `ClubType` 1 club named after the creator, Private
+ * (it is reached only through `/subscription/*`; search excludes the type anyway) and
+ * Open (subscribers join outright), with the creator as its Creator-tier member. Null
+ * when no such account exists, so an unknown id can't mint clubs. Two simultaneous first
+ * reads can create two clubs; {@link getSubscriptionClub} then always serves the oldest,
+ * so the second is inert.
+ */
+export async function getOrCreateSubscriptionClub(
+	db: D1Database,
+	accountId: number
+): Promise<Club | null> {
+	const existing = await getSubscriptionClub(db, accountId)
+	if (existing) return existing
+	const account = await getAccount(db, accountId)
+	if (!account) return null
+	return createClub(db, accountId, {
+		name: account.username,
+		clubType: SUBSCRIPTION_CLUB_TYPE,
+		visibility: ClubVisibility.Private,
+		joinability: ClubJoinability.Open,
+	})
+}
+
+/**
+ * How many subscribers a subscription club has: its members at/above `Member`, not
+ * counting the club's creator. Any club id works; one with no members simply has 0.
+ */
+export async function countClubSubscribers(db: D1Database, clubId: number): Promise<number> {
+	const row = await db
+		.prepare(
+			`SELECT COUNT(*) AS n
+			 FROM club_member m
+			 JOIN club c ON c.club_id = m.club_id
+			 WHERE m.club_id = ?1 AND m.membership_type >= ?2
+			   AND m.account_id != c.creator_account_id`
+		)
+		.bind(clubId, MEMBER_THRESHOLD)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
+ * How subscribing resolved. `subscribed` is a new membership, `alreadySubscribed` a
+ * repeat (idempotent); `notSubscriptionClub` is a club id that isn't a subscription
+ * club, `own` the creator subscribing to themselves, `banned` a banned account.
+ * `membershipId` is the `club_member` row's id when there is one.
+ */
+export interface SubscribeResult {
+	outcome: 'subscribed' | 'alreadySubscribed' | 'notSubscriptionClub' | 'own' | 'banned'
+	club: Club
+	membershipId: number | null
+}
+
+/**
+ * Subscribe `accountId` to a subscription club: they become a `Member` of it outright
+ * (a subscription club's Joinability is not consulted — there is no approval flow for
+ * subscribers). Idempotent for an existing subscriber, refused for the club's creator
+ * and for a banned account. Null when the club doesn't exist.
+ */
+export async function subscribeToClub(
+	db: D1Database,
+	clubId: number,
+	accountId: number
+): Promise<SubscribeResult | null> {
+	const club = await getClub(db, clubId)
+	if (!club) return null
+	const membershipId = async (): Promise<number | null> => {
+		const row = await db
+			.prepare('SELECT club_member_id FROM club_member WHERE club_id = ?1 AND account_id = ?2')
+			.bind(clubId, accountId)
+			.first<{ club_member_id: number }>()
+		return row?.club_member_id ?? null
+	}
+
+	if (club.ClubType !== SUBSCRIPTION_CLUB_TYPE) {
+		return { outcome: 'notSubscriptionClub', club, membershipId: null }
+	}
+	if (club.CreatorAccountId === accountId) return { outcome: 'own', club, membershipId: null }
+
+	const current = await getMembership(db, clubId, accountId)
+	if (current === ClubMembershipType.Banned) return { outcome: 'banned', club, membershipId: null }
+	if (current >= MEMBER_THRESHOLD) {
+		return { outcome: 'alreadySubscribed', club, membershipId: await membershipId() }
+	}
+
+	await setMembership(db, clubId, accountId, ClubMembershipType.Member)
+	const count = await syncMemberCount(db, clubId)
+	return {
+		outcome: 'subscribed',
+		club: { ...club, MemberCount: count },
+		membershipId: await membershipId(),
+	}
+}
+
+/**
+ * One of the caller's subscriptions as `GET /subscription/mine/member` serves it: the
+ * creator subscribed to, their subscription club, and its subscriber count.
+ */
+export interface SubscriptionMembership {
+	AccountId: number
+	ClubId: number
+	SubscriberCount: number
+}
+
+/**
+ * The subscription clubs `accountId` is a member of (Member tier or above — the
+ * subscription-club counterpart of {@link getClubsByMember}), oldest club first, each
+ * with its current subscriber count. A creator is a Creator-tier member of their own
+ * subscription club, so it is listed for them too.
+ */
+export async function getSubscriptionMemberships(
+	db: D1Database,
+	accountId: number
+): Promise<SubscriptionMembership[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT c.club_id AS club_id, c.creator_account_id AS creator_account_id,
+			        (SELECT COUNT(*) FROM club_member s
+			          WHERE s.club_id = c.club_id AND s.membership_type >= ?2
+			            AND s.account_id != c.creator_account_id) AS subscriber_count
+			 FROM club_member m
+			 JOIN club c ON c.club_id = m.club_id
+			 WHERE m.account_id = ?1 AND m.membership_type >= ?2
+			   AND json_extract(c.data, '$.ClubType') = ?3
+			 ORDER BY json_extract(c.data, '$.CreatedAt') ASC, c.club_id ASC`
+		)
+		.bind(accountId, MEMBER_THRESHOLD, SUBSCRIPTION_CLUB_TYPE)
+		.all<{ club_id: number; creator_account_id: number; subscriber_count: number }>()
+	return results.map((r) => ({
+		AccountId: r.creator_account_id,
+		ClubId: r.club_id,
+		SubscriberCount: r.subscriber_count,
+	}))
 }
 
 /** What club search answers: the page of clubs plus the total that matched. */
@@ -855,13 +1026,6 @@ export async function getMostActiveClubhouses(
 		.all<ActiveClubhouse>()
 	return results
 }
-
-/**
- * Subscription clubs (`ClubType` 1) are a creator's paid-subscriber club, not a
- * club you browse or list among your own — they're excluded from the "my clubs"
- * lists (the client reaches them through the `/subscription/*` endpoints instead).
- */
-const SUBSCRIPTION_CLUB_TYPE = 1
 
 /**
  * How many clubs an account has made, for the per-account club cap. Subscription

@@ -245,11 +245,52 @@ export const ClubSearchResponse = z.object({
 	TotalClubs: z.int().describe('How many clubs matched, not the page size'),
 })
 
-/** `GET /subscription/details/:accountId` — simulated: no club, no subscribers. */
+/**
+ * `GET /subscription/mine/member` — one of the caller's subscriptions (recovered from
+ * the client's decoder: `AccountId` int, `ClubId` long, `SubscriberCount` int).
+ */
+export const SubscriptionMembershipDto = z.object({
+	AccountId: z.int().describe('The creator subscribed to (the subscription club’s creator)'),
+	ClubId: z.int().describe('Their subscription club'),
+	SubscriberCount: z.int().describe('How many subscribers that club has, its creator not counted'),
+})
+
+/** `GET /subscription/mine/member` — the caller's subscriptions, oldest first. */
+export const SubscriptionMembershipsResponse = z.array(SubscriptionMembershipDto)
+
+/** `GET /subscription/details/:accountId` — an account's subscription club and its size. */
 export const SubscriptionDetailsResponse = z.object({
 	accountId: z.int(),
-	clubId: z.int().describe('Always 0 — no subscription clubs yet'),
-	subscriberCount: z.int().describe('Always 0'),
+	clubId: z
+		.int()
+		.describe(
+			'The account’s subscription club, provisioned by this read or a subscribe; 0 only for a non-account'
+		),
+	subscriberCount: z.int().describe('Its subscribers, the creator not counted'),
+})
+
+/**
+ * `POST /subscription/:accountId` — the reference's envelope, which differs from the club
+ * one: `error` (and `errorId`) are NULL on success rather than `""`. `value` is the
+ * subscription's id.
+ */
+export const SubscriptionIdEnvelope = z.object({
+	value: z
+		.int()
+		.describe(
+			'The subscription’s id — the club membership row (the existing one when already subscribed)'
+		),
+	success: z.boolean(),
+	errorId: z.null(),
+	error: z.null(),
+})
+
+/** A rejected subscribe: the same envelope, carrying the message. */
+export const SubscriptionErrorEnvelope = z.object({
+	value: z.null(),
+	success: z.boolean().describe('Always false'),
+	errorId: z.null(),
+	error: z.string().describe('The message shown to the player'),
 })
 
 /** The set of category tags a club can be filed under — a fixed list. */
@@ -258,7 +299,9 @@ export const CategoryTags = z.array(z.string())
 /** `GET /subscription/subscriberCount/:accountId` — a bare JSON integer. */
 export const SubscriberCountResponse = z
 	.int()
-	.describe('Always 0 — there are no club subscriptions yet')
+	.describe(
+		'The account’s subscription club’s subscribers, its creator not counted; 0 without a club'
+	)
 
 /**
  * `GET /club/:clubId/hasDisabledClubChat` — a bare JSON boolean, like the other
@@ -315,6 +358,14 @@ export const ModifyClubRequest = z.object({
 /** `PUT /club/home/me` form body. */
 export const HomeClubRequest = z.object({
 	clubId: z.string().describe('The club to make home; the caller must be a member of it'),
+})
+
+/** `POST /subscription/:accountId` — the room the player is subscribing from. */
+export const SubscribeRequest = z.object({
+	roomId: z
+		.string()
+		.optional()
+		.describe('The room the subscribe was posted from. Accepted and unused — nothing stores it'),
 })
 
 /** `PUT /club/:clubId/minlevel` form body. */
