@@ -1,20 +1,18 @@
 import { Command } from '@commander-js/extra-typings'
 import Table from 'cli-table3'
 
-import {
-	buildCatalogLoad,
-	CATALOG_ID_BASE,
-	CATALOG_INSERT_COLUMNS,
-} from '../../../../apps/econ/src/catalog-load'
+import { buildCatalogLoad, CATALOG_INSERT_COLUMNS } from '../../../../apps/econ/src/catalog-load'
 import { execSql, execSqlFile, resolveRemote, target } from '../d1'
 import { getRepoRoot } from '../path'
 
 import type {
-	AvatarItemCapture,
 	CatalogCollision,
+	CatalogLoad,
 	CatalogLoadRow,
 	CatalogValue,
 	SkinCapture,
+	StorefrontDump,
+	StoreListing,
 } from '../../../../apps/econ/src/catalog-load'
 
 /**
@@ -37,8 +35,22 @@ import type {
 /** The worker that owns the table — whose wrangler.jsonc and node_modules wrangler uses. */
 const OWNER = 'econ'
 
-const AVATAR_ITEMS = 'apps/econ/static/db/avatar-items.json'
-const SKINS = 'apps/econ/static/db/skins.json'
+/**
+ * The 2025 general store as the econ worker SERVES it — the ONLY file the loader reads, so a
+ * row's `catalog_id` and a listing's `PurchasableItemId` are one number by construction.
+ * Written by `runx storefront build` from {@link STORE_DUMP} and {@link SKINS}.
+ */
+export const STOREFRONT_FILE = 'apps/econ/static/storefronts/sf3-2025.json'
+/**
+ * The 2025 general store as the live game served it, one storefront page dumped verbatim. Kept
+ * for reference and as the generator's input; nothing serves or loads it directly.
+ */
+export const STORE_DUMP = 'apps/econ/static/db/Watch_EnumValue_3.json'
+/**
+ * The equipment skins, captured separately: the store lists only a third of them, and the
+ * generator appends the rest as listings of their own.
+ */
+export const SKINS = 'apps/econ/static/db/skins.json'
 
 /**
  * Rows per INSERT. Batched because thousands of single-row statements parse far more slowly
@@ -59,26 +71,52 @@ function lit(v: CatalogValue): string {
 	return `'${v.replaceAll("'", "''")}'`
 }
 
-/** Read one capture, tolerating the BOM the exports carry (`JSON.parse` rejects U+FEFF). */
-async function readCapture<T>(relPath: string): Promise<T[]> {
+/** Read one JSON file, tolerating the BOM the exports carry (`JSON.parse` rejects U+FEFF). */
+async function readJson(relPath: string): Promise<unknown> {
 	const full = path.join(getRepoRoot(), relPath)
 	if (!(await fs.pathExists(full))) throw new Error(`no capture at ${relPath}`)
-	const text = (await fs.readFile(full, 'utf8')).replace(/^﻿/, '')
-	const parsed = JSON.parse(text) as unknown
-	if (!Array.isArray(parsed)) throw new Error(`${relPath} is not a JSON array`)
-	return parsed as T[]
+	const text = (await fs.readFile(full, 'utf8')).replace(/^\ufeff/, '')
+	return JSON.parse(text) as unknown
 }
 
-/** Both captures, as the loader and the storefront generator read them. */
-export async function readCaptures(): Promise<{
-	avatarItems: AvatarItemCapture[]
-	skins: SkinCapture[]
-}> {
-	const [avatarItems, skins] = await Promise.all([
-		readCapture<AvatarItemCapture>(AVATAR_ITEMS),
-		readCapture<SkinCapture>(SKINS),
-	])
-	return { avatarItems, skins }
+/** One storefront page (`{ StoreItems: [...] }`), checked to be that shape. */
+export async function readStorefrontPage(relPath: string): Promise<StorefrontDump> {
+	const parsed = await readJson(relPath)
+	if (
+		typeof parsed !== 'object' ||
+		parsed === null ||
+		!Array.isArray((parsed as { StoreItems?: unknown }).StoreItems)
+	) {
+		throw new Error(`${relPath} is not a storefront page ({ StoreItems: [...] })`)
+	}
+	return parsed as StorefrontDump
+}
+
+/** The served store's listings — the only thing the loader reads. */
+export async function readListings(): Promise<StoreListing[]> {
+	return (await readStorefrontPage(STOREFRONT_FILE)).StoreItems
+}
+
+/** The skin capture, for the generator: the skins the store never listed. */
+export async function readSkins(): Promise<SkinCapture[]> {
+	const skins = await readJson(SKINS)
+	if (!Array.isArray(skins)) throw new Error(`${SKINS} is not a JSON array`)
+	return skins as SkinCapture[]
+}
+
+/** What a load is made of, for the console: rows per kind, and the listings that load as nothing. */
+function describeLoad(load: CatalogLoad): string {
+	const kindAt = CATALOG_INSERT_COLUMNS.indexOf('kind')
+	const perKind = new Map<string, number>()
+	for (const r of load.rows) {
+		const k = String(r.values[kindAt])
+		perKind.set(k, (perKind.get(k) ?? 0) + 1)
+	}
+	const kinds = [...perKind].map(([k, n]) => `${n} ${k}`).join(', ')
+	const skipped = Object.entries(load.skipped)
+		.map(([k, n]) => `${n} ${k}`)
+		.join(', ')
+	return `${kinds}${skipped === '' ? '' : `; not loaded: ${skipped}`}`
 }
 
 /** Print the duplicate keys a load dropped. Never silent: that is the whole point of them. */
@@ -192,12 +230,12 @@ const load = new Command('load')
 	.option('--dry-run', 'Build and validate the SQL, print what it would do, change nothing.', false)
 	.action(async (opts) => {
 		const remote = resolveRemote(opts)
-		const { avatarItems, skins } = await readCaptures()
-		const { rows, collisions } = buildCatalogLoad(avatarItems, skins)
+		const load = buildCatalogLoad(await readListings())
+		const { rows, collisions } = load
 
 		console.log(
 			`${opts.replace ? 'Replacing the catalog with' : 'Merging'} ${rows.length} rows ` +
-				`(${avatarItems.length} avatar items, ${skins.length} skins) into ${target(remote)}`
+				`(${describeLoad(load)}) into ${target(remote)}`
 		)
 		reportCollisions(collisions)
 
@@ -224,11 +262,11 @@ const load = new Command('load')
 			statements.push('DELETE FROM catalog;')
 		} else {
 			// Clear every existing number BEFORE assigning any. `catalog_id` is unique, and this
-			// load is about to hand out 1..N: without this, a row already holding one of those
-			// numbers (because it was in an earlier load and this capture no longer mentions it)
+			// load carries the store's numbers: without this, a row already holding one of them
+			// (because it was in an earlier load under a different key, or the store renumbered)
 			// collides and the whole merge fails. Nulling first also means a row left un-numbered
-			// afterwards is visibly a row the captures did not mention, which the tail statement
-			// below then numbers above N.
+			// afterwards is visibly a row the store no longer lists, which the tail statement
+			// below then numbers above everything this load assigned.
 			statements.push('UPDATE catalog SET catalog_id = NULL;')
 		}
 		for (let start = 0; start < rows.length; start += CHUNK) {
@@ -242,11 +280,11 @@ const load = new Command('load')
 			)
 		}
 		if (!opts.replace) {
-			// Anything still un-numbered is a row the captures did not mention — a merge keeps those,
+			// Anything still un-numbered is a row the store no longer lists — a merge keeps those,
 			// so they need handles too. They go ABOVE the highest id this load assigned, so they can
 			// never collide with it, ordered by rowid for determinism. Usually this matches nothing
 			// at all, and it is a single statement either way.
-			const highest = CATALOG_ID_BASE + rows.length - 1
+			const highest = Math.max(0, ...rows.map((r) => r.id))
 			statements.push(
 				`UPDATE catalog SET catalog_id = ${highest} +\n` +
 					`\t(SELECT COUNT(*) FROM catalog c WHERE c.catalog_id IS NULL AND c.rowid <= catalog.rowid)\n` +
@@ -296,16 +334,16 @@ const load = new Command('load')
 	})
 
 const check = new Command('check')
-	.description('Validate the captured JSON without touching any database')
+	.description('Validate the served store as a catalog load without touching any database')
 	.action(async () => {
-		const { avatarItems, skins } = await readCaptures()
-		const { rows, collisions } = buildCatalogLoad(avatarItems, skins)
+		const listings = await readListings()
+		const load = buildCatalogLoad(listings)
+		const { rows, collisions } = load
 
 		const table = new Table()
 		table.push(
-			{ 'avatar items': String(avatarItems.length) },
-			{ skins: String(skins.length) },
-			{ 'rows to load': String(rows.length) },
+			{ 'store listings': String(listings.length) },
+			{ 'rows to load': `${rows.length} (${describeLoad(load)})` },
 			{ 'duplicate keys': String(collisions.length) }
 		)
 		console.log(table.toString())
@@ -329,7 +367,9 @@ export const catalogCmd = new Command('catalog')
 		'after',
 		`
 The catalog's structure is a migration; its contents are not — reload them here whenever
-apps/econ/static/db/*.json changes, with no migration and no deploy.
+apps/econ/static/storefronts/sf3-2025.json (the served 2025 store, see \`runx storefront
+build\`) changes, with no migration and no deploy. That file is the loader's ONLY input, and
+every row's catalog_id is its listing's PurchasableItemId.
 
 load MERGES by default: new items are inserted, existing ones refreshed, and anything the
 captures don't mention is left alone — so a partial capture of a few new items is a valid
@@ -339,7 +379,7 @@ them should be REMOVED.
 Target --local (default) or --remote (production; needs RECFLARE_D1 in .env).
 
 Examples:
-  $ runx catalog check                # validate the JSON, touch nothing
+  $ runx catalog check                # validate the store file, touch nothing
   $ runx catalog load --dry-run       # build the SQL, print what it would do
   $ runx catalog load                 # merge into the local dev database
   $ runx catalog load --remote        # merge into production

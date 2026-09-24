@@ -39,7 +39,6 @@ import { censorSwears } from '../../api/src/sanitize'
 import { BalanceAddType } from '../../notify/src/notification-payloads'
 import { NotificationType } from '../../notify/src/notification-types'
 import adCarouselItems from '../static/ad-carousel-items.json'
-import avatarItemCatalog from '../static/db/avatar-items.json'
 import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
@@ -56,18 +55,10 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
-import { getCatalogItem } from './catalog-db'
+import { getCatalogItem, toCatalogAvatarItem } from './catalog-db'
 // `LEGACY_CLIENT_BUILD` is shared with the storefront generator rather than restated: it picks
-// which store FILE a caller is served here, and which ITEMS go in that file there. The two must
-// name the same moment or a build gets a store built to a different cutoff.
-import {
-	CATALOG_ID_BASE,
-	CatalogKind,
-	isSellableRarity,
-	LEGACY_CLIENT_BUILD,
-	priceForRarity,
-	subscriberPriceFor,
-} from './catalog-load'
+// which store FILE a caller is served here, and is what the generator's help names.
+import { CatalogKind, LEGACY_CLIENT_BUILD } from './catalog-load'
 import { claimChallengeGift, getChallengeStatuses, recordChallengeProgress } from './challenge-db'
 import { buildRotation, rotationMapId, withWeeklyGift } from './challenge-rotation'
 import {
@@ -861,8 +852,8 @@ interface GiftRequest {
  */
 const STOREFRONT_ALIASES: Record<string, string> = {
 	// Empty. 1704 was here for a while, standing in for a 2025 gift-drop storefront nobody had
-	// captured; the items it was meant to sell turned out to belong in the general store, so
-	// they are in `sf3-2025.json` and served as storefront 3 — see {@link STOREFRONT_BY_BUILD}.
+	// captured; the 2025 general store has since been dumped and is served as storefront 3 —
+	// see {@link STOREFRONT_BY_BUILD}.
 	// That is a per-BUILD variant of one storefront rather than an alias between two ids, which
 	// is why nothing is listed here.
 }
@@ -871,16 +862,17 @@ const STOREFRONT_ALIASES: Record<string, string> = {
  * Storefronts that have a SECOND file for newer clients, keyed by the id the client asks for
  * and naming the file a build past {@link LEGACY_CLIENT_BUILD} is served instead.
  *
- * `3` is the general store, and BOTH files are generated from the item catalog by
- * `runx storefront build` — the same store at two points in time. `sf3.json` holds what existed
- * by {@link LEGACY_CLIENT_BUILD}; `sf3-2025.json` holds everything. One storefront id either
- * way: the client asks for 3 in both cases and neither knows there are two files, so nothing
- * about the request changes and no item is renumbered between them.
+ * `3` is the general store at two points in time. `sf3.json` is the 2023 store, frozen;
+ * `sf3-2025.json` is the real 2025 store — a dump of the live game's storefront 3, written by
+ * `runx storefront build` with its captured sale stripped (see that command). One storefront
+ * id either way: the client asks for 3 in both cases and neither knows there are two files, so
+ * nothing about the request changes. The two files number their items differently — each is
+ * the store its build actually had — and nothing crosses between them.
  *
  * Resolved in {@link storefrontAssetPath}, which BOTH the listing route and
  * {@link loadStorefront} go through, so browsing and buying always read the same file. That is
- * the whole reason it is not done at the route: a newer client shown the merged store and then
- * charged against the captured one would have every catalog item 404 as "no such storefront".
+ * the whole reason it is not done at the route: a newer client shown the 2025 store and then
+ * charged against the 2023 one would have every purchase 404 as "no such storefront".
  */
 const STOREFRONT_BY_BUILD: Record<string, string> = {
 	'3': 'sf3-2025',
@@ -909,8 +901,8 @@ function storefrontAssetPath(id: string, build: number | null): string {
  * build, see {@link storefrontAssetPath}. Null when there is no such storefront.
  *
  * Separate from {@link findStoreItem} so a caller resolving SEVERAL items from one
- * storefront reads (and parses) it once: sf3 alone is over a thousand items and the merged
- * sf3-2025 is four, and a bulk purchase carries up to `BULK_PURCHASE_CAP` lines.
+ * storefront reads (and parses) it once: sf3 alone is over two thousand items and sf3-2025
+ * over three, and a bulk purchase carries up to `BULK_PURCHASE_CAP` lines.
  */
 async function loadStorefront(c: Context<App>, storefrontType: number): Promise<Storefront | null> {
 	const build = await authedBuild(c)
@@ -1317,10 +1309,12 @@ const ROLL_STOREFRONT_TYPE = 3
  * Every item a roll or a weekly gift may draw, or `[]` if it can't be read (a roll then yields
  * nothing).
  *
- * The storefront PLUS every equipment skin, which no storefront sells: skins are awarded from
- * weekly challenges rather than bought, so they were taken out of sf3 — and the weekly gift pool
- * is exactly the equipment in this list, which would otherwise be empty. They come from the
- * `catalog` table, whose skins are the same rows `static/db/skins.json` holds.
+ * The storefront PLUS every equipment skin the storefront does not sell. The 2025 store lists
+ * every skin (`runx storefront build` appends the ones the game's own store never sold), the
+ * 2023 store none — and the weekly gift pool is exactly the equipment in this list, which for
+ * an older build would otherwise be empty. The rest come from the `catalog` table, which is
+ * loaded from the 2025 store; one already listed is not added again, or a roll would weight it
+ * double.
  *
  * Being in this list does NOT make an item purchasable. `findStoreItem` and the bulk bag resolve
  * a purchase against the storefront file, never against this.
@@ -1332,7 +1326,9 @@ async function loadRollCatalog(c: Context<App>): Promise<StoreItem[]> {
 	)
 		.bind(CatalogKind.Skin)
 		.all<CatalogRow>()
-	return [...(storefront?.StoreItems ?? []), ...results.map(toSkinStoreItem)]
+	const listed = storefront?.StoreItems ?? []
+	const sold = new Set(listed.map((item) => item.GiftDrop.EquipmentModificationGuid))
+	return [...listed, ...results.filter((row) => !sold.has(row.item_key)).map(toSkinStoreItem)]
 }
 
 /**
@@ -1380,10 +1376,11 @@ const WEEKLY_GIFT_EXCLUDED_PREFABS = ['[Sandbox_']
  * equipment — the captured rotation's is a camera skin — and that guid is exactly what marks an
  * entry as equipment.
  *
- * The pool comes from the catalog's SKINS now rather than from sf3, which no longer sells
- * equipment at all: skins are awarded here, not bought. See {@link loadRollCatalog}.
+ * The pool is the roll catalog's equipment — the skins the caller's store sells plus the
+ * catalog's, see {@link loadRollCatalog} — so a week can be themed on a skin the 2023 store
+ * never sold.
  *
- * `GiftDropId` comes off `PurchasableItemId`, which for a skin is its `catalog_id`.
+ * `GiftDropId` comes off `PurchasableItemId`, which is a skin's `catalog_id` as well.
  */
 function toEquipmentGiftPool(catalog: StoreItem[]): EquipmentGift[] {
 	return catalog
@@ -1609,6 +1606,12 @@ async function grantGiftDrop(
 		giftDrop.EquipmentModificationGuid !== ''
 	) {
 		await grantEquipment(db, accountId, toEquipment(giftDrop))
+	}
+	// A first-party custom avatar item: the 2025 store lists five hundred of them, each a plain
+	// numbered listing whose drop names the item by guid. Ownership is the same row a bag's
+	// guid-keyed line writes; without this the line charges and the box opens on nothing.
+	if (typeof giftDrop.CustomAvatarItemId === 'string' && giftDrop.CustomAvatarItemId !== '') {
+		await grantCustomAvatarItem(db, accountId, giftDrop.CustomAvatarItemId)
 	}
 	const isConsumable =
 		typeof giftDrop.ConsumableItemDesc === 'string' && giftDrop.ConsumableItemDesc !== ''
@@ -1878,69 +1881,6 @@ function toPurchaseMethodId(raw: Partial<PurchaseMethodId> | null | undefined): 
 		NumberId: Number.isInteger(id.NumberId) ? (id.NumberId as number) : null,
 		Guid: typeof id.Guid === 'string' ? id.Guid : null,
 	}
-}
-
-/**
- * Catalog rows as STORE ITEMS, so a bag can be resolved against the `catalog` table the same
- * way it is resolved against an `sf{N}.json` file.
- *
- * The generated storefront (`sf3-2025.json`) is built from these very rows with this very
- * pricing, so an item bought here costs exactly what that file lists it at. That is not a
- * nicety: `priceCheck` refuses a line whose posted `RequestedPrice` doesn't match, so two
- * pricings would 409 every purchase the client made from the page it was shown.
- *
- * Mostly redundant now that the merged store carries every sellable AVATAR ITEM — a newer
- * build's bag resolves those straight out of the file. What it still reaches that the file does
- * not is SKINS, which the generator leaves out, keyed the way a gift-drop keys equipment
- * (`EquipmentPrefabName` +
- * `EquipmentModificationGuid`) rather than as an avatar item — which is what lets a skin be
- * bought at all, since no generated storefront file lists one.
- *
- * {@link isSellableRarity} is applied here as well as in the generator: the developer tier is
- * absent from the file, and resolving a bag straight off the table would otherwise sell items
- * the store never offered.
- */
-async function catalogStoreItems(db: D1Database, catalogIds: number[]): Promise<StoreItem[]> {
-	if (catalogIds.length === 0) return []
-	const placeholders = catalogIds.map((_, i) => `?${i + 1}`).join(', ')
-	const { results } = await db
-		.prepare(`SELECT * FROM catalog WHERE catalog_id IN (${placeholders})`)
-		.bind(...catalogIds)
-		.all<CatalogRow>()
-
-	return results
-		.filter(
-			(row) =>
-				row.catalog_id !== null &&
-				row.kind === CatalogKind.AvatarItem &&
-				isSellableRarity(row.rarity)
-		)
-		.map((row) => {
-			const price = priceForRarity(row.rarity)
-			return {
-				GiftDrop: {
-					FriendlyName: row.friendly_name,
-					// The client's field is a string; the catalog keeps NULL and "" apart.
-					Tooltip: row.tooltip ?? '',
-					ConsumableItemDesc: '',
-					// `item_key` IS the `AvatarItemDesc` for an avatar item — that is what makes it the
-					// key. The equipment fields stay empty: only avatar items reach here.
-					AvatarItemDesc: row.item_key,
-					AvatarItemType: row.avatar_item_type ?? 0,
-					EquipmentPrefabName: '',
-					EquipmentModificationGuid: '',
-					Rarity: row.rarity,
-					Context: 0,
-					Currency: 0,
-					CurrencyType: 0,
-				},
-				Prices: [{ CurrencyType: CurrencyType.RecCenterTokens, Price: price }],
-				SubscriberPrices: [
-					{ CurrencyType: CurrencyType.RecCenterTokens, Price: subscriberPriceFor(price) },
-				],
-				PurchasableItemId: row.catalog_id as number,
-			}
-		})
 }
 
 /**
@@ -2733,8 +2673,8 @@ const app = new Hono<App>({ strict: false })
 			tags: ['Avatar'],
 			summary: 'Locked avatar items in bulk',
 			description: [
-				'Resolves `AvatarItemDescriptions` against the bundled item catalogue and answers the',
-				'matching records as a bare array. The match is on the WHOLE `AvatarItemDesc`, so a',
+				'Resolves `AvatarItemDescriptions` against the item catalogue (the `catalog` table) and',
+				'answers the matching records as a bare array. The match is on the WHOLE `AvatarItemDesc`, so a',
 				'colourway is not found by its base asset alone.',
 				'An empty or absent list answers the WHOLE catalogue, which is the reference’s own',
 				'behaviour rather than a degenerate empty match.',
@@ -2754,12 +2694,22 @@ const app = new Hono<App>({ strict: false })
 			const requested = Array.isArray(body?.AvatarItemDescriptions)
 				? body.AvatarItemDescriptions.filter((d): d is string => typeof d === 'string')
 				: []
-			if (requested.length === 0) return c.json(avatarItemCatalog)
+			// The whole kind from the `catalog` table, in LOAD order — which is store order, the
+			// closest thing to the reference's "catalogue order" there is — then filtered here.
+			// One statement whatever was asked: the client posts hundreds of descs at a time, and
+			// D1 binds at most a hundred parameters, so an `IN (...)` of the request cannot be.
+			const { results } = await c.env.DB.prepare(
+				'SELECT * FROM catalog WHERE kind = ?1 ORDER BY rowid'
+			)
+				.bind(CatalogKind.AvatarItem)
+				.all<CatalogRow>()
+			const catalogue = results.map(toCatalogAvatarItem)
+			if (requested.length === 0) return c.json(catalogue)
 
-			// A Set rather than `Array.includes` per item: the client posts hundreds of descs
-			// against a catalogue of thousands, and the reference's nested scan is quadratic.
+			// A Set rather than `Array.includes` per item: the reference's nested scan is
+			// quadratic.
 			const wanted = new Set(requested)
-			return c.json(avatarItemCatalog.filter((item) => wanted.has(item.AvatarItemDesc)))
+			return c.json(catalogue.filter((item) => wanted.has(item.AvatarItemDesc)))
 		}
 	)
 
@@ -4496,10 +4446,10 @@ const app = new Hono<App>({ strict: false })
 				'with no capture of its own may stand in for another storefront’s catalog (see',
 				'`STOREFRONT_ALIASES`, currently empty), and such an alias applies to purchases from',
 				'that storefront too, not just to this listing. Which FILE a storefront reads from can',
-				'also depend on the caller’s build (`rn.ver`): storefront `3` serves the captured',
-				'`sf3.json` to builds up to 20230414 and the merged `sf3-2025.json` — that same store',
-				'plus every sellable row of the item catalog — to later ones. The id does not change,',
-				'and the same resolution applies to purchases, so what is browsed is what is charged.',
+				'also depend on the caller’s build (`rn.ver`): storefront `3` serves the 2023',
+				'`sf3.json` to builds up to 20230414 and the 2025 store dump `sf3-2025.json` to later',
+				'ones. The id does not change, and the same resolution applies to purchases, so what',
+				'is browsed is what is charged.',
 			].join(' '),
 			parameters: [
 				{
@@ -4771,32 +4721,10 @@ const app = new Hono<App>({ strict: false })
 			const allowPartial = body.AllowPartialSuccess === true
 			const skipGiftBox = body.BypassGiftPackages === true
 
-			// One catalog read for the bag; every line resolves against it in memory.
-			const storefront = await loadStorefront(c, storefrontType as number)
-
-			// Past LEGACY_CLIENT_BUILD the bag may also name CATALOG rows — the ids the generated
-			// storefront and the discovery rows hand out (10000 and up) — so those are looked up in
-			// the `catalog` table and appended. One extra query for the whole bag.
-			//
-			// Appended rather than replacing the file: the two id spaces do not overlap
-			// (`CATALOG_ID_BASE` is above every captured id), so a bag may mix them and a newer
-			// client buying from a captured storefront still works. An older build is not offered
-			// catalog ids anywhere, so it is left resolving exactly what it always did.
-			const build = await authedBuild(c)
-			const catalogItems =
-				build !== null && build > LEGACY_CLIENT_BUILD
-					? await catalogStoreItems(
-							c.env.DB,
-							lines.flatMap((line) => {
-								const numberId = toPurchaseMethodId(line.ItemPurchaseMethodId).NumberId
-								return numberId !== null && numberId >= CATALOG_ID_BASE ? [numberId] : []
-							})
-						)
-					: []
-			const bagCatalog: Storefront | null =
-				catalogItems.length === 0
-					? storefront
-					: { StoreItems: [...(storefront?.StoreItems ?? []), ...catalogItems] }
+			// One catalog read for the bag; every line resolves against it in memory. The file is
+			// the whole catalog: the ids the discovery rows hand out (`lists`) are the store's own
+			// `PurchasableItemId`s, so a numbered line resolves here or nowhere.
+			const bagCatalog = await loadStorefront(c, storefrontType as number)
 			// The bag may also name CUSTOM avatar items — a line whose id is a `Guid`, the item's
 			// `CustomAvatarItemId` — which resolve against the `custom_avatar_item` table rather than
 			// the catalog. One read for the items the bag names and one for which of them the buyer

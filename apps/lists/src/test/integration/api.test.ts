@@ -11,7 +11,6 @@ import {
 
 import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
-import { CATALOG_ID_BASE } from '../../../../econ/src/catalog-load'
 import curatedLists from '../../../static/curated-lists.json'
 
 import type { Env } from '../../context'
@@ -27,6 +26,13 @@ const ORIGIN = 'https://example.com'
  * LIMIT and its randomness are both exercised rather than trivially satisfied.
  */
 const CATALOG_SEEDED = 120
+
+/**
+ * Where the numbered seeds' ids start. A real load numbers a listed row by its store
+ * `PurchasableItemId` — a few thousand at most — so these are shaped like store ids, and only
+ * the ranges below need to stay clear of each other.
+ */
+const CATALOG_SEED_ID = 10_000
 
 /** The row size the worker serves — see `GENERIC_ROW_SIZE`. */
 const GENERIC_ROW_SIZE = 50
@@ -81,7 +87,7 @@ const CATALOG_NAMED_ID = 80_001
  * accept either range while still rejecting the unsellable row and every skin.
  */
 const isSeededAvatarItem = (n: number): boolean =>
-	(n >= CATALOG_ID_BASE && n < CATALOG_ID_BASE + CATALOG_SEEDED) ||
+	(n >= CATALOG_SEED_ID && n < CATALOG_SEED_ID + CATALOG_SEEDED) ||
 	(n >= CATALOG_NAMED_ID && n < CATALOG_NAMED_ID + NAMED_SEEDS.length)
 
 /** Where the seeded skins' ids start — clear of the avatar items above. */
@@ -150,8 +156,7 @@ beforeAll(async () => {
 			`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, rarity, platform_mask)
 			 VALUES (?1, ?2, 'avatar_item', ?3, 0, -1)`
 		)
-			// Numbered from the base, exactly as a real load numbers them.
-			.bind(`seed-desc-${i},,,`, CATALOG_ID_BASE + i, `Seeded Item ${i}`)
+			.bind(`seed-desc-${i},,,`, CATALOG_SEED_ID + i, `Seeded Item ${i}`)
 			.run()
 	}
 	// Named items for the category rows, which filter on the NAME for want of anything better.

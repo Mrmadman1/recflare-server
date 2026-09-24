@@ -322,22 +322,18 @@ const DEFAULT_STORE_ROW_RULE: StoreRowRule = { kind: CatalogKind.AvatarItem }
  * hand-picked list pretended to be a ranking. It also exercises the whole catalog instead of
  * the same ten ids forever, which is the point of pointing it at the table.
  *
- * {@link isSellableRarity} is applied whatever the kind: the generated storefront omits the
- * developer/unreleased tier — `catalog_id` 10002 is in the table and NOT in sf1704 — and an id
- * no storefront sells renders as nothing, indistinguishable from an id the client failed to
- * parse. No skin carries that rarity today, so the clause costs them nothing and stops a future
- * capture that does from leaking one into a row.
+ * `UNSELLABLE_RARITIES` is applied whatever the kind: the developer/unreleased tier is kept out
+ * of the discovery rows. No skin carries that rarity today, so the clause costs them nothing
+ * and stops a future capture that does from leaking one into a row.
  *
- * The number in each id is the `catalog_id`, which is exactly what the generated storefront
- * lists an avatar item under as its `PurchasableItemId` — one number resolves a row entity and a
- * store item, with no second numbering between them. It is clear of every captured storefront's
- * own ids by construction (see `CATALOG_ID_BASE`). It is a LOAD-ORDER surrogate, reassigned by
- * every catalog load, which is fine for a row built and consumed within one request but is why
- * nothing may store one.
+ * The number in each id is the `catalog_id`, which for a listed item IS its store
+ * `PurchasableItemId` — `sf3-2025.json` and the `catalog` table are loaded from the same dump —
+ * so one number resolves a row entity and a store item, with no second numbering between
+ * them. Nothing may store one all the same: an unlisted row's number is a load-order
+ * surrogate.
  *
- * WORTH KNOWING for skins: no generated storefront lists them — sf1704 is avatar items only —
- * so a client handed a skin's id has nothing to resolve it against yet, and the row will draw
- * as nothing until a storefront carries them.
+ * Skins included: the served 2025 store lists every one (the game's own 99 plus the rest at
+ * rarity 50, numbered from a million), so a `skinsitems` id resolves like any other.
  *
  * An empty result is served as an empty row rather than falling back to canned ids: the table
  * being empty means the catalog was never loaded (`runx catalog load`), and a fallback would
@@ -859,8 +855,7 @@ const app = new Hono<App>()
 				'“earrings”/“hearing aids”, “shoes”/“sneakers”/“sandals”/“boots”, “pants”/“shorts”,',
 				'“quiver”/“backpack”/“sword”. Every other row returns the whole avatar-item catalog.',
 				'The name match is a stand-in — the catalog records no',
-				'category — so it takes anything the word appears in. No generated storefront lists',
-				'skins yet, so a client has nothing to resolve those ids against.',
+				'category — so it takes anything the word appears in.',
 			].join('\n'),
 			parameters: [ALGORITHMIC_LIST_PARAM, ALGORITHMIC_TYPE_PARAM],
 			responses: { 200: json(AlgorithmicList, 'The row’s entities, possibly none') },

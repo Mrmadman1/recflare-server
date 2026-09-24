@@ -3,9 +3,9 @@ import { CatalogKind } from './catalog-load'
 import type { CatalogKindValue } from './catalog-load'
 
 /**
- * The item CATALOG on the shared `recflare` D1 database — every avatar item and every
- * equipment skin the game knows about, one row each, loaded once by migration rather than
- * written at runtime. Nothing here is per-player: ownership lives in `inventory` and
+ * The item CATALOG on the shared `recflare` D1 database — every avatar item, consumable and
+ * equipment skin the game knows about, one row each, loaded by a CLI rather than written at
+ * runtime. Nothing here is per-player: ownership lives in `inventory` and
  * `equipment`, and this table only says what a thing IS.
  *
  * It exists to be QUERIED. The catalogs were previously reachable only by parsing a whole
@@ -14,15 +14,16 @@ import type { CatalogKindValue } from './catalog-load'
  * nothing can be searched by name or filtered by tag at all. A row with indexes answers those
  * in one statement.
  *
- * BOTH kinds share one table because they share most of a record — a display name, a tooltip, a
+ * ALL kinds share one table because they share most of a record — a display name, a tooltip, a
  * rarity, a platform mask, a thumbnail — and because the interesting queries ("what is called
  * X", "what is this thing the player owns") run across both. `kind` discriminates, and the
  * columns each kind alone carries are nullable and empty on the other. Read a row through
  * {@link toCatalogAvatarItem}/{@link toCatalogSkin} rather than serving it raw: the client's
  * two DTOs share no key order and differ in what they omit.
  *
- * Where the rows come from: `static/db/avatar-items.json` and `static/db/skins.json`, both
- * captured from the reference and loaded by `runx catalog load`.
+ * Where the rows come from: the served 2025 general store (`static/storefronts/sf3-2025.json`)
+ * and `static/db/skins.json`, loaded by `runx catalog load`. A listed row's `catalog_id` is
+ * its store `PurchasableItemId`.
  *
  * The migration builds the TABLE ONLY — it holds no rows. The catalog changes as the game's
  * item list changes, and that is not a schema change: a migration per refresh would mean a
@@ -42,12 +43,15 @@ export {
 	buildCatalogLoad,
 	CATALOG_INSERT_COLUMNS,
 	CatalogKind,
-	type AvatarItemCapture,
+	listingKind,
 	type CatalogCollision,
 	type CatalogKindValue,
+	type CatalogLoad,
 	type CatalogLoadRow,
 	type CatalogValue,
 	type SkinCapture,
+	type StoreListing,
+	type StorefrontDump,
 } from './catalog-load'
 
 /**
@@ -66,12 +70,11 @@ export {
  * avatar items and repeated on 9 more (id 9503 alone covers five unrelated developer items), so
  * it can neither key nor reliably find anything.
  *
- * `catalog_id` is the small NUMERIC handle the site uses where a key would be unwieldy, and is
- * what a generated storefront lists a row under as its `PurchasableItemId`. It is assigned by
- * the loader from `CATALOG_ID_BASE` (10000, clear of every captured storefront's own ids) and
- * renumbered by every load, so it identifies a row only within one load — see the field's own
- * note. It is unique where set, and the migration that adds it is 0016, since 0015 was already
- * applied.
+ * `catalog_id` is the small NUMERIC handle the site uses where a key would be unwieldy. For a
+ * row the store lists it is the listing's own `PurchasableItemId` — the number `sf3-2025.json`
+ * sells it under — and for a skin the store never listed it is handed out by the loader from
+ * `CATALOG_ID_BASE`, well above any real one. It is unique where set, and the migration that
+ * adds it is 0016, since 0015 was already applied.
  *
  * Nullability is load-bearing rather than incidental: `tooltip` is genuinely NULL on some rows
  * of BOTH kinds and `""` on others, and the client's DTOs serve the distinction through, so the
@@ -113,13 +116,14 @@ export interface CatalogRow {
 	item_key: string
 	/**
 	 * A small numeric handle for the row — for the surfaces that need to name an item as a
-	 * number rather than as a comma-laden `AvatarItemDesc` or a guid, and the
-	 * `PurchasableItemId` a generated storefront lists it under.
+	 * number rather than as a comma-laden `AvatarItemDesc` or a guid. For a listed item it is
+	 * the store's `PurchasableItemId`, so the number resolves a row here and a listing in
+	 * `sf3-2025.json` alike.
 	 *
-	 * A LOAD-ORDER SURROGATE, not an identity: `runx catalog load` assigns it, so it is stable
-	 * only until the next load. Never store it, never reference it across a load, never treat it
-	 * as what an item IS — `item_key` is that, and it is what the inventory holds. NULL only
-	 * between a row existing and a load numbering it.
+	 * Still not an identity: an unlisted skin's number is a load-order surrogate, and a store
+	 * could renumber. Never store it, never treat it as what an item IS — `item_key` is that,
+	 * and it is what the inventory holds. NULL only between a row existing and a load numbering
+	 * it.
 	 */
 	catalog_id: number | null
 	kind: string
@@ -244,11 +248,10 @@ export async function getCatalogItem(db: D1Database, itemKey: string): Promise<C
 }
 
 /**
- * One catalog row by its numeric handle.
+ * One catalog row by its numeric handle — a store `PurchasableItemId` for a listed item.
  *
- * Only meaningful WITHIN a load: the number is reassigned every time the catalog is loaded, so
- * a caller holding one from before a reload will get a different item or nothing at all. Fine
- * for a request that looked the number up moments ago; never for anything stored.
+ * Fine for a request that looked the number up moments ago; never for anything stored, since
+ * an unlisted skin's number is reassigned by every load.
  */
 export async function getCatalogItemById(
 	db: D1Database,

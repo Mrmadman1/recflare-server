@@ -31,12 +31,12 @@ import { NotificationType } from '../../../../notify/src/notification-types'
 // SQL, not modules: they are never executed here, only read.
 import catalogStructureSql from '../../../migrations/0015_catalog.sql?raw'
 import catalogIdSql from '../../../migrations/0016_catalog_id.sql?raw'
-import avatarItemsJson from '../../../static/db/avatar-items.json'
-// The merged 2025 general store, read as a FILE: which file the route serves depends on the
-// caller's build, and these assertions are about the file's CONTENTS.
-import carriedItems from '../../../static/db/consumables.json'
 import skinsJson from '../../../static/db/skins.json'
+// The 2025 store DUMP, the source `runx storefront build` and `runx catalog load` both read.
+import storeDump from '../../../static/db/Watch_EnumValue_3.json'
 import questRewards from '../../../static/quest-rewards.json'
+// Both general-store files, read as FILES: which one the route serves depends on the caller's
+// build, and these assertions are about each file's CONTENTS.
 import sf32025 from '../../../static/storefronts/sf3-2025.json'
 import sf3 from '../../../static/storefronts/sf3.json'
 import { SCHEMA_DDL } from '../../avatar-db'
@@ -66,7 +66,14 @@ import {
 	searchCatalog,
 	toCatalogSkin,
 } from '../../catalog-db'
-import { CATALOG_ID_BASE } from '../../catalog-load'
+import {
+	collapseRepeatedListings,
+	GOLD_SKIN_PRICE,
+	isGoldSkin,
+	UNLISTED_SKIN_ID_BASE,
+	UNLISTED_SKIN_RARITY,
+	unlistedSkinListing,
+} from '../../catalog-load'
 import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
 // The live weekly rotation, generated the same way the worker generates it, so the challenge
 // tests exercise whatever this week actually holds instead of ids from a rotation that has
@@ -84,36 +91,50 @@ import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
 import { ROOM_CONSUMABLE_SCHEMA_DDL, ROOM_INVENTORY_SCHEMA_DDL } from '../../room-consumable-db'
 import { ROOM_BALANCE_SCHEMA_DDL, ROOM_CURRENCY_SCHEMA_DDL } from '../../room-currency-db'
 
-import type { CatalogLoadRow, CatalogRow, CatalogValue } from '../../catalog-db'
+import type { CatalogLoadRow, CatalogRow, CatalogValue, StoreListing } from '../../catalog-db'
 import type { Env } from '../../context'
 
 /**
- * The GENERATED half of a store file — the items built from the item catalog, as opposed to the
- * equipment, consumables and boxes carried across from the 2023 capture.
- *
- * Split on membership in the CARRIED ids rather than on `CATALOG_ID_BASE`. The two happen to
- * agree now that the equipment skins are gone — the carried ids run 2168-2458, well below the
- * base — but they did not while a skin carried id 20756767, and asking the real question costs
- * nothing.
+ * The store dump's listings with the verbatim repeats collapsed — what `runx storefront build`
+ * writes out as sf3-2025.json, sale stripped. The file test below holds the two to each other.
  */
-const capturedIds = new Set(carriedItems.map((i) => i.PurchasableItemId))
-const catalogItems = () => sf32025.StoreItems.filter((i) => !capturedIds.has(i.PurchasableItemId))
+const dumpListings = collapseRepeatedListings(storeDump.StoreItems as StoreListing[]).listings
+
+/** The served store's listings, which is what `runx catalog load` reads. */
+const storeListings = sf32025.StoreItems as StoreListing[]
 
 /**
- * An item ONLY the newer store sells — created after the cutoff, so it is in sf3-2025 and not in
- * sf3. The build gate is only observable through such an item: everything else is in both files
- * and buys identically either way.
+ * An avatar item ONLY the 2025 store sells, priced in tokens: an id sf3-2025 lists and sf3
+ * does not. The build gate is only observable through such an item — the two files number their
+ * stores differently, so nearly any 2025 listing qualifies; the first tokens-priced avatar item
+ * is as good as any.
  */
 const sf3Ids = new Set(sf3.StoreItems.map((i) => i.PurchasableItemId))
 const NEWER_ONLY = (() => {
-	const item = sf32025.StoreItems.find((i) => !sf3Ids.has(i.PurchasableItemId))
-	if (item === undefined) throw new Error('sf3-2025 sells nothing sf3 does not')
+	const item = storeListings.find(
+		(i) =>
+			!sf3Ids.has(i.PurchasableItemId) &&
+			i.GiftDrop.AvatarItemDesc !== '' &&
+			i.Prices.some((p) => p.CurrencyType === 2)
+	)
+	if (item === undefined)
+		throw new Error('sf3-2025 sells no tokens-priced avatar item sf3 does not')
 	return {
 		id: item.PurchasableItemId,
-		price: item.Prices[0]!.Price,
+		price: item.Prices.find((p) => p.CurrencyType === 2)!.Price,
 		name: item.GiftDrop.FriendlyName,
 	}
 })()
+
+/**
+ * The avatar items the suite-wide catalog holds — a slice of the real load, seeded below so the
+ * catalogue reads (`lockeditems/bulk`) have something in store order to answer from. A slice
+ * rather than the whole load: the table is rebuilt per test file, and fifty rows say what three
+ * thousand would.
+ */
+const SEEDED_AVATAR_ITEMS = buildCatalogLoad(storeListings)
+	.rows.filter((r) => r.values[CATALOG_INSERT_COLUMNS.indexOf('kind')] === CatalogKind.AvatarItem)
+	.slice(0, 50)
 
 /**
  * Items the generated `sf3.json` sells, resolved FROM the file rather than hardcoded.
@@ -217,6 +238,16 @@ beforeAll(async () => {
 			.bind(skin.ModificationGuid, 70_001 + i, skin.FriendlyName, skin.Rarity, skin.PrefabName)
 			.run()
 	}
+	// A slice of the real avatar-item load, in load order, for the catalogue reads. One batch:
+	// these are the loader's own rows, so a row it builds that the table refuses fails here.
+	await env.DB.batch(
+		SEEDED_AVATAR_ITEMS.map((row) =>
+			env.DB.prepare(
+				`INSERT OR IGNORE INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')})
+				 VALUES (${CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')})`
+			).bind(...row.values.map((v) => v ?? null))
+		)
+	)
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 42, username: 'Tester', displayName: 'Tester' }))
 		.run()
@@ -1990,10 +2021,9 @@ describe('econ endpoints', () => {
 	})
 
 	test('bulkpurchase buys a merged-store catalog item from storefront 3', async () => {
-		// The exact request the client sends, verbatim: a catalog id under storefront 3, which is
-		// what the merged sf3-2025 lists it as. It resolves because `loadStorefront` picks the file
-		// by the caller's build, so what the store page offered is what the purchase is checked
-		// against.
+		// The exact request the client sends, verbatim: a 2025 store id under storefront 3, which
+		// is what sf3-2025 lists it as. It resolves because `loadStorefront` picks the file by the
+		// caller's build, so what the store page offered is what the purchase is checked against.
 		const res = await exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
 			method: 'POST',
 			headers: {
@@ -2024,18 +2054,18 @@ describe('econ endpoints', () => {
 			Value: { Balance: number } | null
 		}
 		// It used to answer `{ Success: false, Error: "Item not found" }` — storefront 3 resolved
-		// to the captured sf3, which has no id in the catalog range.
+		// to the 2023 sf3, which does not list this id.
 		expect(body.Error).not.toBe('Item not found')
 		expect(body.Success).toBe(true)
 
-		// The price the client posts is the one the file lists, because the file it browsed and the
-		// purchase it made are priced from the same shared rarity table. A second pricing anywhere
-		// would 409 every purchase as "Price has changed".
-		const item = sf32025.StoreItems.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
-		expect(item?.Prices[0]?.Price).toBe(NEWER_ONLY.price)
+		// The price the client posts is the one the file lists — the dump's list price, its
+		// captured sale stripped. A second pricing anywhere would 409 every purchase as "Price
+		// has changed".
+		const item = storeListings.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
+		expect(item?.Prices.find((p) => p.CurrencyType === 2)?.Price).toBe(NEWER_ONLY.price)
 
-		// The SAME request from an old build still fails: its storefront 3 is generated to the
-		// cutoff, and this item postdates it.
+		// The SAME request from an old build still fails: its storefront 3 is the 2023 store,
+		// which does not list this id.
 		const legacy = await exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
 			method: 'POST',
 			headers: {
@@ -2058,9 +2088,11 @@ describe('econ endpoints', () => {
 		expect(((await legacy.json()) as { Success: boolean }).Success).toBe(false)
 	})
 
-	test('bulkpurchase resolves catalog ids for newer builds, at the storefront’s price', async () => {
-		// A catalog row the generated storefront would list at 600 (rarity 10), bought straight off
-		// the `catalog` table; plus a skin and a developer-tier row, neither of which may be.
+	test('bulkpurchase resolves numbered lines against the storefront file alone', async () => {
+		// Rows the `catalog` table holds that the store does NOT list — an avatar item, a skin and
+		// a developer-tier item — none of which may be bought: the file is the whole catalog, and
+		// the ids the discovery rows hand out are the store's own, so a numbered line resolves
+		// there or nowhere.
 		const AVATAR_ID = 20_001
 		const SKIN_ID = 20_002
 		const DEV_ID = 20_003
@@ -2076,15 +2108,19 @@ describe('econ endpoints', () => {
 		)
 			.bind(SKIN_ID)
 			.run()
-		// Rarity -1 is the developer tier: in the catalog, absent from the storefront, and so not
-		// for sale here either — resolving straight off the table must not sell what the store
-		// never offered.
 		await env.DB.prepare(
 			`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, avatar_item_type)
 			 VALUES ('bulk-buy-dev,,,', ?1, 'avatar_item', 'Bulk Buy Dev Item', '', -1, -1, 0)`
 		)
 			.bind(DEV_ID)
 			.run()
+		// None of those three numbers is a 2025 listing, or the test would be about the file.
+		for (const id of [AVATAR_ID, SKIN_ID, DEV_ID]) {
+			expect(
+				sf32025.StoreItems.find((i) => i.PurchasableItemId === id),
+				String(id)
+			).toBeUndefined()
+		}
 
 		const buy = async (
 			version: string | undefined,
@@ -2107,43 +2143,35 @@ describe('econ endpoints', () => {
 					})),
 				}),
 			})
+		const outcome = async (res: Response) =>
+			((await res.json()) as { Success: boolean; Error?: string }).Success
 
-		// 600 (rarity 10) is the generated storefront's own price. It MUST match: `priceCheck`
-		// refuses a line whose posted price differs, so a server pricing a buy differently from the
-		// file it listed would 409 every purchase.
-		const res = await buy('20250718.01', [{ id: AVATAR_ID, price: 600 }])
+		// A 2025 listing buys at its list price — the dump's, its sale stripped. The price MUST
+		// match: `priceCheck` refuses a line whose posted price differs.
+		const res = await buy('20250718.01', [{ id: NEWER_ONLY.id, price: NEWER_ONLY.price }])
 		expect(res.status).toBe(200)
-		const body = (await res.json()) as { Success: boolean; Value: { Balance: number } | null }
-		expect(body.Success).toBe(true)
-
-		// A SKIN is refused even though the catalog holds it: skins are awarded from weekly
-		// challenges rather than sold, so no storefront lists one and the bag will not resolve one
-		// off the table either.
-		const skin = await buy('20250718.01', [{ id: SKIN_ID, price: 150 }])
-		expect(((await skin.json()) as { Success: boolean }).Success).toBe(false)
+		expect(await outcome(res)).toBe(true)
 
 		// A price the storefront does not list is refused, not quietly charged.
-		const wrongPrice = await buy('20250718.01', [{ id: AVATAR_ID, price: 1 }])
-		expect(((await wrongPrice.json()) as { Success: boolean }).Success).toBe(false)
+		expect(await outcome(await buy('20250718.01', [{ id: NEWER_ONLY.id, price: 1 }]))).toBe(false)
 
-		// The developer-tier row is not for sale.
-		const dev = await buy('20250718.01', [{ id: DEV_ID, price: 150 }])
-		expect(((await dev.json()) as { Success: boolean }).Success).toBe(false)
+		// Table-only rows are not for sale, whatever their kind and at any price. The catalog says
+		// what a thing IS; only the storefront says what is sold.
+		for (const [id, price] of [
+			[AVATAR_ID, 600],
+			[SKIN_ID, 150],
+			[DEV_ID, 150],
+		] as const) {
+			expect(await outcome(await buy('20250718.01', [{ id, price }])), String(id)).toBe(false)
+		}
 
-		// An OLD build is left resolving exactly what it always did — the storefront file — so a
-		// catalog id means nothing to it. Nothing offers those ids to that build anyway.
-		const legacy = await buy('20230414', [{ id: AVATAR_ID, price: 600 }])
-		expect(((await legacy.json()) as { Success: boolean }).Success).toBe(false)
-		const unversioned = await buy(undefined, [{ id: AVATAR_ID, price: 600 }])
-		expect(((await unversioned.json()) as { Success: boolean }).Success).toBe(false)
-
-		// A bag may MIX an item the STOREFRONT FILE lists with one resolved straight off the
-		// `catalog` table.
-		const mixed = await buy('20250718.01', [
-			{ id: SF3_ITEM.id, price: SF3_ITEM.price },
-			{ id: AVATAR_ID, price: 600 },
-		])
-		expect(((await mixed.json()) as { Success: boolean }).Success).toBe(true)
+		// And an old build never sees a 2025 number: its storefront 3 is the 2023 file.
+		expect(
+			await outcome(await buy('20230414', [{ id: NEWER_ONLY.id, price: NEWER_ONLY.price }]))
+		).toBe(false)
+		expect(
+			await outcome(await buy(undefined, [{ id: NEWER_ONLY.id, price: NEWER_ONLY.price }]))
+		).toBe(false)
 
 		// Cleaned up: the `catalog` block below counts every row in the table, so rows left behind
 		// here would change what it sees.
@@ -2165,12 +2193,14 @@ describe('econ endpoints', () => {
 			return (await res.json()) as Array<{ AvatarItemDesc: string; FriendlyName: string }>
 		}
 
-		// Three real catalogue entries, deliberately asked for OUT of catalogue order.
-		const [first, second, third] = [
-			avatarItemsJson[0]!,
-			avatarItemsJson[40]!,
-			avatarItemsJson[900]!,
-		]
+		// Three real catalogue entries — rows of the seeded slice, which are the loader's own —
+		// deliberately asked for OUT of catalogue order.
+		const seeded = SEEDED_AVATAR_ITEMS.map((r) => ({ AvatarItemDesc: r.key }))
+		const [first, second, third] = [seeded[0]!, seeded[20]!, seeded[45]!]
+		// The catalogue the route answers with is every avatar item in the table — the seeded
+		// slice, plus whatever the catalog block below has not yet replaced it with.
+		const catalogueSize = (await countCatalog(env.DB))[CatalogKind.AvatarItem] ?? 0
+		expect(catalogueSize).toBeGreaterThanOrEqual(SEEDED_AVATAR_ITEMS.length)
 
 		const got = await ask([third.AvatarItemDesc, first.AvatarItemDesc, second.AvatarItemDesc])
 		expect(got).toHaveLength(3)
@@ -2195,9 +2225,11 @@ describe('econ endpoints', () => {
 		expect(await ask(['no-such-desc,,,'])).toEqual([])
 
 		// EMPTY or absent means the WHOLE catalogue — the reference's "give me everything" case,
-		// not a degenerate match-nothing.
-		expect(await ask([])).toHaveLength(avatarItemsJson.length)
-		expect(await ask(undefined)).toHaveLength(avatarItemsJson.length)
+		// not a degenerate match-nothing. In the catalogue's record shape: the desc IS the key.
+		const whole = await ask([])
+		expect(whole).toHaveLength(catalogueSize)
+		expect(whole[0]).toMatchObject({ AvatarItemDesc: first.AvatarItemDesc, PlatformMask: -1 })
+		expect(await ask(undefined)).toHaveLength(catalogueSize)
 
 		// No auth needed, and a body that will not parse falls back to the catalogue rather than
 		// erroring.
@@ -2207,7 +2239,7 @@ describe('econ endpoints', () => {
 			body: 'not json',
 		})
 		expect(junk.status).toBe(200)
-		expect(((await junk.json()) as unknown[]).length).toBe(avatarItemsJson.length)
+		expect(((await junk.json()) as unknown[]).length).toBe(catalogueSize)
 	})
 
 	test('POST /api/items/purchaseInfos prices custom avatar items in tokens', async () => {
@@ -2492,79 +2524,166 @@ describe('econ endpoints', () => {
 		expect((await store(await bearer())).StoreItems).toHaveLength(sf3.StoreItems.length)
 		expect((await store(await at('not-a-build'))).StoreItems).toHaveLength(sf3.StoreItems.length)
 
-		// Later builds get the merged store — bigger than either half, and still storefront 3.
+		// Later builds get the 2025 store — bigger, and still storefront 3.
 		for (const version of ['20230616', '20250424.01', '20250718.01']) {
-			const merged = await store(await at(version))
-			expect(merged.StorefrontType, version).toBe(3)
-			expect(merged.StoreItems.length, version).toBe(sf32025.StoreItems.length)
-			expect(merged.StoreItems.length, version).toBeGreaterThan(sf3.StoreItems.length)
+			const newer = await store(await at(version))
+			expect(newer.StorefrontType, version).toBe(3)
+			expect(newer.StoreItems.length, version).toBe(sf32025.StoreItems.length)
+			expect(newer.StoreItems.length, version).toBeGreaterThan(sf3.StoreItems.length)
 		}
 
-		// The id does not change and nothing is renumbered: sf3's own items are in the merged file
-		// unchanged, so a newer client buying one is charged the same as an older client would be.
-		const bowtie = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
-			method: 'POST',
-			headers: { ...(await at('20250718.01')), 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				StorefrontType: 3,
-				PurchasableItemId: SF3_ITEM.id, // an avatar item the generated sf3 sells
-				CurrencyType: 2,
-				RequestedPrice: SF3_ITEM.price,
-			}),
-		})
-		expect(bowtie.status).toBe(200)
-
-		// And a CATALOG item can be bought from storefront 3 by a newer build — the half a
+		// A 2025 listing can be bought from storefront 3 by a newer build — the half a
 		// listing-only swap breaks. `findStoreItem` resolves the purchase through the same
 		// build-aware path the listing does, so an item on the page is an item that can be bought.
-		// From the catalog half — see `catalogItems`, which is why this is not an id comparison.
-		const catalogItem = sf32025.StoreItems.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
-		expect(catalogItem).toBeDefined()
+		const listing = sf32025.StoreItems.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
+		expect(listing).toBeDefined()
 		const bought = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await at('20250718.01')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: catalogItem!.PurchasableItemId,
+				PurchasableItemId: NEWER_ONLY.id,
 				CurrencyType: 2,
-				RequestedPrice: catalogItem!.Prices[0]!.Price,
+				RequestedPrice: NEWER_ONLY.price,
 			}),
 		})
 		expect(bought.status).toBe(200)
 
-		// The SAME item is not for sale to an old build: it postdates the cutoff, so sf3 — which
-		// is generated to that date — does not list it.
+		// The SAME id is not for sale to an old build: its store is the 2023 one, which numbers
+		// its items differently and does not list it.
 		const refused = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await at('20230414')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: catalogItem!.PurchasableItemId,
+				PurchasableItemId: NEWER_ONLY.id,
 				CurrencyType: 2,
-				RequestedPrice: catalogItem!.Prices[0]!.Price,
+				RequestedPrice: NEWER_ONLY.price,
 			}),
 		})
 		expect(refused.status).toBe(404)
+
+		// And the 2023 store's own items still buy for the old build exactly as they always did.
+		const legacyBuy = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await at('20230414')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: SF3_ITEM.id,
+				CurrencyType: 2,
+				RequestedPrice: SF3_ITEM.price,
+			}),
+		})
+		expect(legacyBuy.status).toBe(200)
 	})
 
-	test('sf3 and sf3-2025 are the same store at two points in time', async () => {
-		// BOTH are generated from the item catalog now — sf3 is no longer a capture. They report
-		// the same storefront id, because they are two versions of ONE store and the client asks
-		// for 3 either way.
+	test('sf3 is the frozen 2023 store; sf3-2025 is the 2025 dump with its sale stripped', async () => {
+		// Two versions of ONE store: both report storefront 3, because the client asks for 3
+		// either way.
 		expect(sf3.StorefrontType).toBe(3)
 		expect(sf32025.StorefrontType).toBe(3)
 
-		// sf3 is a strict SUBSET of sf3-2025: same items, same ids, same prices — it just stops at
-		// the cutoff. Anything else would mean a player's store changed under them on upgrade.
-		const newer = new Map(sf32025.StoreItems.map((i) => [i.PurchasableItemId, i]))
-		for (const item of sf3.StoreItems) {
-			expect(newer.get(item.PurchasableItemId), String(item.PurchasableItemId)).toEqual(item)
-		}
-		expect(sf3.StoreItems.length).toBeLessThan(sf32025.StoreItems.length)
+		// sf3 is frozen — nothing regenerates it. What it was when it was cut: no equipment (skins
+		// are awarded from weekly challenges), the discount expressed only in `SubscriberPrices`,
+		// ids unique.
+		expect(sf3.SubscriberDiscountPercent).toBe(0)
+		expect(
+			sf3.StoreItems.filter((i) => (i.GiftDrop.EquipmentModificationGuid ?? '') !== '')
+		).toEqual([])
 
-		// Ids are unique within each file. The merge of carried and generated halves is only safe
-		// because their id spaces don't overlap, so a collision must fail rather than be resolved
-		// by array order.
+		// sf3-2025 is `Watch_EnumValue_3.json` — the live game's storefront 3 — listing for
+		// listing, with its verbatim repeats collapsed. Everything the dump says about an item is
+		// in the file: its id, its list price, its subscriber price, its gift drop.
+		expect(sf32025.StoreItems.length).toBeGreaterThan(dumpListings.length)
+		expect(sf32025.StoreItems.length).toBeGreaterThan(sf3.StoreItems.length)
+		const stripSale = (prices: Array<{ StorefrontSaleData: unknown }> | null) =>
+			prices?.map((p) => ({ ...p, StorefrontSaleData: null })) ?? null
+		for (const [i, listing] of dumpListings.entries()) {
+			const served = sf32025.StoreItems[i]!
+			expect(served.PurchasableItemId, String(listing.PurchasableItemId)).toBe(
+				listing.PurchasableItemId
+			)
+			// A skin's or a consumable's thumbnail is blanked — the dump names a PNG per item that
+			// this server does not have — and nothing else about a drop changes.
+			const blanked =
+				listing.GiftDrop.EquipmentModificationGuid !== '' ||
+				listing.GiftDrop.ConsumableItemDesc !== ''
+			expect(served.GiftDrop).toEqual(
+				blanked ? { ...listing.GiftDrop, ThumbnailImageName: '' } : listing.GiftDrop
+			)
+			// The other edit to a listing: the dump was taken mid-sale (80% off nearly everything,
+			// no end date), and the client posts the sale price it computes — which this server,
+			// which knows only list prices, would refuse as "Price has changed". The `Price` beside
+			// it is the list price and stands.
+			expect(served.Prices).toEqual(stripSale(listing.Prices))
+			expect(served.SubscriberPrices).toEqual(stripSale(listing.SubscriberPrices))
+		}
+		expect(sf32025.SubscriberDiscountPercent).toBe(storeDump.SubscriberDiscountPercent)
+
+		// After the dump's listings: the equipment skins the game's own store never sold, from
+		// `skins.json`, each a listing of its own in the dump's skin shape — rarity 50 and priced
+		// from it (the store's own rarity-50 skins run 1000-6000), numbered from a million in
+		// capture order. A capture guid the store lists is NOT added again: the capture's names
+		// and rarities are wrong wherever the two can be compared, so the listing is the record.
+		const dumpSkins = new Set(
+			dumpListings.map((l) => l.GiftDrop.EquipmentModificationGuid).filter((g) => g !== '')
+		)
+		const unlisted = skinsJson.filter((sk) => !dumpSkins.has(sk.ModificationGuid))
+		expect(unlisted.length).toBeGreaterThan(100)
+		// A gold skin is the one appended listing that differs from `unlistedSkinListing`: its
+		// price, checked on its own below.
+		const tail = sf32025.StoreItems.slice(dumpListings.length)
+		const goldPrice = { CurrencyType: 2, Price: GOLD_SKIN_PRICE, StorefrontSaleData: null }
+		const gilded = (l: StoreListing): StoreListing =>
+			isGoldSkin(l) ? { ...l, Prices: [goldPrice], SubscriberPrices: [goldPrice] } : l
+		expect(tail).toEqual(
+			unlisted.map((sk, i) => gilded(unlistedSkinListing(sk, UNLISTED_SKIN_ID_BASE + i)))
+		)
+		expect(tail[0]).toMatchObject({
+			GiftDrop: { Rarity: UNLISTED_SKIN_RARITY, EquipmentPrefabName: unlisted[0]!.PrefabName },
+			Prices: [{ CurrencyType: 2, Price: 3000, StorefrontSaleData: null }],
+			SubscriberPrices: [{ CurrencyType: 2, Price: 2700, StorefrontSaleData: null }],
+		})
+		expect(sf32025.StoreItems).toHaveLength(dumpListings.length + unlisted.length)
+		// Every skin the capture knows is now sold by this store, once — and no skin, the game's
+		// own included, names a thumbnail.
+		const soldSkins = storeListings.filter((i) => i.GiftDrop.EquipmentModificationGuid !== '')
+		const soldGuids = soldSkins.map((i) => i.GiftDrop.EquipmentModificationGuid)
+		expect(new Set(soldGuids).size).toBe(soldGuids.length)
+		expect(skinsJson.every((sk) => soldGuids.includes(sk.ModificationGuid))).toBe(true)
+		expect(soldSkins.every((i) => i.GiftDrop.ThumbnailImageName === '')).toBe(true)
+		expect(soldSkins.length).toBeGreaterThan(unlisted.length)
+		// A "(Gold)" skin — thirteen, all from the capture — is a prestige item: 100,000 tokens,
+		// the same for a subscriber, no sale. A "(Gold)" AVATAR item is priced as the dump has it.
+		const goldSkins = soldSkins.filter((i) => i.GiftDrop.FriendlyName.includes('(Gold)'))
+		expect(goldSkins.length).toBeGreaterThan(10)
+		for (const g of goldSkins) {
+			expect(g.Prices, g.GiftDrop.FriendlyName).toEqual([goldPrice])
+			expect(g.SubscriberPrices, g.GiftDrop.FriendlyName).toEqual([goldPrice])
+		}
+		expect(
+			soldSkins.filter((i) => !isGoldSkin(i)).every((i) => i.Prices[0]?.Price !== GOLD_SKIN_PRICE)
+		).toBe(true)
+		const goldAvatar = storeListings.find(
+			(i) => i.GiftDrop.AvatarItemDesc !== '' && i.GiftDrop.FriendlyName.includes('(Gold)')
+		)!
+		expect(goldAvatar.Prices[0]?.Price).not.toBe(GOLD_SKIN_PRICE)
+
+		// Consumables likewise; avatar items keep theirs.
+		const consumables = storeListings.filter((i) => i.GiftDrop.ConsumableItemDesc !== '')
+		expect(consumables.length).toBeGreaterThan(200)
+		expect(consumables.every((i) => i.GiftDrop.ThumbnailImageName === '')).toBe(true)
+		expect(
+			storeListings.filter(
+				(i) => i.GiftDrop.AvatarItemDesc !== '' && (i.GiftDrop.ThumbnailImageName ?? '') !== ''
+			).length
+		).toBeGreaterThan(2000)
+		// The dump's `NextUpdate` was the real store's next rotation, long past; the client
+		// refetches after it, and this file is regenerated by hand.
+		expect(sf32025.NextUpdate > '2200').toBe(true)
+
+		// Ids are unique within each file: `findStoreItem` resolves a purchase by id, so a
+		// repeated id would mean array order decides what the player bought.
 		for (const [label, file] of [
 			['sf3', sf3],
 			['sf3-2025', sf32025],
@@ -2573,57 +2692,18 @@ describe('econ endpoints', () => {
 			expect(new Set(ids).size, label).toBe(ids.length)
 		}
 
-		// The discount is expressed ONLY in `SubscriberPrices`; announcing it again at the top
-		// level risks a client taking 10% off an already-discounted price and posting through the
-		// server's own subscriber floor, refused as "Price has changed".
-		expect(sf3.SubscriberDiscountPercent).toBe(0)
-		expect(sf32025.SubscriberDiscountPercent).toBe(0)
-
-		// Every GENERATED item is priced from its rarity, and rarity -1 (the developer tier) is
-		// excluded rather than priced — an item listed here can be bought.
-		const priceByRarity = new Map([
-			[0, 150],
-			[10, 600],
-			[20, 700],
-			[30, 800],
-			[50, 3000],
-		])
-		for (const item of catalogItems()) {
-			const expected = priceByRarity.get(item.GiftDrop.Rarity)
-			expect(expected, `rarity ${item.GiftDrop.Rarity}`).toBeDefined()
-			expect(item.Prices[0]).toMatchObject({ CurrencyType: 2, Price: expected })
-			// Floored, matching the server's own `subscriberFloor`.
-			expect(item.SubscriberPrices[0]).toMatchObject({
-				CurrencyType: 2,
-				Price: Math.floor((expected! * 90) / 100),
-			})
-			// `GiftDropId` echoes the id, as the capture did on all 1161 of its items.
-			expect(item.GiftDrop.GiftDropId).toBe(item.PurchasableItemId)
-			expect(item.PurchasableItemId).toBeGreaterThanOrEqual(CATALOG_ID_BASE)
-		}
-		expect(catalogItems().filter((i) => i.GiftDrop.Rarity === -1)).toEqual([])
-
-		// The CARRIED half — 30 consumables and 5 random boxes — comes from
-		// `static/db/consumables.json`, what survives of the 2023 capture. The item catalog does
-		// not model these, so they keep their own ids and prices.
-		const carried = sf3.StoreItems.filter((i) => capturedIds.has(i.PurchasableItemId))
-		expect(carried.length).toBeGreaterThan(0)
-		expect(carried.every((i) => (i.GiftDrop.AvatarItemDesc ?? '') === '')).toBe(true)
-
-		// And NO equipment skins anywhere in either file: they are awarded from weekly challenges,
-		// so a store listing one would sell something the game gives away.
-		for (const [label, file] of [
-			['sf3', sf3],
-			['sf3-2025', sf32025],
-		] as const) {
-			expect(
-				file.StoreItems.filter((i) => (i.GiftDrop.EquipmentModificationGuid ?? '') !== ''),
-				label
-			).toEqual([])
-		}
+		// A known listing, at the dump's own numbers: Candy Apples, 1801, 95 tokens, 85 for a
+		// subscriber — NOT the 2023 store's 2184, and NOT a price computed from its rarity.
+		const apples = sf32025.StoreItems.find((i) => i.GiftDrop.FriendlyName === 'Candy Apples')
+		expect(apples).toMatchObject({
+			PurchasableItemId: 1801,
+			GiftDrop: { GiftDropId: 3361, ConsumableItemDesc: 'EmPvh3I6L0uK_1i8Wy_ylQ' },
+			Prices: [{ CurrencyType: 2, Price: 95, StorefrontSaleData: null }],
+			SubscriberPrices: [{ CurrencyType: 2, Price: 85, StorefrontSaleData: null }],
+		})
 
 		// An id with no storefront still 404s, and 1704 is gone — it was a stand-in for a store
-		// that turned out to belong inside sf3.
+		// that turned out to be this one.
 		for (const id of [1705, 1704]) {
 			const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/${id}`)
 			expect(res.status, String(id)).toBe(404)
@@ -6010,8 +6090,8 @@ describe('catalog', () => {
 		expect(migrations).not.toContain('DELETE FROM catalog')
 	})
 
-	test('the loader maps both captures onto the columns it declares', async () => {
-		const { rows, collisions } = buildCatalogLoad(avatarItemsJson, skinsJson)
+	test('the loader maps the served store and the skin capture onto the columns it declares', async () => {
+		const { rows, collisions, skipped } = buildCatalogLoad(storeListings)
 
 		// Every row carries exactly one value per declared column, in that order — the loader
 		// renders them positionally, so a column added to one side and not the other is a silent
@@ -6021,60 +6101,120 @@ describe('catalog', () => {
 		const kindAt = CATALOG_INSERT_COLUMNS.indexOf('kind')
 		expect(rows.every((r) => r.values[keyAt] === r.key)).toBe(true)
 
-		// One key space, both kinds, no collisions between them.
+		// One key space, every kind, no collisions between them. A listing loads as the kind of
+		// the ONE item id it carries; the rows come out in store order.
 		expect(new Set(rows.map((r) => r.key)).size).toBe(rows.length)
 		const kinds = rows.map((r) => r.values[kindAt])
-		expect(kinds.filter((k) => k === 'avatar_item')).toHaveLength(avatarItemsJson.length)
+		const listed = (pick: (l: StoreListing) => string) =>
+			new Set(storeListings.map(pick).filter((k) => k !== '')).size
+		expect(kinds.filter((k) => k === 'avatar_item')).toHaveLength(
+			listed((l) => l.GiftDrop.AvatarItemDesc)
+		)
+		expect(kinds.filter((k) => k === 'consumable')).toHaveLength(
+			listed((l) => l.GiftDrop.ConsumableItemDesc)
+		)
+		expect(rows[0]?.label).toBe(`${storeListings[0]!.GiftDrop.FriendlyName} (avatar item)`)
 
-		// Skins are the one place the counts may legitimately differ: the capture holds five guids
-		// twice. A repeat is a defect rather than something the table models, so the loader keeps
-		// the first and RETURNS the rest for the caller to report — dropping them silently is the
-		// exact failure the single key exists to prevent.
-		const distinctSkinKeys = new Set(skinsJson.map((s) => s.ModificationGuid)).size
-		expect(kinds.filter((k) => k === 'skin')).toHaveLength(distinctSkinKeys)
-		expect(collisions).toHaveLength(skinsJson.length - distinctSkinKeys)
-		expect(collisions.every((c) => c.kept !== c.dropped)).toBe(true)
+		// Skins: every guid the served store lists, which is every guid the capture holds too —
+		// the store file carries the capture's unlisted skins as listings of their own (see the
+		// file test) — so the loader never reads `skins.json` at all. A skin the game's own store
+		// sold keeps the store's name and rarity, not the capture's, which disagree on every row.
+		const listedSkins = new Set(
+			storeListings.map((l) => l.GiftDrop.EquipmentModificationGuid).filter((g) => g !== '')
+		)
+		const capturedSkins = new Set(skinsJson.map((sk) => sk.ModificationGuid))
+		expect([...capturedSkins].every((g) => listedSkins.has(g))).toBe(true)
+		expect(kinds.filter((k) => k === 'skin')).toHaveLength(listedSkins.size)
+		const both = dumpListings.find(
+			(l) =>
+				l.GiftDrop.EquipmentModificationGuid !== '' &&
+				capturedSkins.has(l.GiftDrop.EquipmentModificationGuid)
+		)!
+		const row = rows.find((r) => r.key === both.GiftDrop.EquipmentModificationGuid)!
+		expect(row.id).toBe(both.PurchasableItemId)
+		expect(row.values[CATALOG_INSERT_COLUMNS.indexOf('friendly_name')]).toBe(
+			both.GiftDrop.FriendlyName
+		)
+		expect(row.values[CATALOG_INSERT_COLUMNS.indexOf('rarity')]).toBe(both.GiftDrop.Rarity)
 
-		// And the rows really do go in: the same table these tests built accepts a sample of the
-		// real load unchanged, so a capture that would be rejected in production fails here. Rows
-		// this file already seeded are skipped — they are real capture rows too, and re-inserting
-		// one would trip the key constraint on the seed rather than on anything under test.
-		const sample: CatalogLoadRow[] = []
-		for (const row of [rows[0], rows[1], rows[rows.length - 2], rows[rows.length - 1]]) {
-			if (row && (await getCatalogItem(env.DB, row.key)) === null) sample.push(row)
-		}
-		expect(sample.length).toBeGreaterThan(0)
-		for (const row of sample) {
-			await env.DB.prepare(
-				`INSERT INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')})
-				 VALUES (${CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')})`
-			)
-				.bind(...row.values.map((v) => v ?? null))
-				.run()
-			expect((await getCatalogItem(env.DB, row.key))?.friendly_name).toBe(
-				row.values[CATALOG_INSERT_COLUMNS.indexOf('friendly_name')]
-			)
-			await env.DB.prepare('DELETE FROM catalog WHERE item_key = ?1').bind(row.key).run()
-		}
+		// What the store lists that is NOT a catalog item is counted, not loaded: first-party
+		// custom items (the `custom_avatar_item` table's), loot boxes, token bundles — and the
+		// PACKS, a consumable listed again under another number with a count. Every listing is
+		// accounted for: a row, a skipped count, or nothing else.
+		expect(skipped.custom_avatar_item).toBe(
+			storeListings.filter((l) => l.GiftDrop.CustomAvatarItemId).length
+		)
+		expect(skipped.query).toBe(storeListings.filter((l) => l.GiftDrop.IsQuery).length)
+		expect(skipped.consumable_pack).toBeGreaterThan(0)
+		expect(
+			storeListings.find((l) => l.GiftDrop.FriendlyName === 'Disco Dance Break 3-Pack')?.GiftDrop
+				.ConsumableItemDesc
+		).toBe(
+			storeListings.find((l) => l.GiftDrop.FriendlyName === 'Disco Dance Break')?.GiftDrop
+				.ConsumableItemDesc
+		)
+		expect(rows.length + Object.values(skipped).reduce((a, b) => a + b, 0)).toBe(
+			storeListings.length
+		)
 
-		// The row the capture had a skin pasted over. It is an avatar item, and the skin that
-		// overwrote its name lives in skins.json where it belongs.
-		expect(avatarItemsJson.filter((i) => i.FriendlyName === 'Disc (Coop)')).toEqual([])
+		// The served store repeats no key, so nothing collides. The report is still wired: a
+		// repeat is a defect rather than something the table models, so the loader keeps the
+		// first and RETURNS the rest for the caller to report, because a collision that vanishes
+		// quietly is the exact failure the single key exists to prevent. (The dump's own verbatim
+		// repeats never reach it: the served file has them collapsed.)
+		expect(collisions).toEqual([])
+		const first = storeListings[0]!
+		const twice = buildCatalogLoad([first, { ...first, PurchasableItemId: 999_999 }])
+		expect(twice.rows).toHaveLength(1)
+		expect(twice.rows[0]?.id).toBe(first.PurchasableItemId)
+		expect(twice.collisions).toEqual([
+			{
+				key: first.GiftDrop.AvatarItemDesc,
+				kept: twice.rows[0]!.label,
+				dropped: twice.rows[0]!.label,
+			},
+		])
+		// And one number naming two different things is refused outright, not resolved by order.
+		expect(() =>
+			buildCatalogLoad([
+				first,
+				{ ...storeListings[1]!, PurchasableItemId: first.PurchasableItemId },
+			])
+		).toThrow(/names two items/)
+
+		// The skin that was once pasted over an avatar item's row lives in skins.json where it
+		// belongs.
 		expect(skinsJson.filter((s) => s.FriendlyName === 'Disc (Coop)')).toHaveLength(1)
 	})
 
-	test('catalog_id is a contiguous, unique, load-order handle from 10000', async () => {
-		const { rows } = buildCatalogLoad(avatarItemsJson, skinsJson)
+	test('catalog_id is the listing’s PurchasableItemId, always', async () => {
+		const { rows } = buildCatalogLoad(storeListings)
 
-		// BASE..BASE+N-1 with no gaps, in capture order — avatar items first, then skins. Numbered
-		// AFTER de-duplication, so a dropped duplicate must not burn a number and leave a hole.
-		//
-		// From 10000 rather than 1 because a generated storefront lists a row under this very
-		// number as its `PurchasableItemId`, and every captured storefront's ids are 2764 or below
-		// — numbering from 1 would have made one id mean two different items.
-		expect(rows.map((r) => r.id)).toEqual(rows.map((_, i) => CATALOG_ID_BASE + i))
-		expect(Math.min(...rows.map((r) => r.id))).toBe(CATALOG_ID_BASE)
+		// A row's number IS its listing's `PurchasableItemId` — the number sf3-2025.json sells it
+		// under — so nothing has to be kept in step between the file and the table. No row is
+		// numbered by the loader: the skins the game's own store never sold are LISTINGS in the
+		// served file, numbered there from `UNLISTED_SKIN_ID_BASE`.
+		const byId = new Map(sf32025.StoreItems.map((i) => [i.PurchasableItemId, i]))
+		expect(rows.length).toBeGreaterThan(2500)
+		for (const row of rows) {
+			const drop = byId.get(row.id)?.GiftDrop
+			expect(drop, String(row.id)).toBeDefined()
+			expect(
+				[drop!.AvatarItemDesc, drop!.ConsumableItemDesc, drop!.EquipmentModificationGuid],
+				String(row.id)
+			).toContain(row.key)
+		}
 		expect(new Set(rows.map((r) => r.id)).size).toBe(rows.length)
+		const appended = rows.filter((r) => r.id >= UNLISTED_SKIN_ID_BASE)
+		expect(appended.length).toBeGreaterThan(0)
+		expect(appended.every((r) => r.values[CATALOG_INSERT_COLUMNS.indexOf('kind')] === 'skin')).toBe(
+			true
+		)
+		expect(
+			appended.every(
+				(r) => r.values[CATALOG_INSERT_COLUMNS.indexOf('rarity')] === UNLISTED_SKIN_RARITY
+			)
+		).toBe(true)
 
 		// The id in the row object and the id in the values it renders are the same number — the
 		// loader binds `values` positionally, so a mismatch would write one and report the other.
@@ -6190,7 +6330,7 @@ describe('catalog', () => {
 
 		// Replace: `DELETE FROM catalog` first, and the sentinel goes with everything else. That is
 		// why it is opt-in — pointed at a partial capture it removes whatever the file omits.
-		const { rows } = buildCatalogLoad(avatarItemsJson, skinsJson)
+		const { rows } = buildCatalogLoad(storeListings)
 		await env.DB.prepare('DELETE FROM catalog').run()
 		await upsert((rows[0] as CatalogLoadRow).values)
 		expect(await getCatalogItem(env.DB, 'untouched-by-any-load')).toBeNull()

@@ -245,7 +245,7 @@ export const ListEntityDto = z.object({
 	Id: z
 		.string()
 		.describe(
-			'The room/item id the client resolves itself. On a GENERIC row (`type=5`) it is instead a `<prefix>.<id>` composite with EXACTLY ONE dot — `0.<int>` a purchasable item, `1.<guid>` a custom avatar item — since such a row can name things of more than one sort. The store rows serve `1.<guid>`, the `CustomAvatarItemId` of a first-party item. The integer after `0.` is a `catalog_id`, which is exactly what the generated storefront lists the item under as its `PurchasableItemId` — catalog ids start at 10000 so they cannot collide with a captured storefront’s own numbering.'
+			'The room/item id the client resolves itself. On a GENERIC row (`type=5`) it is instead a `<prefix>.<id>` composite with EXACTLY ONE dot — `0.<int>` a purchasable item, `1.<guid>` a custom avatar item — since such a row can name things of more than one sort. The store rows serve `1.<guid>`, the `CustomAvatarItemId` of a first-party item. The integer after `0.` is a `catalog_id`, which for a listed item is its store `PurchasableItemId` — the number `sf3-2025.json` sells it under.'
 		),
 	Context: z.string().nullable().describe('Ranking attribution; always null here'),
 })
