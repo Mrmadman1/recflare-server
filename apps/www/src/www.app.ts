@@ -40,7 +40,7 @@ import {
 	clearPasswordHandler,
 	createReportHandler,
 	getReportHandler,
-	giftCustomItemHandler,
+	giftItemHandler,
 	giftOnlineTokensHandler,
 	giftRoomTokensHandler,
 	giftTokensHandler,
@@ -486,7 +486,8 @@ const app = new Hono<App>()
 	// The staff card on a player's profile page — account fixes the game has no endpoint for.
 	// The gifts create value from nothing, so they are developer-only, not all staff.
 	.post('/api/staff/players/:id/gift-tokens', requireDeveloper, giftTokensHandler)
-	.post('/api/staff/players/:id/gift-custom-item', requireDeveloper, giftCustomItemHandler)
+	// One id field for a custom avatar item, a skin or a consumable; the kind is resolved here.
+	.post('/api/staff/players/:id/gift-item', requireDeveloper, giftItemHandler)
 	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)

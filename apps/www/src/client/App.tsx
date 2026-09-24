@@ -1198,15 +1198,35 @@ function PlayerPage({
  * `audit_log`. Clearing a password asks twice, since it logs the player out of password
  * sign-in until they set a new one; the rest are one click.
  */
+/** The optional message on the box a staff gift comes in — one field, shared by every gift below it. */
+function GiftMessageField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+	return (
+		<label>
+			Gift box message
+			<input
+				type="text"
+				value={value}
+				maxLength={256}
+				placeholder="A gift from the staff!"
+				onChange={(e) => onChange(e.target.value)}
+			/>
+			<span className="hint">
+				Goes on every gift box sent below. Optional; blank sends the default.
+			</span>
+		</label>
+	)
+}
+
 function StaffPlayerActions({ account, navigate }: { account: PublicAccount; navigate: Navigate }) {
 	const [tokens, setTokens] = useState('')
-	const [tokenMessage, setTokenMessage] = useState('')
+	// One message for every box sent from this card; it stays put between sends.
+	const [message, setMessage] = useState('')
 	const [confirmingClear, setConfirmingClear] = useState(false)
-	const [customItemId, setCustomItemId] = useState('')
+	const [itemId, setItemId] = useState('')
 	const [xp, setXp] = useState('')
 	const gift = useAction()
 	const xpGift = useAction()
-	const customGift = useAction()
+	const itemGift = useAction()
 	const usernameChange = useAction()
 	const clearPassword = useAction()
 	const base = `/api/staff/players/${account.accountId}`
@@ -1217,6 +1237,8 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 			{/* The gifts are developer-only; www refuses them to moderators. */}
 			{isDeveloper() && (
 				<>
+					<GiftMessageField value={message} onChange={setMessage} />
+
 					<form
 						onSubmit={(e) => {
 							e.preventDefault()
@@ -1224,10 +1246,9 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 								const amount = Number(tokens)
 								const res = await call<{ balance: number }>(`${base}/gift-tokens`, {
 									authed: true,
-									json: { amount, message: tokenMessage.trim() },
+									json: { amount, message: message.trim() },
 								})
 								setTokens('')
-								setTokenMessage('')
 								const what =
 									amount < 0
 										? `Took ${Math.abs(amount).toLocaleString()} tokens back`
@@ -1258,17 +1279,6 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 								they have. Zero sends an empty box and moves nothing.
 							</span>
 						</label>
-						<label>
-							Gift box message
-							<input
-								type="text"
-								value={tokenMessage}
-								maxLength={256}
-								placeholder="A gift from the staff!"
-								onChange={(e) => setTokenMessage(e.target.value)}
-							/>
-							<span className="hint">Optional. Blank sends the default.</span>
-						</label>
 						{gift.error && <p className="error">{gift.error}</p>}
 						{gift.done && <p className="ok">{gift.done}</p>}
 					</form>
@@ -1280,7 +1290,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 								const amount = Number(xp)
 								const res = await call<{ level: number; levelsGained: number }>(`${base}/gift-xp`, {
 									authed: true,
-									json: { amount },
+									json: { amount, message: message.trim() },
 								})
 								setXp('')
 								const levels =
@@ -1319,38 +1329,52 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 					<form
 						onSubmit={(e) => {
 							e.preventDefault()
-							void customGift.run(async () => {
-								const res = await call<{ name: string }>(`${base}/gift-custom-item`, {
+							void itemGift.run(async () => {
+								const res = await call<{
+									kind: 'custom_item' | 'skin' | 'consumable'
+									name: string
+									prefabName?: string
+									owned?: number
+								}>(`${base}/gift-item`, {
 									authed: true,
-									json: { customAvatarItemId: customItemId.trim() },
+									json: { itemId: itemId.trim(), message: message.trim() },
 								})
-								setCustomItemId('')
-								return `Sent “${res.name}” to @${account.username}.`
+								setItemId('')
+								switch (res.kind) {
+									case 'skin':
+										return `Sent the skin “${res.name}” (${res.prefabName}) to @${account.username}.`
+									case 'consumable':
+										return `Sent one “${res.name}” to @${account.username}. They now have ${(res.owned ?? 1).toLocaleString()}.`
+									default:
+										return `Sent the custom item “${res.name}” to @${account.username}.`
+								}
 							})
 						}}
 					>
 						<label>
-							Gift custom item
+							Gift item
 							<span className="staff-gift">
 								<input
 									type="text"
-									value={customItemId}
-									placeholder="Custom avatar item id"
+									value={itemId}
+									placeholder="Custom item, skin or consumable id"
 									spellCheck={false}
 									required
-									onChange={(e) => setCustomItemId(e.target.value)}
+									onChange={(e) => setItemId(e.target.value)}
 								/>
-								<button type="submit" disabled={customGift.pending}>
-									{customGift.pending ? 'Sending…' : 'Send'}
+								<button type="submit" disabled={itemGift.pending}>
+									{itemGift.pending ? 'Sending…' : 'Send'}
 								</button>
 							</span>
 							<span className="hint">
-								Arrives as a gift box, as if bought from the store. Free to them, and the creator
-								isn&apos;t paid.
+								A custom avatar item’s guid, a skin’s modification guid, a consumable’s item desc,
+								or a store id — the kind is worked out from the id. Arrives as a gift box, as if
+								bought from the store; free to them, and a creator isn’t paid. Consumables stack:
+								send again for another.
 							</span>
 						</label>
-						{customGift.error && <p className="error">{customGift.error}</p>}
-						{customGift.done && <p className="ok">{customGift.done}</p>}
+						{itemGift.error && <p className="error">{itemGift.error}</p>}
+						{itemGift.done && <p className="ok">{itemGift.done}</p>}
 					</form>
 				</>
 			)}
@@ -2094,7 +2118,8 @@ function RoomPage({
  * A room as anyone sees it: the same hero the owner's page draws, with the creator linked
  * to their profile in place of the upload control, then the room's public facts and the
  * photos players took in it — read-only, since nothing here is the viewer's to change.
- * Staff also see its subrooms; the owner gets them on their own page instead.
+ * No subroom list: a visitor has no use for the room's internals, and the owner gets them
+ * (with the scene-data tool) on their own page instead.
  */
 function PublicRoomView({
 	room,
@@ -2108,7 +2133,6 @@ function PublicRoomView({
 	const [creator, setCreator] = useState<{ username: string; displayName: string } | null>(null)
 	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
 	const created = new Date(room.CreatedAt)
-	const subRooms = room.SubRooms ?? []
 
 	useEffect(() => {
 		setCreator(null)
@@ -2177,32 +2201,6 @@ function PublicRoomView({
 					<PhotoGrid photos={photos} />
 				)}
 			</section>
-
-			{/* Staff only: a visitor has no use for the room's internals. The owner sees them on
-			    their own page (RoomDetail), never this one. */}
-			{isAdmin() && (
-				<section className="card">
-					<h2>Subrooms</h2>
-					{subRooms.length === 0 ? (
-						<p className="muted">This room has no subrooms.</p>
-					) : (
-						<ul className="subrooms">
-							{subRooms.map((sub) => (
-								<li className="subroom" key={sub.SubRoomId}>
-									<div className="room-head">
-										<span className="subroom-name">{sub.Name}</span>
-										<VisibilityBadge accessibility={sub.Accessibility} />
-									</div>
-									<p className="subroom-meta">
-										Up to {sub.MaxPlayers} player{sub.MaxPlayers === 1 ? '' : 's'}
-										{sub.IsSandbox ? ' · sandbox' : ''}
-									</p>
-								</li>
-							))}
-						</ul>
-					)}
-				</section>
-			)}
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
 			    role itself on the DELETE. */}

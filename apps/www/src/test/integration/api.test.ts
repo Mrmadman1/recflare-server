@@ -41,6 +41,9 @@ import {
 	DEFAULT_STARTING_TOKENS,
 	getBalance,
 } from '../../../../econ/src/balance-db'
+import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
+import { CONSUMABLE_SCHEMA_DDL, getConsumables } from '../../../../econ/src/consumables-db'
+import { EQUIPMENT_SCHEMA_DDL, getEquipment } from '../../../../econ/src/equipment-db'
 import {
 	grantCustomAvatarItem,
 	INVENTORY_CUSTOM_SCHEMA_DDL,
@@ -115,6 +118,11 @@ beforeAll(async () => {
 	// `inventory_custom` (owned by `econ`).
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTORY_CUSTOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// A skin or consumable gift resolves its item in `catalog` and writes `equipment` or
+	// `consumable` — all three `econ`'s.
+	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of EQUIPMENT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// And an XP gift writes `progression`.
 	for (const stmt of PROGRESSION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
@@ -715,7 +723,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
-		'/api/staff/players/1/gift-custom-item',
+		'/api/staff/players/1/gift-item',
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
@@ -1316,6 +1324,8 @@ it('gifts a player tokens in a gift box', async () => {
 		FromPlayerId: 1,
 		CurrencyType: CurrencyType.RecCenterTokens,
 		Currency: 500,
+		// No staff box holds an avatar item; a 0 here sends the client after one.
+		AvatarItemType: null,
 	})
 
 	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
@@ -1680,21 +1690,49 @@ const seedCustomItem = (id: string, creatorAccountId: number, accessibility = 1)
 		thumbnailImageFilename: 'thumb.png',
 	})
 
+/** A catalog row — a skin (with `prefabName`), a consumable or an avatar item — as `runx catalog load` writes one. */
+const seedCatalogRow = (
+	itemKey: string,
+	catalogId: number,
+	kind: 'skin' | 'consumable' | 'avatar_item',
+	friendlyName: string,
+	prefabName: string | null = null
+) =>
+	env.DB.prepare(
+		`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, prefab_name)
+		 VALUES (?1, ?2, ?3, ?4, NULL, 3, -1, ?5)`
+	)
+		.bind(itemKey, catalogId, kind, friendlyName, prefabName)
+		.run()
+
+/** Every frame the hub was handed, after clearing it. */
+const hubFrames = async () =>
+	(await (
+		await env.RECFLARE_NOTIFICATIONS_HUB.getByName('global').fetch('http://do/all')
+	).json()) as Array<{
+		playerId: number
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+const clearHub = () =>
+	env.RECFLARE_NOTIFICATIONS_HUB.getByName('global').fetch('http://do/all', { method: 'DELETE' })
+
+/** The one item gift, by whichever id. */
+const giftItem = (playerId: number, itemId: unknown, message?: string) =>
+	devPost(`/api/staff/players/${playerId}/gift-item`, 8110, { itemId, message })
+
 // Delivered as a purchase delivers one — owned, and boxed by `CustomAvatarItemId` — but nobody
 // is charged and the creator is not paid: a grant, not a sale.
 it('gifts a player a custom item in a gift box', async () => {
-	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
-	await hub().fetch('http://do/all', { method: 'DELETE' })
+	await clearHub()
 	await updateAccount(env.DB, 8330, { username: 'Wearer' })
 	const item = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000001', 8331)
 
 	// Upper-cased on purpose: a GUID's case is not part of its identity.
-	const res = await devPost('/api/staff/players/8330/gift-custom-item', 8110, {
-		customAvatarItemId: item.CustomAvatarItemId.toUpperCase(),
-	})
+	const res = await giftItem(8330, item.CustomAvatarItemId.toUpperCase())
 	expect(res.status).toBe(200)
-	const body = (await res.json()) as { giftId: number; name: string }
-	expect(body.name).toBe(item.Name)
+	const body = (await res.json()) as { kind: string; giftId: number; name: string }
+	expect(body).toMatchObject({ kind: 'custom_item', name: item.Name })
 
 	await expect(ownedCustomAvatarItemIds(env.DB, 8330, [item.CustomAvatarItemId])).resolves.toEqual(
 		new Set([item.CustomAvatarItemId])
@@ -1706,18 +1744,17 @@ it('gifts a player a custom item in a gift box', async () => {
 		FromPlayerId: 1,
 		CustomAvatarItemId: item.CustomAvatarItemId,
 		AvatarItemDesc: '',
+		// As econ boxes a bought custom item — an avatar item, so not the null the others carry.
+		AvatarItemType: 0,
 		Currency: 0,
+		Message: 'A gift from the staff!',
 		// Purchased_Gift_A: one of the contexts the client's box classifier tests. Default (0)
 		// is not, and a box it can't classify renders as "cannot display".
 		GiftContext: 500,
 	})
 
 	// Only the box is announced: no balance moved, the creator's included.
-	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
-		playerId: number
-		notificationType: number
-		data: Record<string, unknown>
-	}>
+	const frames = await hubFrames()
 	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([[8330, 31]])
 	expect(frames[0].data).toMatchObject({
 		Id: body.giftId,
@@ -1732,6 +1769,7 @@ it('gifts a player a custom item in a gift box', async () => {
 				playerId: 8330,
 				customAvatarItemId: item.CustomAvatarItemId,
 				name: item.Name,
+				message: 'A gift from the staff!',
 				giftId: body.giftId,
 			},
 		},
@@ -1745,19 +1783,210 @@ it('refuses a custom item gift the store would refuse', async () => {
 	const own = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000004', 8340)
 	await grantCustomAvatarItem(env.DB, 8340, published.CustomAvatarItemId)
 
-	const gift = (customAvatarItemId: unknown, playerId = 8340) =>
-		devPost(`/api/staff/players/${playerId}/gift-custom-item`, 8110, { customAvatarItemId })
-
-	expect((await gift('')).status).toBe(400)
-	expect((await gift('no-such-item')).status).toBe(404)
+	expect((await giftItem(8340, '')).status).toBe(400)
+	expect((await giftItem(8340, 7)).status).toBe(400)
+	expect((await giftItem(8340, published.CustomAvatarItemId, 'x'.repeat(257))).status).toBe(400)
+	expect((await giftItem(8340, 'no-such-item')).status).toBe(404)
 	// A draft is visible to its creator alone; handing it out would publish it for them.
-	expect((await gift(draft.CustomAvatarItemId)).status).toBe(404)
-	expect((await gift(own.CustomAvatarItemId)).status).toBe(409)
-	expect((await gift(published.CustomAvatarItemId)).status).toBe(409)
-	expect((await gift(published.CustomAvatarItemId, 8396)).status).toBe(404)
+	expect((await giftItem(8340, draft.CustomAvatarItemId)).status).toBe(404)
+	expect((await giftItem(8340, own.CustomAvatarItemId)).status).toBe(409)
+	expect((await giftItem(8340, published.CustomAvatarItemId)).status).toBe(409)
+	expect((await giftItem(8396, published.CustomAvatarItemId)).status).toBe(404)
 
 	expect(await getPendingGifts(env.DB, 8340)).toEqual([])
 	expect(await auditRows('gift_custom_item', 8340)).toEqual([])
+})
+
+// Delivered as a purchase delivers one — an `equipment` row, and a box keyed by the prefab and
+// guid with `AvatarItemType` NULL (a 0 sends the client after an avatar item that isn't there).
+it('gifts a player a skin in a gift box', async () => {
+	await clearHub()
+	await updateAccount(env.DB, 8420, { username: 'Armed' })
+	await seedCatalogRow('0dM2SfqGR0SmtO5ufTWfUQ', 91001, 'skin', 'Bow Skin (Dryad)', '[Bow]')
+	await seedCatalogRow(
+		'a1b2c3d4-0000-4000-8000-000000000001',
+		91002,
+		'skin',
+		'Pen Skin',
+		'[MakerPen]'
+	)
+
+	// By key, as the export spells it — the short ids are case-sensitive, so nothing is folded.
+	let res = await giftItem(8420, '0dM2SfqGR0SmtO5ufTWfUQ', 'Nice shot')
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as {
+		kind: string
+		giftId: number
+		name: string
+		prefabName: string
+	}
+	expect(body).toMatchObject({ kind: 'skin', name: 'Bow Skin (Dryad)', prefabName: '[Bow]' })
+
+	expect(await getEquipment(env.DB, 8420)).toEqual([
+		{
+			ModificationGuid: '0dM2SfqGR0SmtO5ufTWfUQ',
+			PrefabName: '[Bow]',
+			FriendlyName: 'Bow Skin (Dryad)',
+			Tooltip: '',
+			Rarity: 3,
+			PlatformMask: -1,
+			Favorited: false,
+		},
+	])
+	const gifts = await getPendingGifts(env.DB, 8420)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		Id: body.giftId,
+		FromPlayerId: 1,
+		EquipmentPrefabName: '[Bow]',
+		EquipmentModificationGuid: '0dM2SfqGR0SmtO5ufTWfUQ',
+		AvatarItemType: null,
+		AvatarItemDesc: '',
+		GiftRarity: 3,
+		GiftContext: 500,
+		Message: 'Nice shot',
+	})
+	const frames = await hubFrames()
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([[8420, 31]])
+	expect(frames[0].data).toMatchObject({
+		Id: body.giftId,
+		EquipmentModificationGuid: '0dM2SfqGR0SmtO5ufTWfUQ',
+		AvatarItemType: null,
+		GiftContext: 500,
+	})
+	expect(await auditRows('gift_skin', 8420)).toEqual([
+		{
+			actor: 8110,
+			data: {
+				playerId: 8420,
+				modificationGuid: '0dM2SfqGR0SmtO5ufTWfUQ',
+				prefabName: '[Bow]',
+				name: 'Bow Skin (Dryad)',
+				message: 'Nice shot',
+				giftId: body.giftId,
+			},
+		},
+	])
+
+	// Or by the store's numeric id.
+	res = await giftItem(8420, '91002')
+	expect(res.status).toBe(200)
+	expect((await getEquipment(env.DB, 8420)).map((eq) => eq.ModificationGuid)).toEqual([
+		'0dM2SfqGR0SmtO5ufTWfUQ',
+		'a1b2c3d4-0000-4000-8000-000000000001',
+	])
+
+	// Owning a skin is boolean: a second gift would be a box with nothing new in it.
+	expect((await giftItem(8420, 'skin-owned-8420', 'x'.repeat(257))).status).toBe(400)
+	expect((await giftItem(8420, '0dM2SfqGR0SmtO5ufTWfUQ')).status).toBe(409)
+	expect((await giftItem(8420, '99999999')).status).toBe(404)
+	expect((await giftItem(8394, '0dM2SfqGR0SmtO5ufTWfUQ')).status).toBe(404)
+	expect(await getEquipment(env.DB, 8420)).toHaveLength(2)
+	expect(await getPendingGifts(env.DB, 8420)).toHaveLength(2)
+})
+
+// A consumable stacks: each gift is a fresh row, and the box carries that row's id and the
+// count the player had before it, which is what opening the box reports.
+it('gifts a player a consumable in a gift box, and again', async () => {
+	await clearHub()
+	await updateAccount(env.DB, 8430, { username: 'Hungry' })
+	await seedCatalogRow('0DsHcPhR_Eybn53UxKJhJw', 91010, 'consumable', 'Supreme Pizza')
+
+	let res = await giftItem(8430, '0DsHcPhR_Eybn53UxKJhJw')
+	expect(res.status).toBe(200)
+	const first = (await res.json()) as {
+		kind: string
+		giftId: number
+		name: string
+		count: number
+		owned: number
+	}
+	expect(first).toMatchObject({ kind: 'consumable', name: 'Supreme Pizza', count: 1, owned: 1 })
+
+	let owned = await getConsumables(env.DB, 8430)
+	expect(owned).toHaveLength(1)
+	expect(owned[0]).toMatchObject({ ConsumableItemDesc: '0DsHcPhR_Eybn53UxKJhJw', Count: 1 })
+	let gifts = await getPendingGifts(env.DB, 8430)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		Id: first.giftId,
+		FromPlayerId: 1,
+		ConsumableItemDesc: '0DsHcPhR_Eybn53UxKJhJw',
+		ConsumableCount: 1,
+		ConsumableMappingId: owned[0].Ids[0],
+		ConsumablePreExistingCount: 0,
+		AvatarItemType: null,
+		EquipmentModificationGuid: '',
+		GiftRarity: 3,
+		GiftContext: 500,
+		Message: 'A gift from the staff!',
+	})
+	const frames = await hubFrames()
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([[8430, 31]])
+	expect(frames[0].data).toMatchObject({
+		Id: first.giftId,
+		ConsumableItemDesc: '0DsHcPhR_Eybn53UxKJhJw',
+		AvatarItemType: null,
+	})
+	expect(await auditRows('gift_consumable', 8430)).toEqual([
+		{
+			actor: 8110,
+			data: {
+				playerId: 8430,
+				consumableItemDesc: '0DsHcPhR_Eybn53UxKJhJw',
+				name: 'Supreme Pizza',
+				count: 1,
+				message: 'A gift from the staff!',
+				giftId: first.giftId,
+			},
+		},
+	])
+
+	// Again, by the store's id this time: a second instance, and the box knows they had one.
+	res = await giftItem(8430, '91010', 'Seconds?')
+	expect(res.status).toBe(200)
+	expect(await res.json()).toMatchObject({ kind: 'consumable', owned: 2 })
+	owned = await getConsumables(env.DB, 8430)
+	expect(owned).toHaveLength(1)
+	expect(owned[0]).toMatchObject({ Count: 2 })
+	expect(owned[0].Ids).toHaveLength(2)
+	gifts = await getPendingGifts(env.DB, 8430)
+	expect(gifts).toHaveLength(2)
+	expect(gifts.map((g) => g.ConsumablePreExistingCount ?? -1).sort((a, b) => a - b)).toEqual([0, 1])
+	expect(gifts.map((g) => g.Message).sort()).toEqual(['A gift from the staff!', 'Seconds?'])
+
+	expect((await giftItem(8430, '0DsHcPhR_Eybn53UxKJhJw', 'x'.repeat(257))).status).toBe(400)
+	expect((await giftItem(8393, '0DsHcPhR_Eybn53UxKJhJw')).status).toBe(404)
+	expect(await getConsumables(env.DB, 8430)).toEqual(owned)
+})
+
+// One id field, so the id decides the kind — and a UUID could be anything, so BOTH tables are
+// asked. A baked avatar item is a real row nothing here can grant, and an id in both tables
+// is nobody's to pick between.
+it('refuses an item gift for a baked avatar item, or an id that names two things', async () => {
+	await updateAccount(env.DB, 8440, { username: 'Ambiguous' })
+	await seedCatalogRow('Hat,0,0,', 91020, 'avatar_item', 'A Hat')
+	const twin = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000005', 8441)
+	await seedCatalogRow(twin.CustomAvatarItemId, 91021, 'skin', 'Twin Skin', '[Bow]')
+
+	let res = await giftItem(8440, 'Hat,0,0,')
+	expect(res.status).toBe(400)
+	expect(((await res.json()) as { error: string }).error).toMatch(/baked avatar item/)
+	res = await giftItem(8440, '91020')
+	expect(res.status).toBe(400)
+
+	res = await giftItem(8440, twin.CustomAvatarItemId)
+	expect(res.status).toBe(409)
+	expect(((await res.json()) as { error: string }).error).toMatch(/both/)
+	// The catalog id names only the skin, so that way round it goes through.
+	res = await giftItem(8440, '91021')
+	expect(res.status).toBe(200)
+	expect(await res.json()).toMatchObject({ kind: 'skin', name: 'Twin Skin' })
+
+	expect(await getPendingGifts(env.DB, 8440)).toHaveLength(1)
+	await expect(ownedCustomAvatarItemIds(env.DB, 8440, [twin.CustomAvatarItemId])).resolves.toEqual(
+		new Set()
+	)
 })
 
 // Banked and levelled like a game reward's XP: 25 takes a fresh player from level 1 through
@@ -1767,7 +1996,10 @@ it('gifts a player XP in a gift box', async () => {
 	await hub().fetch('http://do/all', { method: 'DELETE' })
 	await updateAccount(env.DB, 8350, { username: 'Climber' })
 
-	const res = await devPost('/api/staff/players/8350/gift-xp', 8110, { amount: 25 })
+	const res = await devPost('/api/staff/players/8350/gift-xp', 8110, {
+		amount: 25,
+		message: 'Keep climbing!',
+	})
 	expect(res.status).toBe(200)
 	const body = (await res.json()) as { giftId: number }
 	expect(body).toMatchObject({ level: 3, xp: 5, levelsGained: 2 })
@@ -1780,7 +2012,9 @@ it('gifts a player XP in a gift box', async () => {
 		FromPlayerId: 1,
 		Xp: 25,
 		Currency: 0,
+		AvatarItemType: null,
 		GiftContext: 500,
+		Message: 'Keep climbing!',
 	})
 
 	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
@@ -1793,12 +2027,24 @@ it('gifts a player XP in a gift box', async () => {
 		[8350, 31],
 	])
 	expect(frames[0].data).toEqual({ PlayerId: 8350, Level: 3, XP: 5 })
-	expect(frames[1].data).toMatchObject({ Id: body.giftId, Xp: 25, GiftContext: 500 })
+	expect(frames[1].data).toMatchObject({
+		Id: body.giftId,
+		Xp: 25,
+		GiftContext: 500,
+		Message: 'Keep climbing!',
+	})
 
 	expect(await auditRows('gift_xp', 8350)).toEqual([
 		{
 			actor: 8110,
-			data: { playerId: 8350, amount: 25, level: 3, levelsGained: 2, giftId: body.giftId },
+			data: {
+				playerId: 8350,
+				amount: 25,
+				message: 'Keep climbing!',
+				level: 3,
+				levelsGained: 2,
+				giftId: body.giftId,
+			},
 		},
 	])
 })
@@ -1808,6 +2054,14 @@ it('refuses an XP gift that is not a positive whole number, too large, or to nob
 	for (const amount of [0, -5, 1.5, 'lots', 101]) {
 		expect((await devPost('/api/staff/players/8351/gift-xp', 8110, { amount })).status).toBe(400)
 	}
+	expect(
+		(
+			await devPost('/api/staff/players/8351/gift-xp', 8110, {
+				amount: 5,
+				message: 'x'.repeat(257),
+			})
+		).status
+	).toBe(400)
 	expect((await devPost('/api/staff/players/8395/gift-xp', 8110, { amount: 5 })).status).toBe(404)
 	await expect(getProgression(env.DB, 8351)).resolves.toEqual({ PlayerId: 8351, Level: 1, XP: 0 })
 	expect(await auditRows('gift_xp', 8351)).toEqual([])

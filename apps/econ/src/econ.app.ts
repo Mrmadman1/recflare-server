@@ -1100,18 +1100,24 @@ function truncateGiftMessage(message: string): string {
  * own context — a box the server handed over on nobody's behalf.
  */
 /**
- * `AvatarItemType` as a gift box carries it: the drop's own for an avatar item, NULL for
- * anything else — a consumable, a skin, a box, a token bundle.
+ * `AvatarItemType` as a gift box carries it: the drop's own (0 when it names none) for an
+ * AVATAR ITEM — a baked one by `AvatarItemDesc` or a custom one by `CustomAvatarItemId` — and
+ * NULL for anything else: a consumable, a skin, a box, a token bundle.
  *
  * The client routes a box by this field before it looks at what else the box names: a 0
  * reads as "an avatar item of type 0", and a consumable or skin box sent with 0 fails with
  * "can't find avatar item" because there is no such item to find. The 2025 store lists every
  * non-avatar drop with `AvatarItemType: null` for exactly that reason, and this is what the
- * old `?? 0` coalescing used to erase. Applied at every surface a box is serialized on — the
- * stored box, both purchase responses and the hub frame — so they cannot disagree.
+ * old `?? 0` coalescing used to erase. A custom item's box is the other way round: it needs
+ * the number, as the bag's guid-keyed box ({@link toCustomGiftContent}) sends it. Applied at
+ * every surface a box is serialized on — the stored box, both purchase responses and the hub
+ * frame — so they cannot disagree.
  */
 function boxAvatarItemType(drop: StoreGiftDrop): number | null {
-	return drop.AvatarItemDesc !== '' ? (drop.AvatarItemType ?? 0) : null
+	const isAvatarItem =
+		drop.AvatarItemDesc !== '' ||
+		(typeof drop.CustomAvatarItemId === 'string' && drop.CustomAvatarItemId !== '')
+	return isAvatarItem ? (drop.AvatarItemType ?? 0) : null
 }
 
 function toGiftContent(

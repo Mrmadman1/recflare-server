@@ -41,6 +41,15 @@ import {
 	getBalance,
 	spendCurrency,
 } from '../../econ/src/balance-db'
+// The item catalog and the two inventories a skin or a consumable gift writes, all `econ`'s.
+import {
+	CatalogKind,
+	getCatalogItem,
+	getCatalogItemById,
+	toCatalogSkin,
+} from '../../econ/src/catalog-db'
+import { countConsumable, grantConsumable } from '../../econ/src/consumables-db'
+import { getEquipment, grantEquipment } from '../../econ/src/equipment-db'
 import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/inventory-custom-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
 // imported as values/types with no runtime dependencies.
@@ -48,7 +57,9 @@ import { NotificationType } from '../../notify/src/notification-types'
 
 import type { Context, MiddlewareHandler } from 'hono'
 import type { GiftContent } from '@repo/domain'
+import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type { ReportRow, ReportSearch } from '../../api/src/reports-db'
+import type { CatalogRow } from '../../econ/src/catalog-db'
 import type {
 	BalanceResponsePayload,
 	GiftPackagePayload,
@@ -554,7 +565,7 @@ export const DEFAULT_MAX_XP_GIFT = 100
  */
 export const MAX_TOKEN_DROP = 1_000
 
-/** The longest message a staff token box may carry — the same cap a client message has. */
+/** The longest message a staff box may carry — the same cap a client message has. */
 const MAX_GIFT_MESSAGE = 256
 
 /**
@@ -601,6 +612,10 @@ async function recordPlayerAudit(
  * The stored content of a box staff hand over: from the Coach, as every box the server hands
  * over on nobody's behalf is (who really sent it is on the audit row), carrying nothing but
  * what `fields` puts in it.
+ *
+ * `AvatarItemType` is NULL: no staff box holds an avatar item, and the client routes a box on
+ * that field before reading the rest — a 0 sends it after "avatar item type 0", which fails
+ * with "can't find avatar item". Same rule as econ's `boxAvatarItemType`.
  */
 function staffGiftContent(fields: Partial<GiftContent>): GiftContent {
 	return {
@@ -609,7 +624,7 @@ function staffGiftContent(fields: Partial<GiftContent>): GiftContent {
 		ConsumableItemDesc: '',
 		ConsumableCount: 0,
 		AvatarItemDesc: '',
-		AvatarItemType: 0,
+		AvatarItemType: null,
 		CurrencyType: 0,
 		Currency: 0,
 		Xp: 0,
@@ -739,7 +754,7 @@ function tokenAmountRefusal(c: Context<App>, amount: number): string | null {
 }
 
 /**
- * The message a token box should carry, from the body's optional `message`: the staffer's
+ * The message a staff box should carry, from the body's optional `message`: the staffer's
  * own words, trimmed, or {@link STAFF_GIFT_MESSAGE} when they wrote none. `undefined` means
  * a message was written but is too long to send — the caller refuses rather than truncating
  * what the player is going to read.
@@ -948,7 +963,7 @@ export async function giftXpHandler(c: Context<App>) {
 	const playerId = playerIdParam(c)
 	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
 
-	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown }
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown; message?: unknown }
 	const amount = Number(body.amount)
 	if (!Number.isInteger(amount) || amount <= 0) {
 		return c.json({ error: 'Enter a whole number of XP greater than 0' }, 400)
@@ -957,6 +972,8 @@ export async function giftXpHandler(c: Context<App>) {
 	if (amount > maxGift) {
 		return c.json({ error: `A gift can carry at most ${maxGift.toLocaleString()} XP` }, 400)
 	}
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
 	if ((await getAccount(c.env.DB, playerId)) === null) {
 		return c.json({ error: 'No such player' }, 404)
 	}
@@ -965,12 +982,14 @@ export async function giftXpHandler(c: Context<App>) {
 	const content = staffGiftContent({
 		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
 		Xp: amount,
+		Message: message,
 	})
 	const gift = await createGift(c.env.DB, playerId, content)
 
 	await recordPlayerAudit(c, 'gift_xp', {
 		playerId,
 		amount,
+		message,
 		level: progression.Level,
 		levelsGained,
 		giftId: gift.id,
@@ -1006,35 +1025,123 @@ export async function giftXpHandler(c: Context<App>) {
 }
 
 /**
- * Give a player a custom avatar item, delivered the way a store purchase delivers one:
- * ownership is a row in `inventory_custom` (what `econ`'s owned read serves the item from),
- * and the item comes in a gift box naming it by `CustomAvatarItemId` — without the box the
- * player is shown nothing. Unlike a purchase nobody pays and the creator is not paid: this is
- * a grant, not a sale.
- *
- * Refused as the store refuses a sale to this player: an unknown item or a DRAFT
- * (`Accessibility` 0, visible to its creator alone — handing it out would publish it for
- * them), the item's own creator (who owns it already), or a player who already has it.
+ * How many of a consumable one staff gift carries — one, as a store purchase grants one
+ * (econ's `CONSUMABLE_GRANT_COUNT`). Consumables stack, so more is more gifts.
  */
-export async function giftCustomItemHandler(c: Context<App>) {
+const CONSUMABLE_GIFT_COUNT = 1
+
+/**
+ * What an item gift's id resolved to. `avatar_item` is a catalog row nothing here can grant;
+ * `ambiguous` is an id found in BOTH tables, which nothing here can pick between.
+ */
+type GiftableItem =
+	| { kind: 'custom_item'; item: CustomAvatarItem }
+	| { kind: 'skin'; row: CatalogRow }
+	| { kind: 'consumable'; row: CatalogRow }
+	| { kind: 'avatar_item'; row: CatalogRow }
+	| { kind: 'ambiguous' }
+
+/**
+ * Resolve the one id the staff card takes to whatever it names, looking in BOTH tables an
+ * item can live in: `custom_avatar_item` by guid, in either case (a GUID's case is not its
+ * identity; ids are stored as the export spelled them), and `catalog` by KEY — a skin's
+ * `ModificationGuid` or a consumable's `ConsumableItemDesc`, spelled as the export spells it
+ * (the short pre-GUID ids are case-sensitive, so nothing is folded there) — or, for a bare
+ * number, by `catalog_id`, the store's `PurchasableItemId`.
+ *
+ * A UUID could be anything, so neither lookup is skipped on the strength of the other: an id
+ * that answers in both tables is `ambiguous` rather than whichever was asked first. In
+ * practice they don't collide — no catalog key is a bare number, and a skin and a consumable
+ * never share a key — but the check is what makes that a fact rather than an assumption.
+ *
+ * A DRAFT custom item (`Accessibility` 0, visible to its creator alone — handing it out would
+ * publish it for them) is treated as unknown, exactly as the store would refuse to sell it.
+ */
+async function findGiftableItem(db: D1Database, requested: string): Promise<GiftableItem | null> {
+	const [custom, byKey] = await Promise.all([
+		getCustomAvatarItem(db, requested).then(
+			(item) => item ?? getCustomAvatarItem(db, requested.toLowerCase())
+		),
+		getCatalogItem(db, requested),
+	])
+	const item = custom !== null && custom.Accessibility !== 0 ? custom : null
+	const row =
+		byKey ?? (/^\d{1,9}$/.test(requested) ? await getCatalogItemById(db, Number(requested)) : null)
+
+	if (item !== null && row !== null) return { kind: 'ambiguous' }
+	if (item !== null) return { kind: 'custom_item', item }
+	if (row === null) return null
+	switch (row.kind) {
+		case CatalogKind.Skin:
+			return { kind: 'skin', row }
+		case CatalogKind.Consumable:
+			return { kind: 'consumable', row }
+		case CatalogKind.AvatarItem:
+			return { kind: 'avatar_item', row }
+		default:
+			return null
+	}
+}
+
+/**
+ * Give a player an item — a custom avatar item, an equipment skin or a consumable — by any
+ * one of their ids, delivered the way a store purchase delivers it: ownership in the inventory
+ * `econ` reads that kind from, and a gift box that names it, without which the player is
+ * shown nothing. Nobody pays, and a custom item's creator is not paid: a grant, not a sale.
+ * Which kind the id turned out to be is on the reply as `kind`, and the audit row is filed
+ * per kind (`gift_custom_item`, `gift_skin`, `gift_consumable`).
+ *
+ * A baked avatar item's id is refused outright: nothing here grants one yet, and a 404 would
+ * send the staffer checking an id that is right.
+ */
+export async function giftItemHandler(c: Context<App>) {
 	const playerId = playerIdParam(c)
 	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
 
-	const body = (await c.req.json().catch(() => ({}))) as { customAvatarItemId?: unknown }
-	const requested =
-		typeof body.customAvatarItemId === 'string' ? body.customAvatarItemId.trim() : ''
-	if (requested === '') return c.json({ error: 'Enter a custom item id' }, 400)
+	const body = (await c.req.json().catch(() => ({}))) as { itemId?: unknown; message?: unknown }
+	const requested = typeof body.itemId === 'string' ? body.itemId.trim() : ''
+	if (requested === '') return c.json({ error: 'Enter an item id' }, 400)
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
 	if ((await getAccount(c.env.DB, playerId)) === null) {
 		return c.json({ error: 'No such player' }, 404)
 	}
 
-	// A GUID's case is not part of its identity, and ids are stored as the export spelled them.
-	const item =
-		(await getCustomAvatarItem(c.env.DB, requested)) ??
-		(await getCustomAvatarItem(c.env.DB, requested.toLowerCase()))
-	if (item === null || item.Accessibility === 0) {
-		return c.json({ error: 'No such custom item' }, 404)
+	const found = await findGiftableItem(c.env.DB, requested)
+	if (found === null) return c.json({ error: 'No such item' }, 404)
+	switch (found.kind) {
+		case 'custom_item':
+			return await giftCustomItem(c, playerId, found.item, message)
+		case 'skin':
+			return await giftSkin(c, playerId, found.row, message)
+		case 'consumable':
+			return await giftConsumable(c, playerId, found.row, message)
+		case 'avatar_item':
+			return c.json(
+				{
+					error:
+						'That is a baked avatar item; only custom items, skins and consumables can be gifted',
+				},
+				400
+			)
+		case 'ambiguous':
+			return c.json({ error: 'That id names both a custom item and a catalog item' }, 409)
 	}
+}
+
+/**
+ * A custom avatar item: ownership is a row in `inventory_custom` (what `econ`'s owned read
+ * serves the item from), and the box names it by `CustomAvatarItemId`.
+ *
+ * Refused as the store refuses a sale to this player: the item's own creator (who owns it
+ * already), or a player who already has it.
+ */
+async function giftCustomItem(
+	c: Context<App>,
+	playerId: number,
+	item: CustomAvatarItem,
+	message: string
+) {
 	if (item.CreatorAccountId === playerId) {
 		return c.json({ error: 'This player created that item, so they already have it' }, 409)
 	}
@@ -1047,6 +1154,10 @@ export async function giftCustomItemHandler(c: Context<App>) {
 	const content = staffGiftContent({
 		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
 		CustomAvatarItemId: item.CustomAvatarItemId,
+		// 0, not the null the other staff boxes carry: a custom item IS an avatar item, and this
+		// matches the box econ mints for a bought one, which is the shape seen to open.
+		AvatarItemType: 0,
+		Message: message,
 	})
 	const gift = await createGift(c.env.DB, playerId, content)
 
@@ -1054,6 +1165,7 @@ export async function giftCustomItemHandler(c: Context<App>) {
 		playerId,
 		customAvatarItemId: item.CustomAvatarItemId,
 		name: item.Name,
+		message,
 		giftId: gift.id,
 	})
 	logger.info('staff gifted a custom item', {
@@ -1064,9 +1176,117 @@ export async function giftCustomItemHandler(c: Context<App>) {
 	await announceGift(c, playerId, gift.id, content)
 
 	return c.json({
+		kind: 'custom_item',
 		playerId,
 		customAvatarItemId: item.CustomAvatarItemId,
 		name: item.Name,
+		giftId: gift.id,
+	})
+}
+
+/**
+ * An equipment skin: ownership is a row in `equipment` (what `GET /api/equipment/v2/getUnlocked`
+ * serves), and the box names it by `EquipmentPrefabName`/`EquipmentModificationGuid` with
+ * `AvatarItemType` NULL — a 0 there sends the client looking for an avatar item that does not
+ * exist, and the box fails to open.
+ *
+ * Refused for a player who already owns it: owning a skin is boolean, so a second grant would
+ * hand them a box with nothing new in it.
+ */
+async function giftSkin(c: Context<App>, playerId: number, row: CatalogRow, message: string) {
+	const skin = toCatalogSkin(row)
+	const owned = await getEquipment(c.env.DB, playerId)
+	if (owned.some((eq) => eq.ModificationGuid === skin.ModificationGuid)) {
+		return c.json({ error: 'This player already owns that skin' }, 409)
+	}
+
+	// The same DTO a purchase grants (econ's `toEquipment`), built from the catalog's view.
+	await grantEquipment(c.env.DB, playerId, {
+		ModificationGuid: skin.ModificationGuid,
+		PrefabName: skin.PrefabName,
+		FriendlyName: skin.FriendlyName,
+		Tooltip: skin.Tooltip ?? '',
+		Rarity: skin.Rarity,
+		PlatformMask: -1,
+		Favorited: false,
+	})
+	const content = staffGiftContent({
+		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+		EquipmentPrefabName: skin.PrefabName,
+		EquipmentModificationGuid: skin.ModificationGuid,
+		GiftRarity: skin.Rarity,
+		Message: message,
+	})
+	const gift = await createGift(c.env.DB, playerId, content)
+
+	await recordPlayerAudit(c, 'gift_skin', {
+		playerId,
+		modificationGuid: skin.ModificationGuid,
+		prefabName: skin.PrefabName,
+		name: skin.FriendlyName,
+		message,
+		giftId: gift.id,
+	})
+	logger.info('staff gifted a skin', {
+		moderatorId: staffId(c),
+		playerId,
+		modificationGuid: skin.ModificationGuid,
+	})
+	await announceGift(c, playerId, gift.id, content)
+
+	return c.json({
+		kind: 'skin',
+		playerId,
+		modificationGuid: skin.ModificationGuid,
+		prefabName: skin.PrefabName,
+		name: skin.FriendlyName,
+		giftId: gift.id,
+	})
+}
+
+/**
+ * One of a consumable: a fresh `consumable` row (they stack, so there is no "already owns"
+ * refusal — a second gift is a second one), and a box naming it by `ConsumableItemDesc` with
+ * `AvatarItemType` NULL, as a skin's is. The box also carries the granted row's id and the
+ * player's count BEFORE this one, which is what lets opening it fire an accurate
+ * `ConsumableMappingAdded`.
+ */
+async function giftConsumable(c: Context<App>, playerId: number, row: CatalogRow, message: string) {
+	const preExisting = await countConsumable(c.env.DB, playerId, row.item_key)
+	const mappingId = await grantConsumable(c.env.DB, playerId, row.item_key, CONSUMABLE_GIFT_COUNT)
+	const content = staffGiftContent({
+		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+		ConsumableItemDesc: row.item_key,
+		ConsumableCount: CONSUMABLE_GIFT_COUNT,
+		ConsumableMappingId: mappingId,
+		ConsumablePreExistingCount: preExisting,
+		GiftRarity: row.rarity,
+		Message: message,
+	})
+	const gift = await createGift(c.env.DB, playerId, content)
+
+	await recordPlayerAudit(c, 'gift_consumable', {
+		playerId,
+		consumableItemDesc: row.item_key,
+		name: row.friendly_name,
+		count: CONSUMABLE_GIFT_COUNT,
+		message,
+		giftId: gift.id,
+	})
+	logger.info('staff gifted a consumable', {
+		moderatorId: staffId(c),
+		playerId,
+		consumableItemDesc: row.item_key,
+	})
+	await announceGift(c, playerId, gift.id, content)
+
+	return c.json({
+		kind: 'consumable',
+		playerId,
+		consumableItemDesc: row.item_key,
+		name: row.friendly_name,
+		count: CONSUMABLE_GIFT_COUNT,
+		owned: preExisting + CONSUMABLE_GIFT_COUNT,
 		giftId: gift.id,
 	})
 }

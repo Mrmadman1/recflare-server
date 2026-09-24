@@ -372,7 +372,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				ConsumableItemDesc: '',
 				AvatarItemDesc: '',
 				FriendlyName: '',
-				AvatarItemType: 0,
+				// A token box holds no avatar item: null, or the client goes looking for type 0.
+				AvatarItemType: null,
 				EquipmentPrefabName: '',
 				EquipmentModificationGuid: '',
 				CurrencyType: 2,

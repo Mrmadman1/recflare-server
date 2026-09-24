@@ -848,7 +848,7 @@ export const GeneratedGift = z.object({
 	ConsumableItemDesc: z.string(),
 	AvatarItemDesc: z.string(),
 	FriendlyName: z.string(),
-	AvatarItemType: z.int(),
+	AvatarItemType: z.int().nullable().describe('Null — a token box holds no avatar item'),
 	EquipmentPrefabName: z.string(),
 	EquipmentModificationGuid: z.string(),
 	CurrencyType: z.int(),
