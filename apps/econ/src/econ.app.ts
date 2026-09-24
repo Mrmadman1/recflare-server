@@ -1099,6 +1099,21 @@ function truncateGiftMessage(message: string): string {
  * with nothing but the row to say who sent it or why. They default to Coach and the drop's
  * own context — a box the server handed over on nobody's behalf.
  */
+/**
+ * `AvatarItemType` as a gift box carries it: the drop's own for an avatar item, NULL for
+ * anything else — a consumable, a skin, a box, a token bundle.
+ *
+ * The client routes a box by this field before it looks at what else the box names: a 0
+ * reads as "an avatar item of type 0", and a consumable or skin box sent with 0 fails with
+ * "can't find avatar item" because there is no such item to find. The 2025 store lists every
+ * non-avatar drop with `AvatarItemType: null` for exactly that reason, and this is what the
+ * old `?? 0` coalescing used to erase. Applied at every surface a box is serialized on — the
+ * stored box, both purchase responses and the hub frame — so they cannot disagree.
+ */
+function boxAvatarItemType(drop: StoreGiftDrop): number | null {
+	return drop.AvatarItemDesc !== '' ? (drop.AvatarItemType ?? 0) : null
+}
+
 function toGiftContent(
 	giftDrop: StoreGiftDrop,
 	message: string,
@@ -1116,7 +1131,7 @@ function toGiftContent(
 		ConsumableMappingId: consumableMappingId,
 		ConsumablePreExistingCount: consumablePreExistingCount,
 		AvatarItemDesc: giftDrop.AvatarItemDesc,
-		AvatarItemType: giftDrop.AvatarItemType,
+		AvatarItemType: boxAvatarItemType(giftDrop),
 		CurrencyType: giftDrop.CurrencyType,
 		Currency: giftDrop.Currency,
 		Xp: giftDrop.Xp ?? 0,
@@ -1197,7 +1212,7 @@ async function pushGiftReceived(
 		FromPlayerId: fromPlayerId,
 		ConsumableItemDesc: gift.drop.ConsumableItemDesc,
 		AvatarItemDesc: gift.drop.AvatarItemDesc,
-		AvatarItemType: gift.drop.AvatarItemType ?? 0,
+		AvatarItemType: boxAvatarItemType(gift.drop),
 		EquipmentPrefabName: gift.drop.EquipmentPrefabName,
 		EquipmentModificationGuid: gift.drop.EquipmentModificationGuid,
 		CurrencyType: gift.drop.CurrencyType,
@@ -1347,7 +1362,8 @@ function toSkinStoreItem(row: CatalogRow): StoreItem {
 			Tooltip: row.tooltip ?? '',
 			ConsumableItemDesc: '',
 			AvatarItemDesc: '',
-			AvatarItemType: 0,
+			// A skin is no avatar item: null, as the store lists every skin.
+			AvatarItemType: null,
 			EquipmentPrefabName: row.prefab_name ?? '',
 			EquipmentModificationGuid: row.item_key,
 			Rarity: row.rarity,
@@ -1668,7 +1684,7 @@ function toBalanceUpdateData(
 		FromPlayerId: fromPlayerId,
 		ConsumableItemDesc: drop.ConsumableItemDesc,
 		AvatarItemDesc: drop.AvatarItemDesc,
-		AvatarItemType: drop.AvatarItemType ?? 0,
+		AvatarItemType: boxAvatarItemType(drop),
 		EquipmentPrefabName: drop.EquipmentPrefabName,
 		EquipmentModificationGuid: drop.EquipmentModificationGuid,
 		CurrencyType: drop.CurrencyType,
@@ -1816,7 +1832,7 @@ function toGiftPackage(
 		PlayerId: playerId,
 		FromPlayerId: fromPlayerId,
 		ConsumableItemDesc: drop.ConsumableItemDesc,
-		AvatarItemType: drop.AvatarItemType ?? 0,
+		AvatarItemType: boxAvatarItemType(drop),
 		AvatarItemDesc: drop.AvatarItemDesc,
 		CustomAvatarItemId: null,
 		EquipmentPrefabName: drop.EquipmentPrefabName,

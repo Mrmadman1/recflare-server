@@ -2827,7 +2827,7 @@ describe('econ endpoints', () => {
 				Data: Array<{
 					ConsumableItemDesc: string
 					AvatarItemDesc: string
-					AvatarItemType: number
+					AvatarItemType: number | null
 					FromPlayerId: number
 				}>
 			}>
@@ -2837,8 +2837,9 @@ describe('econ endpoints', () => {
 		const drop = body.BalanceUpdates[0].Data[0]
 		expect(drop.ConsumableItemDesc).toBe(consumableDesc)
 		expect(drop.AvatarItemDesc).toBe('')
-		// A consumable's AvatarItemType is null in the catalog; the response coalesces it to 0.
-		expect(drop.AvatarItemType).toBe(0)
+		// A consumable's AvatarItemType is NULL, as the store lists it — never 0, which the
+		// client reads as an avatar item and fails on ("can't find avatar item").
+		expect(drop.AvatarItemType).toBeNull()
 		// A self-buy is attributed to the "Coach" system account (id 1).
 		expect(drop.FromPlayerId).toBe(1)
 
@@ -4888,7 +4889,9 @@ describe('econ endpoints', () => {
 			FromPlayerId: 1,
 			ConsumableItemDesc: '',
 			AvatarItemDesc: gift.AvatarItemDesc,
-			AvatarItemType: gift.AvatarItemType,
+			// The week's reward is a SKIN, so this is null whatever the block says: a 0 would
+			// send the client looking for an avatar item that does not exist.
+			AvatarItemType: gift.AvatarItemDesc === '' ? null : gift.AvatarItemType,
 			EquipmentPrefabName: gift.EquipmentPrefabName,
 			EquipmentModificationGuid: gift.EquipmentModificationGuid,
 			CurrencyType: 0,

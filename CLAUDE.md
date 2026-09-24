@@ -259,6 +259,13 @@ inconsistency here without checking the client first.
   each stored and pushed as `MessageReceived`. The `RelationshipChanged` frames only
   refresh relationship state: sent alone, the request "worked" server-side and the target
   saw nothing. Same pattern as the cheer.
+- A gift box's `AvatarItemType` (`econ`: the stored box in `GET /api/avatar/v2/gifts`, `buyItem`'s
+  `BalanceUpdates[].Data`, `bulkpurchase`'s `GiftPackage`, and the `GiftPackageReceived*` frame)
+  must be NULL for anything that is not an avatar item — a consumable, a skin, a box. The client
+  routes the box on that field before it reads what else the box names, so a 0 sends it looking
+  for avatar item type 0 and it fails with "can't find avatar item". The 2025 store lists every
+  non-avatar drop with `AvatarItemType: null` for this reason; `boxAvatarItemType` applies it on
+  every surface, so don't coalesce it with `?? 0` anywhere a box is built.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members
