@@ -3697,6 +3697,20 @@ describe('econ endpoints', () => {
 		expect(anon.status).toBe(401)
 	})
 
+	test('GET /paintball-battle-pass/config serves the stub season', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/paintball-battle-pass/config`)
+		expect(res.status).toBe(200)
+		const config = (await res.json()) as Record<string, unknown>
+		expect(config).toMatchObject({
+			BattlePassId: 1,
+			Name: 'Season 1',
+			ValidRoomIds: [112],
+			Levels: [{ XpRequired: 100, RewardGiftDropIds: [1] }],
+			EventXP: { '1': 10, '2': 25, '3': 50, '4': 100 },
+			PermanentBoostTokenPrice: 500,
+		})
+	})
+
 	test('GET /econ/roomEconConfig/:roomId echoes the room and disables sorting tabs', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/econ/roomEconConfig/92`)
 		expect(anon.status).toBe(401)
@@ -7322,6 +7336,7 @@ describe('econ endpoints', () => {
 			'GET /econ/roomInventoryItemTags/room/{roomId}',
 			'GET /econ/roomOffer/room/{roomId}',
 			'GET /econ/roomOffer/room/{roomId}/purchaseCounts',
+			'GET /paintball-battle-pass/config',
 			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
 			'POST /api/avatar/v1/lockeditems/bulk',
 			'POST /api/avatar/v2/gifts/consume',

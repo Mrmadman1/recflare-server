@@ -4783,6 +4783,40 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
+	// The paintball battle pass's season config. A stub: nothing stores a season yet, so
+	// every caller is served the one example season below, verbatim.
+	.get(
+		'/paintball-battle-pass/config',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The paintball battle pass config (stub)',
+			description: 'A fixed example season — no battle pass is stored yet.',
+			responses: { 200: json(JsonObject, 'The battle pass config') },
+		}),
+		(c) =>
+			c.json({
+				BattlePassId: 1,
+				Name: 'Season 1',
+				ValidRoomIds: [112],
+				StartTime: '2026-10-01T00:00:00Z',
+				EndTime: '2026-12-01T00:00:00Z',
+				Levels: [{ XpRequired: 100, RewardGiftDropIds: [1] }],
+				EventXP: { '1': 10, '2': 25, '3': 50, '4': 100 },
+				BoostConfig: {
+					TemporaryBoostDurationInMinutes: 60,
+					TemporaryBoostXpMultiplierPercentage: 50,
+					PermanentBoostXpMultiplierPercentage: 25,
+					SocialBoostXpMultiplierPercentage: 10,
+					MaxBoostXpMultiplierPercentage: 100,
+				},
+				DailyParticipationBonusLimit: 5,
+				MinimumParticipationTimeInSeconds: 120,
+				PurchasableSkus: [{ Type: 1, TokenPrice: 1000, BonusLevels: 0, PermanentBoost: false }],
+				PermanentBoostTokenPrice: 500,
+				LimitedTimeReward: { CompletionDeadline: '2026-11-01T00:00:00Z', GiftDropIds: [9] },
+			})
+	)
+
 	// Everything a room sells, in one list: its keys, its consumables and the purchase offers
 	// of its currencies, each as the client's 10-key `UgcPurchasableItem` with `ItemType`
 	// saying which (0 key, 1 consumable, 3 currency pack). Asked for on every room load. A
