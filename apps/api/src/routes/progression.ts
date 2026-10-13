@@ -13,6 +13,20 @@ import { logger } from '@repo/hono-helpers'
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
 // value — the enum has no runtime dependencies.
 import { NotificationType } from '../../../notify/src/notification-types'
+import progressionEvent13 from '../../static/progression-events/Anime_Season_EventId_13.json'
+import progressionEvent8 from '../../static/progression-events/Base_Event_EventId_8.json'
+import progressionEvent2 from '../../static/progression-events/Coming_in_Hot_Progression_Event_Alpha_EventId_2.json'
+import progressionEvent9 from '../../static/progression-events/Invasion_2_EventId_9.json'
+import progressionEvent6 from '../../static/progression-events/Invasion_EventId_6.json'
+import progressionEvent15 from '../../static/progression-events/Medieval_Season_EventId_15.json'
+import progressionEvent5 from '../../static/progression-events/Progression_Event_Alpha_Repeat_EventId_5.json'
+import progressionEvent3 from '../../static/progression-events/Rec_Room_EventId_3.json'
+import progressionEvent12 from '../../static/progression-events/Science_Experiment_Restoration_EventId_12.json'
+import progressionEvent7 from '../../static/progression-events/Science_Party_EventId_7.json'
+import progressionEvent14 from '../../static/progression-events/Summer_Party_EventId_14.json'
+import progressionEvent16 from '../../static/progression-events/Treat_Collection_Challenge_EventId_16.json'
+import progressionEvent17 from '../../static/progression-events/Tricks_Challenge_EventId_17.json'
+import progressionEvent18 from '../../static/progression-events/Yetis_Challenge_EventId_18.json'
 import { authedId, parseFormIds, queryIds, unauthorized } from '../http'
 import {
 	AUTHED,
@@ -20,14 +34,15 @@ import {
 	BulkIdsRequest,
 	CheerPlayerRequest,
 	CheerPlayerResponse,
-	SetSelectedCheerRequest,
 	form,
 	idParam,
 	intQuery,
 	json,
 	JsonArray,
+	JsonObject,
 	ProgressionDto,
 	ReputationDto,
+	SetSelectedCheerRequest,
 	UNAUTHORIZED_RESPONSE,
 } from '../openapi'
 import {
@@ -46,6 +61,32 @@ import type { Progression } from '@repo/domain'
 import type { ReputationPayload } from '../../../notify/src/notification-payloads'
 import type { App } from '../context'
 import type { Reputation } from '../reputation-db'
+
+/**
+ * The archived official progression events, by `ProgressionEventId` — each the event record
+ * exactly as the official API served it. They are held as TEXT and served byte for byte, not
+ * imported as JSON: a keepsake room's `RoomId` is a 64-bit number (`8364812036745705361`)
+ * that a JS parse rounds to a different room. The archive has gaps (no 1, 4, 10, 11).
+ *
+ * The text import is a `rules` entry in wrangler.jsonc, which TypeScript cannot see — it
+ * types a `.json` import as the parsed object — hence the cast.
+ */
+const PROGRESSION_EVENTS = new Map([
+	[2, progressionEvent2],
+	[3, progressionEvent3],
+	[5, progressionEvent5],
+	[6, progressionEvent6],
+	[7, progressionEvent7],
+	[8, progressionEvent8],
+	[9, progressionEvent9],
+	[12, progressionEvent12],
+	[13, progressionEvent13],
+	[14, progressionEvent14],
+	[15, progressionEvent15],
+	[16, progressionEvent16],
+	[17, progressionEvent17],
+	[18, progressionEvent18],
+] as Array<[number, unknown]> as Array<[number, string]>)
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -542,4 +583,30 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 			responses: { 200: json(BareInteger, 'A bare `0` — no event is running') },
 		}),
 		(c) => c.json(0)
+	)
+
+	// One progression event's definition — its reward track, keepsake rooms, dates and boost
+	// settings — served from the archive of official events above. Reading a definition says
+	// nothing about whether the event is running (`/active` above still answers 0), and no
+	// auth for the same reason as there: it is the same record for everybody.
+	.get(
+		'/api/progressionEvents/event/:id{[0-9]+}',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'A progression event’s definition',
+			description:
+				'The archived official event with this `ProgressionEventId`, verbatim: rewards, ' +
+				'keepsake room lists, start/end/collection times and boost settings. 404 for an ' +
+				'id the archive does not hold. No auth.',
+			parameters: [idParam('id', 'The `ProgressionEventId`')],
+			responses: {
+				200: json(JsonObject, 'The progression event'),
+				404: { description: 'No such event (empty body)' },
+			},
+		}),
+		(c) => {
+			const event = PROGRESSION_EVENTS.get(Number(c.req.param('id')))
+			if (event === undefined) return c.body(null, 404)
+			return c.body(event, 200, { 'Content-Type': 'application/json' })
+		}
 	)

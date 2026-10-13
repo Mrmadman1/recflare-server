@@ -2089,6 +2089,28 @@ describe('public endpoints', () => {
 		expect(await res.json()).toBe(0)
 	})
 
+	test('GET /api/progressionEvents/event/:id serves the archived event verbatim', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/18`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toMatchObject({
+			ProgressionEventId: 18,
+			Name: 'Yetis Challenge',
+			Rewards: [],
+			KeepsakeRoomLists: [],
+			EventLeaderboardId: 18,
+		})
+
+		// A keepsake room's id is 64-bit: it has to reach the client as written, not as the
+		// nearest double (…705361 parses to …705000), so the body is checked as text.
+		const base = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/8`)
+		expect(await base.text()).toContain('"RoomId": 8364812036745705361')
+
+		// The archive has gaps, and an id it doesn't hold is a 404.
+		const missing = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/4`)
+		expect(missing.status).toBe(404)
+	})
+
 	test('GET /api/rooms/v1/filters returns an object with filter arrays', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/rooms/v1/filters`)
 		expect(res.status).toBe(200)
@@ -10189,6 +10211,7 @@ describe('openapi', () => {
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/progressionEvents/active',
+			'GET /api/progressionEvents/event/{id}',
 			'GET /api/quickPlay/v1/getandclear',
 			'GET /api/referee/files',
 			'GET /api/relationships/mutualfriends',
