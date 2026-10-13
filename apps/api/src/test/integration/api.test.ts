@@ -2081,12 +2081,12 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(400)
 	})
 
-	test('GET /api/progressionEvents/active is a bare 0 (no auth)', async () => {
-		// 0 is the "no active event" value; the client reads it as "no event running" and
-		// skips the event UI. A 404 would stall its load instead.
+	test('GET /api/progressionEvents/active is a bare 18 (no auth)', async () => {
+		// A hardcoded stub: the id of an archived event (0 would mean "no active event").
+		// A 404 would stall the client's load instead.
 		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/active`)
 		expect(res.status).toBe(200)
-		expect(await res.json()).toBe(0)
+		expect(await res.json()).toBe(18)
 	})
 
 	test('GET /api/progressionEvents/event/:id serves the archived event verbatim', async () => {

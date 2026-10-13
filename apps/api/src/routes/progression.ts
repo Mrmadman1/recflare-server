@@ -565,29 +565,29 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 	// The progression event running right now — the limited-time XP event the client shows
 	// a banner and a progress track for.
 	//
-	// STUB: a bare `0` — the id of the active event, or 0 when there is none (this once
-	// served -1 for the same meaning). The client reads it as "no event on" and skips the
-	// event UI entirely. That is the honest answer (nothing here runs events) and the safe
-	// one: a fabricated event would draw a track that never fills. No auth — whether an
-	// event is running is the same fact for everybody, and the client asks while loading.
+	// STUB: a bare `18` — the id of the active event, or 0 when there is none (this once
+	// served -1 for the same meaning). 18 is hardcoded: it names an event the archive above
+	// holds, so the client can fetch its definition from `/event/18`, but nothing here
+	// tracks progress through it yet. No auth — whether an event is running is the same
+	// fact for everybody, and the client asks while loading.
 	.get(
 		'/api/progressionEvents/active',
 		describeRoute({
 			tags: ['Progression'],
 			summary: 'Progression event currently running (stub)',
 			description:
-				'The limited-time XP event in progress, as a bare event id. Always `0` — the ' +
-				'“no active event” value; nothing on this server runs one — which the client reads ' +
-				'as “no event” and skips the event UI, where a 404 would stall the load. No auth: ' +
+				'The limited-time XP event in progress, as a bare event id (`0` would mean “no ' +
+				'active event”). Always `18` for now — a hardcoded archived event; nothing on this ' +
+				'server tracks progress through it yet. A 404 here would stall the load. No auth: ' +
 				'it is the same answer for every player.',
-			responses: { 200: json(BareInteger, 'A bare `0` — no event is running') },
+			responses: { 200: json(BareInteger, 'A bare `18` — the hardcoded active event') },
 		}),
-		(c) => c.json(0)
+		(c) => c.json(18)
 	)
 
 	// One progression event's definition — its reward track, keepsake rooms, dates and boost
 	// settings — served from the archive of official events above. Reading a definition says
-	// nothing about whether the event is running (`/active` above still answers 0), and no
+	// nothing about whether the event is running (`/active` above is a hardcoded 18), and no
 	// auth for the same reason as there: it is the same record for everybody.
 	.get(
 		'/api/progressionEvents/event/:id{[0-9]+}',
