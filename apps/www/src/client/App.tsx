@@ -507,6 +507,24 @@ async function changeUsername(username: string): Promise<SelfAccount> {
 }
 
 /**
+ * Set the display name — the name other players read, as opposed to the username the
+ * account signs in with. Unrationed, unlike a username change.
+ *
+ * Not checked here first, for the reason the email below isn't: `accounts` owns the rule
+ * (`displayNameRejection` in `@repo/domain`, the game client's own charset), and that
+ * module can't come into the browser — it imports `isemail`. The route refuses with an
+ * empty 400, so the rule is spelled out in the refusal instead.
+ */
+const saveDisplayName = (displayName: string): Promise<unknown> =>
+	call(`${where().accounts}/account/me/displayname`, {
+		method: 'PUT',
+		form: { displayName },
+		authed: true,
+		refusal:
+			"That display name can't be used. Use up to 15 letters, numbers, spaces and .,'!?_&()#@:+- — and no profanity.",
+	})
+
+/**
  * Set the account's email.
  *
  * The address is NOT checked here first. `accounts` validates it with `isemail`, which
@@ -3811,6 +3829,11 @@ function Dashboard({
 			render: () => <UsernameForm account={account} onChange={onChange} />,
 		},
 		{
+			id: 'displayname',
+			label: 'Display name',
+			render: () => <DisplayNameForm account={account} onChange={onChange} />,
+		},
+		{
 			id: 'email',
 			label: 'Email',
 			render: () => <EmailForm account={account} onChange={onChange} />,
@@ -4603,6 +4626,61 @@ function UsernameForm({
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending || spent || unchanged}>
 					{pending ? 'Changing…' : 'Change username'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+function DisplayNameForm({
+	account,
+	onChange,
+}: {
+	account: SelfAccount
+	onChange: (a: SelfAccount) => void
+}) {
+	const [displayName, setDisplayName] = useState(account.displayName)
+	const { pending, error, done, run } = useAction()
+
+	const unchanged = displayName.trim() === account.displayName
+
+	return (
+		<section className="card">
+			<h2>Display name</h2>
+			<p className="muted">
+				The name other players see in the game. Changing it doesn&apos;t change what you sign in
+				with.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const saved = displayName.trim()
+						await saveDisplayName(saved)
+						onChange({ ...account, displayName: saved })
+						setDisplayName(saved)
+						return 'Display name saved.'
+					})
+				}}
+			>
+				<label>
+					Display name
+					<input
+						type="text"
+						value={displayName}
+						autoComplete="nickname"
+						maxLength={15}
+						onChange={(e) => setDisplayName(e.target.value)}
+						required
+					/>
+					<span className="hint">
+						Up to 15 characters: letters, numbers, spaces and .,&apos;!?_&amp;()#@:+-
+					</span>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+				<button type="submit" disabled={pending || unchanged}>
+					{pending ? 'Saving…' : 'Save display name'}
 				</button>
 			</form>
 		</section>
