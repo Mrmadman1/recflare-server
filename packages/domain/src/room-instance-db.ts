@@ -504,15 +504,22 @@ export async function deleteEmptyRoomInstances(
  *
  * `gameVersion` is matched as a BUILD ({@link gameBuild}): `20250718.01` and `20250718.2`
  * both find the `20250718` session, which is what the rows store.
+ *
+ * `eventId` scopes the search to one player event's sessions, and the default 0 to the
+ * room's ordinary ones — the two never mix. An event matchmake only reuses an instance
+ * stamped with that event, so its guests gather in the event's session rather than
+ * scattering into whatever public instance the room has open; and a plain room matchmake
+ * never lands in an event's session, which for a private event is its guest list's alone.
  */
 export async function getJoinableInstance(
 	db: D1Database,
 	roomId: number,
 	gameVersion: string,
 	subRoomId?: number,
-	excludeInstanceId?: number
+	excludeInstanceId?: number,
+	eventId = 0
 ): Promise<RoomInstanceDto | null> {
-	const binds: Array<number | string> = [roomId, gameBuild(gameVersion) ?? '']
+	const binds: Array<number | string> = [roomId, gameBuild(gameVersion) ?? '', eventId]
 	const filters: string[] = []
 	if (subRoomId !== undefined) {
 		binds.push(subRoomId)
@@ -525,7 +532,7 @@ export async function getJoinableInstance(
 	const row = await db
 		.prepare(
 			`SELECT data FROM room_instance
-			 WHERE room_id = ?1 AND game_version = ?2
+			 WHERE room_id = ?1 AND game_version = ?2 AND COALESCE(event_id, 0) = ?3
 			   AND is_private = 0 AND is_full = 0 AND join_disabled = 0
 			   AND is_in_progress = 0
 			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${filters.join(' ')}

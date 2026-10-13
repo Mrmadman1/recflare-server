@@ -1070,7 +1070,8 @@ function roomInstanceFromRoom(
 	isPrivate: boolean,
 	instanceId: number,
 	photonRoomId: string,
-	subRoomId?: number
+	subRoomId?: number,
+	eventId = 0
 ) {
 	const f = instanceFieldsFromRoom(room, subRoomId)
 	// The same region the connection info names its Photon apps for — see photonApps.
@@ -1082,7 +1083,7 @@ function roomInstanceFromRoom(
 		roomInstanceType: f.roomInstanceType,
 		location: f.location,
 		dataBlob: f.dataBlob,
-		eventId: 0,
+		eventId,
 		clubId: 0,
 		roomCode: '',
 		photonRegion: region,
@@ -1518,7 +1519,8 @@ async function resolveRoomInstance(
 	isPrivate: boolean,
 	ownerId: number,
 	requestedSubRoomId?: number,
-	gateOnAccessibility = false
+	gateOnAccessibility = false,
+	eventId = 0
 ): Promise<ResolvedInstance> {
 	const id = Number.parseInt(roomKey, 10)
 	const requested = Number.isNaN(id)
@@ -1606,6 +1608,10 @@ async function resolveRoomInstance(
 	// reuses a public instance; an unpublished one reuses its single private session.
 	// A private matchmake into a published room always gets a fresh instance. Create
 	// one when there's nothing to join.
+	//
+	// An event's sessions are its own: an event matchmake reuses only an instance stamped
+	// with that event (and stamps the one it creates), and a room matchmake — `eventId` 0
+	// — never reuses an event's.
 	let instance = unpublished
 		? await getSharedPrivateInstance(
 				c.env.DB,
@@ -1616,7 +1622,14 @@ async function resolveRoomInstance(
 			)
 		: privateInstance
 			? null
-			: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
+			: await getJoinableInstance(
+					c.env.DB,
+					f.roomId,
+					gameVersion,
+					f.subRoomId,
+					currentInstanceId,
+					eventId
+				)
 	if (!instance) {
 		instance = await createRoomInstance(c.env.DB, {
 			ownerAccountId: ownerId,
@@ -1630,6 +1643,7 @@ async function resolveRoomInstance(
 			isPrivate: privateInstance || f.isDorm,
 			roomInstanceType: f.roomInstanceType,
 			gameVersion,
+			eventId,
 		})
 	}
 	return {
@@ -1639,7 +1653,8 @@ async function resolveRoomInstance(
 			privateInstance,
 			instance.roomInstanceId,
 			instance.photonRoomId,
-			f.subRoomId
+			f.subRoomId,
+			instance.eventId
 		),
 		errorCode: MatchmakingErrorCode.Success,
 	}
@@ -2428,12 +2443,16 @@ const app = new Hono<App>()
 			}
 
 			const { joinMode, additionalPlayerIds } = await readMatchmakeBody(c)
+			// The event id scopes the session: the caller joins an instance already stamped
+			// with this event, or opens one that is — never the room's ordinary instances.
 			const { instance, errorCode } = await resolveRoomInstance(
 				c,
 				String(event.RoomId),
 				joinMode === 2,
 				id,
-				event.SubRoomId ?? undefined
+				event.SubRoomId ?? undefined,
+				false,
+				eventId
 			)
 			if (!instance) return matchmakeResult(c, errorCode, null)
 			await enterRoom(c, id, instance)
@@ -2961,7 +2980,8 @@ const app = new Hono<App>()
 				stored.isPrivate,
 				stored.roomInstanceId,
 				stored.photonRoomId,
-				stored.subRoomId
+				stored.subRoomId,
+				stored.eventId
 			)
 			await enterRoom(c, id, instance)
 			return matchmakeResult(c, 0, instance)

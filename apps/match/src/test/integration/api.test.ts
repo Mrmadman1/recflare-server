@@ -1071,27 +1071,69 @@ describe('public endpoints', () => {
 			})
 		type Body = {
 			errorCode: number
-			roomInstance: { roomId: number; location: string; roomInstanceId: number } | null
+			roomInstance: {
+				roomId: number
+				location: string
+				roomInstanceId: number
+				eventId: number
+			} | null
 		}
 		const join = async (path: string, sub?: string) =>
 			(await (await matchmake(path, sub)).json()) as Body
 
-		// An invited player lands in an instance of the event's room (2)...
+		// An invited player lands in an instance of the event's room (2), which names the
+		// event it is for...
 		const invited = await join('/matchmake/event/8', '301')
 		expect(invited.errorCode).toBe(0)
-		expect(invited.roomInstance).toMatchObject({ roomId: 2, location: RECCENTER_SCENE })
+		expect(invited.roomInstance).toMatchObject({
+			roomId: 2,
+			location: RECCENTER_SCENE,
+			eventId: 8,
+		})
 
 		// ...recorded as their presence, like any other matchmake.
 		const row = await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
 			.bind(301)
 			.first<{ data: string }>()
-		const presence = JSON.parse(row!.data) as { roomInstance: { roomInstanceId: number } }
+		const presence = JSON.parse(row!.data) as {
+			roomInstance: { roomInstanceId: number; eventId: number }
+		}
 		expect(presence.roomInstance.roomInstanceId).toBe(invited.roomInstance!.roomInstanceId)
+		expect(presence.roomInstance.eventId).toBe(8)
+
+		// The instance itself is stamped, which is what the next guest's search matches on.
+		const stored = await env.DB.prepare('SELECT event_id FROM room_instance WHERE id = ?1')
+			.bind(invited.roomInstance!.roomInstanceId)
+			.first<{ event_id: number }>()
+		expect(stored!.event_id).toBe(8)
 
 		// The creator gets in, and so does someone who was invited and DECLINED — the row
-		// is the invite, whatever the answer.
-		expect((await join('/matchmake/event/8', '300')).errorCode).toBe(0)
+		// is the invite, whatever the answer. They join the SAME session: the event's.
+		const creator = await join('/matchmake/event/8', '300')
+		expect(creator.errorCode).toBe(0)
+		expect(creator.roomInstance).toMatchObject({
+			roomInstanceId: invited.roomInstance!.roomInstanceId,
+			eventId: 8,
+		})
 		expect((await join('/matchmake/event/8', '302')).errorCode).toBe(0)
+
+		// A plain matchmake into the same room stays out of the event's session, and
+		// another event in that room gets a session of its own.
+		const plain = await join('/matchmake/room/2', '399')
+		expect(plain.errorCode).toBe(0)
+		expect(plain.roomInstance!.eventId).toBe(0)
+		expect(plain.roomInstance!.roomInstanceId).not.toBe(invited.roomInstance!.roomInstanceId)
+		const other = await join('/matchmake/event/9', '303')
+		expect(other.roomInstance!.eventId).toBe(9)
+		expect(other.roomInstance!.roomInstanceId).not.toBe(invited.roomInstance!.roomInstanceId)
+
+		// Coming back to the event from elsewhere lands in the event's session again, not
+		// the room's ordinary one.
+		expect((await join('/matchmake/room/2', '300')).roomInstance!.eventId).toBe(0)
+		expect((await join('/matchmake/event/8', '300')).roomInstance).toMatchObject({
+			roomInstanceId: invited.roomInstance!.roomInstanceId,
+			eventId: 8,
+		})
 
 		// A stranger doesn't — and is told why (35 EventIsPrivate), not fobbed off with 20.
 		expect(await join('/matchmake/event/8', '399')).toEqual(refused(35))
