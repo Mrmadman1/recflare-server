@@ -3711,6 +3711,33 @@ describe('econ endpoints', () => {
 		})
 	})
 
+	test('POST /api/timedCurrencyGrants/update serves the stub grant', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/timedCurrencyGrants/update`, {
+			method: 'POST',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			TimedCurrencyGrantId: 1,
+			Name: 'Daily Tokens',
+			StartTime: '2026-10-01T00:00:00Z',
+			EndTime: '2026-12-01T00:00:00Z',
+			CurrencyType: 0,
+			OfflineRatePerHour: 1,
+			OnlineRatePerHour: 5,
+			ActiveExperiment: null,
+		})
+	})
+
+	test('POST /api/distanceMovedRewardTracks/distance is a stub: answers an empty 200', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/distanceMovedRewardTracks/distance`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'distanceMeters=12.5',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('')
+	})
+
 	test('GET /econ/roomEconConfig/:roomId echoes the room and disables sorting tabs', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/econ/roomEconConfig/92`)
 		expect(anon.status).toBe(401)
@@ -7348,6 +7375,7 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
 			'POST /api/consumables/v1/updateActive',
+			'POST /api/distanceMovedRewardTracks/distance',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/influencerpartnerprogram/remove',
@@ -7372,6 +7400,7 @@ describe('econ endpoints', () => {
 			'POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency',
 			'POST /api/storefronts/v2/buyItem',
 			'POST /api/storefronts/v3/buyInvention',
+			'POST /api/timedCurrencyGrants/update',
 			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
 			'PUT /api/roomconsumables/v1/roomConsumable',

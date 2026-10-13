@@ -4817,6 +4817,44 @@ const app = new Hono<App>({ strict: false })
 			})
 	)
 
+	// The timed currency grant the client polls. A stub: nothing accrues or is granted yet,
+	// so every caller is served the one example grant below, verbatim. Takes no body.
+	.post(
+		'/api/timedCurrencyGrants/update',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The timed currency grant (stub)',
+			description: 'A fixed example grant — no timed grant is stored or paid out yet.',
+			responses: { 200: json(JsonObject, 'The timed currency grant') },
+		}),
+		(c) =>
+			c.json({
+				TimedCurrencyGrantId: 1,
+				Name: 'Daily Tokens',
+				StartTime: '2026-10-01T00:00:00Z',
+				EndTime: '2026-12-01T00:00:00Z',
+				CurrencyType: 0,
+				OfflineRatePerHour: 1.0,
+				OnlineRatePerHour: 5.0,
+				ActiveExperiment: null,
+			})
+	)
+
+	// The client reporting how far the player has moved, towards a distance-moved reward
+	// track. A stub: the form body (`distanceMeters=12.5`) is not read, nothing is tracked,
+	// and the answer is an empty 200.
+	.post(
+		'/api/distanceMovedRewardTracks/distance',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Report distance moved (stub)',
+			description:
+				'Takes a form-encoded `distanceMeters` and stores nothing — no reward track exists yet.',
+			responses: { 200: { description: 'Empty body' } },
+		}),
+		(c) => c.body(null, 200)
+	)
+
 	// Everything a room sells, in one list: its keys, its consumables and the purchase offers
 	// of its currencies, each as the client's 10-key `UgcPurchasableItem` with `ItemType`
 	// saying which (0 key, 1 consumable, 3 currency pack). Asked for on every room load. A
