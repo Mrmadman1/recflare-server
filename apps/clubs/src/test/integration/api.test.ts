@@ -78,10 +78,11 @@ describe('clubs endpoints', () => {
 		expect(res.status).toBe(401)
 	})
 
-	test('GET /club/home/me 404s when the player has no home club', async () => {
-		// The client expects a 404 here, and errors on an empty object.
+	test('GET /club/home/me answers a literal null when the player has no home club', async () => {
+		// Not a 404, and not an empty object.
 		const res = await exports.default.fetch(`${ORIGIN}/club/home/me`, { headers: await bearer() })
-		expect(res.status).toBe(404)
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('null')
 	})
 
 	test('GET /subscription/details/:subscription returns an empty object', async () => {
@@ -777,11 +778,12 @@ describe('clubs endpoints', () => {
 		})
 		const clubId = ((await create.json()) as { value: { ClubId: number } }).value.ClubId
 
-		// No home club yet → 404.
+		// No home club yet → null.
 		const before = await exports.default.fetch(`${ORIGIN}/club/home/me`, {
 			headers: await bearer('9100'),
 		})
-		expect(before.status).toBe(404)
+		expect(before.status).toBe(200)
+		expect(await before.json()).toBeNull()
 
 		// You must be a member of the club you're making your home.
 		expect((await form('/club/home/me', 'PUT', `clubId=${clubId}`, '9101')).status).toBe(403)
@@ -793,11 +795,11 @@ describe('clubs endpoints', () => {
 		expect(set.status).toBe(200)
 		expect(await set.json()).toMatchObject({ error: '', success: true })
 
-		// The club has no clubhouse room yet, so there's still nowhere to spawn → 404.
+		// The club has no clubhouse room yet, so there's still nowhere to spawn → null.
 		const noClubhouse = await exports.default.fetch(`${ORIGIN}/club/home/me`, {
 			headers: await bearer('9100'),
 		})
-		expect(noClubhouse.status).toBe(404)
+		expect(await noClubhouse.json()).toBeNull()
 
 		// Give it a clubhouse → the home club now resolves.
 		const clubhouse = await form(`/club/${clubId}/clubhouse`, 'PUT', 'roomId=77', '9100')
@@ -825,7 +827,7 @@ describe('clubs endpoints', () => {
 		const cleared = await exports.default.fetch(`${ORIGIN}/club/home/me`, {
 			headers: await bearer('9100'),
 		})
-		expect(cleared.status).toBe(404)
+		expect(await cleared.json()).toBeNull()
 
 		// DELETE clears it too, ignoring any body it's sent.
 		await form(`/club/${clubId}/clubhouse`, 'PUT', 'roomId=88', '9100')
@@ -846,9 +848,10 @@ describe('clubs endpoints', () => {
 		expect(dropped.status).toBe(200)
 		expect(await dropped.json()).toEqual({ error: '', success: true, value: null })
 		expect(
-			(await exports.default.fetch(`${ORIGIN}/club/home/me`, { headers: await bearer('9100') }))
-				.status
-		).toBe(404)
+			await (
+				await exports.default.fetch(`${ORIGIN}/club/home/me`, { headers: await bearer('9100') })
+			).json()
+		).toBeNull()
 		// Still a member of the club they'd made their home.
 		const mine = (await (
 			await exports.default.fetch(`${ORIGIN}/club/mine/member`, { headers: await bearer('9100') })
