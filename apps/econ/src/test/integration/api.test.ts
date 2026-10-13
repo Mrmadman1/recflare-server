@@ -3772,10 +3772,20 @@ describe('econ endpoints', () => {
 		}
 	})
 
-	test('GET /api/consumables/v1/all is a stub: returns []', async () => {
+	test('GET /api/consumables/v1/all serves the consumable definitions', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/all?supportedVersion=2`)
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		const body = await res.json<Array<Record<string, unknown>>>()
+		expect(body.length).toBeGreaterThan(0)
+		expect(body[0]).toMatchObject({
+			ConsumableItemId: 1,
+			ConsumableItemDesc: 'frOMH6WxDEG1fBqC4_83vg',
+			FriendlyName: 'Black & White Camera Film',
+		})
+		// ConfigurationData is JSON escaped into a string (or null), never a nested object.
+		for (const item of body) {
+			expect(item.ConfigurationData === null || typeof item.ConfigurationData === 'string').toBe(true)
+		}
 	})
 
 	test('GET /api/consumables/v2/getUnlocked 401s without a token, returns []', async () => {

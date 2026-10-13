@@ -42,6 +42,7 @@ import { censorSwears } from '../../api/src/sanitize'
 import { BalanceAddType } from '../../notify/src/notification-payloads'
 import { NotificationType } from '../../notify/src/notification-types'
 import adCarouselItems from '../static/ad-carousel-items.json'
+import consumableDefinitions from '../static/consumables.json'
 import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
@@ -4976,19 +4977,19 @@ const app = new Hono<App>({ strict: false })
 	)
 
 	// The consumable DEFINITIONS the client knows how to use (`?supportedVersion=2`), as
-	// opposed to the ones a player owns. A stub: none are served yet, so the list is empty.
-	// A real row is `{ ConsumableItemDesc, InitialCount, CreatedAt, ThumbnailImageName,
-	// FriendlyName, RoomieCategory, ConsumableToolName, ConfigurationData }`, where
-	// `ConfigurationData` is JSON escaped into a STRING (`"{\"MeshConfigurationData\":null,…}"`).
+	// opposed to the ones a player owns. Served verbatim from `static/consumables.json`, the
+	// live game's list; `supportedVersion` is accepted and unused. A row's `ConfigurationData`
+	// is JSON escaped into a STRING (`"{\"MeshConfigurationData\":null,…}"`), or null.
 	.get(
 		'/api/consumables/v1/all',
 		describeRoute({
 			tags: ['Consumables'],
-			summary: 'All consumable definitions (stub)',
-			description: 'Always [] — no consumable definitions are served yet.',
-			responses: { 200: json(JsonArray, 'The consumable definitions (always empty)') },
+			summary: 'All consumable definitions',
+			description:
+				'Every consumable definition, verbatim from static/consumables.json. supportedVersion is ignored.',
+			responses: { 200: json(JsonArray, 'The consumable definitions') },
 		}),
-		(c) => c.json([])
+		(c) => c.json(consumableDefinitions)
 	)
 
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from
