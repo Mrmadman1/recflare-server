@@ -2081,6 +2081,14 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(400)
 	})
 
+	test('GET /api/players/v1/progression/xpEarnedToday is a bare 0', async () => {
+		// A plain int on the client. It must not fall through to `/progression/:id`, which
+		// would read the path segment as an account id and answer a progression OBJECT.
+		const res = await exports.default.fetch(`${ORIGIN}/api/players/v1/progression/xpEarnedToday`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(0)
+	})
+
 	test('GET /api/progressionEvents/active is a bare 18 (no auth)', async () => {
 		// A hardcoded stub: the id of an archived event (0 would mean "no active event").
 		// A 404 would stall the client's load instead.
@@ -10208,6 +10216,7 @@ describe('openapi', () => {
 			'GET /api/playerevents/v1/{eventId}/responses',
 			'GET /api/playerevents/v2/{eventId}',
 			'GET /api/players/v1/playerPhotoTaggingSetting',
+			'GET /api/players/v1/progression/xpEarnedToday',
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/progressionEvents/active',

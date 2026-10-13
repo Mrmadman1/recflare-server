@@ -297,6 +297,28 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 		}),
 		async (c) => c.json(await getReputation(c.env.DB, Number.parseInt(c.req.param('id'), 10)))
 	)
+	// How much XP the caller has earned today — what the client measures against its daily
+	// XP cap. A BARE INTEGER (the client decodes a plain `int`), not a progression record.
+	//
+	// Registered BEFORE `/progression/:id` below, which otherwise takes `xpEarnedToday` as
+	// an account id and answers `{ PlayerId: null, Level: 1, XP: 0 }` — the client's decoder
+	// threw on that (`expected:'Number Token', actual:'{'`).
+	//
+	// STUB: always 0. Nothing here records when XP was earned, only the running total. No
+	// auth while the answer is the same for everybody; it will need the caller once it is
+	// real, since the path names no player.
+	.get(
+		'/api/players/v1/progression/xpEarnedToday',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'XP the caller earned today (stub)',
+			description:
+				'The XP earned so far today, as a bare integer. Always `0` — XP is banked as a ' +
+				'running total and nothing records when it was earned.',
+			responses: { 200: json(BareInteger, 'A bare `0`') },
+		}),
+		(c) => c.json(0)
+	)
 	.get(
 		'/api/players/v1/progression/:id',
 		describeRoute({
