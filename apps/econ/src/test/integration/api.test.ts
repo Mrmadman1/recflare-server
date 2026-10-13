@@ -3997,7 +3997,7 @@ describe('econ endpoints', () => {
 		expect((await store(await at('not-a-build'))).StoreItems).toHaveLength(sf3.StoreItems.length)
 
 		// Later builds get the 2025 store — bigger, and still storefront 3.
-		for (const version of ['20230616', '20250424.01', '20250718.01']) {
+		for (const version of ['20230616', '20250424.01', '20250718.01', '20260323.14']) {
 			const newer = await store(await at(version))
 			expect(newer.StorefrontType, version).toBe(3)
 			expect(newer.StoreItems.length, version).toBe(sf32025.StoreItems.length)
