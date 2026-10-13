@@ -4975,6 +4975,22 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
+	// The consumable DEFINITIONS the client knows how to use (`?supportedVersion=2`), as
+	// opposed to the ones a player owns. A stub: none are served yet, so the list is empty.
+	// A real row is `{ ConsumableItemDesc, InitialCount, CreatedAt, ThumbnailImageName,
+	// FriendlyName, RoomieCategory, ConsumableToolName, ConfigurationData }`, where
+	// `ConfigurationData` is JSON escaped into a STRING (`"{\"MeshConfigurationData\":null,…}"`).
+	.get(
+		'/api/consumables/v1/all',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'All consumable definitions (stub)',
+			description: 'Always [] — no consumable definitions are served yet.',
+			responses: { 200: json(JsonArray, 'The consumable definitions (always empty)') },
+		}),
+		(c) => c.json([])
+	)
+
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from
 	// `buyItem`, stored in the `consumable` table), grouped by item into the client's
 	// unlocked-consumable DTO. A player who has bought none gets an empty list.

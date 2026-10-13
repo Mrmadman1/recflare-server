@@ -3772,6 +3772,12 @@ describe('econ endpoints', () => {
 		}
 	})
 
+	test('GET /api/consumables/v1/all is a stub: returns []', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/all?supportedVersion=2`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+	})
+
 	test('GET /api/consumables/v2/getUnlocked 401s without a token, returns []', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`)
 		expect(anon.status).toBe(401)
@@ -7329,6 +7335,7 @@ describe('econ endpoints', () => {
 			'GET /api/challenge/v2/getCurrent',
 			'GET /api/checklist/v1/current',
 			'GET /api/checklist/v2/current',
+			'GET /api/consumables/v1/all',
 			'GET /api/consumables/v2/getUnlocked',
 			'GET /api/equipment/v2/getUnlocked',
 			'GET /api/gamerewards/v1/pending',
