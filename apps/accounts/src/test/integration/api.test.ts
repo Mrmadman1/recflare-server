@@ -272,7 +272,7 @@ describe('auth-gated endpoints', () => {
 			...(await bearer('895')),
 			'Content-Type': 'application/x-www-form-urlencoded',
 		}
-		// A name carries no spaces, so the filter has to find the swear at the seam the
+		// These names carry no spaces, so the filter has to find the swear at the seam the
 		// player typed instead of one.
 		for (const displayName of ['fuck', 'ShitLord', 'Fucker123']) {
 			const res = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
@@ -741,8 +741,9 @@ describe('auth-gated endpoints', () => {
 	})
 })
 
-// The names a player chooses are alphanumeric and length-capped, by the same rule the
-// `rooms` worker applies (see `nameRejection` in @repo/domain). The three limits come
+// The names a player chooses are charset- and length-capped by the rules in @repo/domain:
+// a username is alphanumeric (`nameRejection`), a display name takes the wider charset
+// the client's own box does (`displayNameRejection`). The limits come
 // from the client's own input boxes rather than a round number, so anything stored is
 // something the game can render and re-edit.
 //
@@ -787,25 +788,44 @@ describe('name, email and bio validation', () => {
 		expect(((await ok.json()) as { success: boolean }).success).toBe(true)
 	})
 
-	test('PUT /account/me/displayname refuses anything but letters and digits, max 15', async () => {
+	test('PUT /account/me/displayname holds a name to the client charset, max 15', async () => {
 		const headers = await authed('8802')
-		for (const displayName of ['has space', 'punct!', 'a'.repeat(16)]) {
-			const res = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
+		const put = (displayName: string) =>
+			exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
 				...form({ displayName }),
 				headers,
 			})
+
+		// The Rec Room build's own rule: ^[\p{Latin}0-9 .,'!?_&()#@:+-]+$
+		for (const displayName of ['has space', 'punct!', 'café', "O'Neil_Jr.", '(a)&b#1@c:+-,?']) {
+			expect((await put(displayName)).status, displayName).toBe(200)
+		}
+
+		for (const displayName of [
+			'semi;colon',
+			'star*',
+			'sla/sh',
+			'Привет',
+			'名前',
+			'smile😀',
+			'a'.repeat(16),
+		]) {
 			// An empty 400, matching what this route already answers for an empty name —
 			// it acks with a bare `{ success: true }` and has never sent the client a body
 			// on failure.
-			expect(res.status, displayName).toBe(400)
+			expect((await put(displayName)).status, displayName).toBe(400)
+		}
+
+		// Trimmed before it is checked, so a name of nothing but spaces is an empty one.
+		expect((await put('   ')).status).toBe(400)
+
+		// A swear set off by the punctuation the charset now allows is still a swear.
+		for (const displayName of ['shit lord', 'Shit_Lord', 'fuck.you', 'fuck!']) {
+			expect((await put(displayName)).status, displayName).toBe(400)
 		}
 
 		// 15 is the client's box, so it must fit.
-		const ok = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
-			...form({ displayName: 'a'.repeat(15) }),
-			headers,
-		})
-		expect(ok.status).toBe(200)
+		expect((await put('a'.repeat(15))).status).toBe(200)
 	})
 
 	// Syntax comes from the `isemail` package rather than a pattern written here — this is

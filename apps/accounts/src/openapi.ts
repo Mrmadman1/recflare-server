@@ -2,6 +2,7 @@ import { resolver } from 'hono-openapi'
 import { z } from 'zod'
 
 import {
+	displayNameRejection,
 	isValidBio,
 	isValidEmail,
 	MAX_DISPLAY_NAME_LENGTH,
@@ -181,12 +182,12 @@ export const CreateAccountRequest = z.object({
  * sentence that explains it rather than two, and the swear check never sees the
  * punctuation the charset rule has already refused.
  */
-const nameCheck = (label: string, max: number) =>
+const nameCheck = (label: string, rejectionFor: (value: string) => string | null) =>
 	z
 		.string()
 		.trim()
 		.superRefine((value, ctx) => {
-			const rejection = nameRejection(value, label, max)
+			const rejection = rejectionFor(value)
 			if (rejection !== null) {
 				ctx.addIssue({ code: 'custom', message: rejection })
 			} else if (nameContainsSwears(value)) {
@@ -197,15 +198,15 @@ const nameCheck = (label: string, max: number) =>
 		})
 
 export const DisplayNameRequest = z.object({
-	displayName: nameCheck('display name', MAX_DISPLAY_NAME_LENGTH)
+	displayName: nameCheck('display name', displayNameRejection)
 		.min(1)
 		.describe(
-			'Trimmed; letters and digits only, max 15, no profanity. Empty or invalid is rejected (400)'
+			`Trimmed; Latin letters, digits, spaces and .,'!?_&()#@:+- only, max ${MAX_DISPLAY_NAME_LENGTH}, no profanity. Empty or invalid is rejected (400)`
 		),
 })
 
 export const UsernameRequest = z.object({
-	username: nameCheck('username', MAX_USERNAME_LENGTH)
+	username: nameCheck('username', (value) => nameRejection(value, 'username', MAX_USERNAME_LENGTH))
 		.min(1, 'You must enter a username.')
 		.describe(
 			'Trimmed; letters and digits only, max 50, no profanity. Must be unique and changes must remain'

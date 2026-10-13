@@ -116,6 +116,34 @@ export function nameRejection(value: string, label: string, max: number): string
 }
 
 /**
+ * The display name charset, taken from the Rec Room build's own check rather than chosen
+ * here: Latin-script letters (accented ones included), digits, spaces and the punctuation
+ * listed. Wider than `NAME_PATTERN` because a display name is a label other players read,
+ * not something typed into a sign-in box — the username stays on the narrow rule.
+ *
+ * Matching the client matters in both directions: a narrower rule refuses a name the
+ * game's own box accepted, and a wider one stores a name the game can't re-enter. The
+ * dash stays last in the class so it reads as a literal rather than a range.
+ */
+const DISPLAY_NAME_PATTERN = /^[\p{Script=Latin}0-9 .,'!?_&()#@:+-]+$/u
+
+/**
+ * Why a player-supplied display name is unacceptable, or `null` when it's fine.
+ *
+ * Callers pass the TRIMMED name. Length is counted in code points, since the charset now
+ * reaches letters outside the basic plane.
+ */
+export function displayNameRejection(value: string): string | null {
+	if (glyphLength(value) > MAX_DISPLAY_NAME_LENGTH) {
+		return `Your display name can be at most ${MAX_DISPLAY_NAME_LENGTH} characters.`
+	}
+	if (!DISPLAY_NAME_PATTERN.test(value)) {
+		return "Your display name can only contain letters, numbers, spaces and .,'!?_&()#@:+-"
+	}
+	return null
+}
+
+/**
  * Letters, digits and underscores — `NAME_PATTERN` plus the one separator a room name is
  * allowed. A room name is a label other players read in a browse tile rather than
  * something typed into a sign-in box, and the underscore is how players write the space
