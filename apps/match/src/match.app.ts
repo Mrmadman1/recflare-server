@@ -1889,6 +1889,23 @@ const app = new Hono<App>()
 		(c) => c.json({ errorCode: 0 })
 	)
 
+	// The client asks whether its `LoginLock` still holds the session. Nothing enforces the
+	// lock yet (see exclusivelogin), so every lock verifies: a bare 200, no body.
+	.post(
+		'/player/verifylock',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'Verify the session login lock (no-op)',
+			description: [
+				'Asks whether the session `LoginLock` is still the live one. Login locking is not',
+				'enforced, so this always acks. Empty ack — there is no response shape.',
+			].join(' '),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID'),
+			responses: { 200: EMPTY_OK },
+		}),
+		(c) => c.body(null, 200)
+	)
+
 	// Logout clears the player's presence so they read offline immediately and the
 	// instance they were in frees up (rather than waiting out the presence TTL).
 	//

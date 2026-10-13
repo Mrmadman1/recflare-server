@@ -342,6 +342,12 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual({ errorCode: 0 })
 	})
 
+	test('POST /player/verifylock returns 200 with no body', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/player/verifylock`, { method: 'POST' })
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('')
+	})
+
 	test('POST /player/notifydisconnect returns 200', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/notifydisconnect`, {
 			method: 'POST',
