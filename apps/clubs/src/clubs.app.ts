@@ -214,9 +214,9 @@ const app = new Hono<App>()
 	.notFound(withNotFound())
 
 	// The player's home club — the one whose clubhouse they spawn into, stored on their
-	// account. Auth-gated. A literal JSON `null` (200) when they have no home club, the
-	// club is gone, or it has no clubhouse room — not a 404, and not an empty object.
-	// Returns the bare club (not the envelope), as the reference does.
+	// account. Auth-gated. 404 when they have no home club, the club is gone, or it has
+	// no clubhouse room: the client expects a 404 for "no home club" and errors on an
+	// empty object. Returns the bare club (not the envelope), as the reference does.
 	.get(
 		'/club/home/me',
 		describeRoute({
@@ -224,9 +224,9 @@ const app = new Hono<App>()
 			summary: 'The player’s home club',
 			description: [
 				'The club whose clubhouse the player spawns into (a field on their account row).',
-				'A literal JSON `null` when they have no home club, the club is gone, or it has no',
-				'clubhouse room — not a 404, and not an empty object. Returns the bare club, not',
-				'the envelope, as the reference does.',
+				'404 when they have no home club, the club is gone, or it has no clubhouse room —',
+				'the client expects a 404 for “no home club” and errors on an empty object. Returns',
+				'the bare club, not the envelope, as the reference does.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
@@ -239,7 +239,7 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return c.body(null, 401)
 			const club = await getHomeClub(c.env.DB, id)
-			return c.json(club)
+			return club === null ? c.notFound() : c.json(club)
 		}
 	)
 
