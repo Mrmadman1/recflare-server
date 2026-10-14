@@ -134,6 +134,7 @@ import {
 	PurchaseRoomCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyResponse,
+	QueryConsumablesRequest,
 	ReferralProgressResponse,
 	RemoveInfluencerBody,
 	RoomConsumableDto,
@@ -4990,6 +4991,34 @@ const app = new Hono<App>({ strict: false })
 			responses: { 200: json(JsonArray, 'The consumable definitions') },
 		}),
 		(c) => c.json(consumableDefinitions)
+	)
+
+	// STUB. The client's lookup of consumable definitions by descriptor
+	// (`?configurationVersion=2`), form-encoded with one repeated key:
+	// `descriptors=xfeDIDboPES-AS90CCn2xQ&descriptors=test_bad`. The answer is an array of
+	// definitions — `{ ConsumableItemDesc, InitialCount, CreatedAt, ThumbnailImageName,
+	// FriendlyName, RoomieCategory, ConsumableToolName, ConfigurationData }`, with
+	// `ConfigurationData` JSON escaped into a string as on `/all` — holding only the
+	// descriptors that resolve. Nothing here can resolve one yet, so every query answers [].
+	.post(
+		'/api/consumables/v1/query/bulk',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'Look up consumable definitions by descriptor (stub)',
+			description: [
+				'STUB. Takes a form body repeating `descriptors` once per consumable descriptor and',
+				'answers the definitions that resolve. There is no lookup behind it yet, so the',
+				'answer is always []. configurationVersion is ignored.',
+			].join(' '),
+			requestBody: form(QueryConsumablesRequest, 'The descriptors to look up'),
+			responses: { 200: json(JsonArray, 'The matching definitions (always empty for now)') },
+		}),
+		async (c) => {
+			const body = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>)
+			const descriptors = body['descriptors']
+			logger.info('consumable query/bulk (stub, nothing resolved)', { descriptors })
+			return c.json([])
+		}
 	)
 
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from

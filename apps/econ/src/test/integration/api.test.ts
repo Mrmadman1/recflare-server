@@ -3798,6 +3798,19 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
+	test('POST /api/consumables/v1/query/bulk is a stub: resolves nothing, answers []', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/consumables/v1/query/bulk?configurationVersion=2`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'descriptors=xfeDIDboPES-AS90CCn2xQ&descriptors=test_bad',
+			}
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+	})
+
 	test('POST /api/consumables/v1/updateActive is a stub: auth-gated, stores nothing, answers nothing', async () => {
 		const before = await env.DB.prepare('SELECT * FROM consumable ORDER BY id').all()
 		const body = { Id: 7550, IsActive: true, ActivatedByRoomie: false }
@@ -7391,6 +7404,7 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v1/complete',
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
+			'POST /api/consumables/v1/query/bulk',
 			'POST /api/consumables/v1/updateActive',
 			'POST /api/distanceMovedRewardTracks/distance',
 			'POST /api/equipment/v1/update',

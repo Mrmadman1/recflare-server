@@ -1300,6 +1300,17 @@ export const ConsumeConsumableRequest = z.object({
 })
 
 /**
+ * `POST /api/consumables/v1/query/bulk` form body — `descriptors` repeated once per
+ * consumable to look up.
+ */
+export const QueryConsumablesRequest = z.object({
+	descriptors: z
+		.union([z.string(), z.array(z.string())])
+		.optional()
+		.describe('A ConsumableItemDesc; the key repeats for each one asked about'),
+})
+
+/**
  * `POST /api/consumables/v1/updateActive` JSON body — the client marking one of its
  * consumables active or not. Accepted and NOT acted on yet; see the route.
  */
