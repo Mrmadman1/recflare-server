@@ -168,7 +168,7 @@ import {
 	WishlistItemList,
 	WishlistItemRequest,
 } from './openapi'
-import { claimReward, isNewActivity } from './reward-db'
+import { claimDailyTokens, claimReward, DAILY_REWARD_COOLDOWN_MS } from './reward-db'
 import {
 	awardRoomConsumable,
 	getRoomConsumable,
@@ -2285,29 +2285,46 @@ const GIFT_CONTEXT_GAME_REWARDS = 50
 const DEFAULT_GAME_REWARD_MESSAGE = 'Reward earned!'
 
 /**
- * Tokens paid the FIRST time a player completes an activity — a `giftContext` no row of
- * theirs in `reward_status` has seen before, whatever the reward type. A one-off per
- * activity on top of the hourly XP: the reward for trying something new, sized as a
- * visible nudge (a cheap catalog item) rather than an income, since the catalog of
- * activities is finite and each pays it exactly once.
+ * Tokens paid with each claimed {@link TOKEN_REWARD_TYPES} reward, until the player has had
+ * {@link GAME_REWARD_DAILY_TOKEN_CAP} in the current 24h window — whatever the activity.
+ * The running total is the player's `$tokens` row in `reward_status` (`claimDailyTokens`).
  */
-const NEW_ACTIVITY_BONUS_TOKENS = 250
+const GAME_REWARD_TOKENS = 250
+
+/**
+ * The most game-reward tokens a player earns in one rolling 24h window: five claims' worth.
+ * A multiple of {@link GAME_REWARD_TOKENS} — a claim that would cross it pays nothing.
+ */
+const GAME_REWARD_DAILY_TOKEN_CAP = 1250
+
+/**
+ * The reward types whose tokens draw on the daily allowance: the client's ask after a match
+ * and after a quest. {@link FIRST_ACTIVITY_OF_DAY} pays its own on top, outside the cap.
+ */
+const TOKEN_REWARD_TYPES = new Set(['PostGameActivity', 'PostQuestActivity'])
+
+/**
+ * The once-a-day bonus. Its claim is per PLAYER — keyed on the empty context whatever
+ * activity asked — on a 24h cooldown, and it pays {@link GAME_REWARD_TOKENS} outside the
+ * daily cap: the claim itself is what limits it, so it needs no allowance row.
+ */
+const FIRST_ACTIVITY_OF_DAY = 'FirstActivityOfDay'
 
 /**
  * `GiftContext.GameRewardsTokens` — the tokens variant of {@link GIFT_CONTEXT_GAME_REWARDS},
- * on the box the new-activity bonus arrives in.
+ * on the box the token payout arrives in.
  */
 const GIFT_CONTEXT_GAME_REWARDS_TOKENS = 51
 
-/** The message on the new-activity bonus box. */
-const NEW_ACTIVITY_BONUS_MESSAGE = 'New activity bonus!'
+/** The message on the token payout's box. */
+const GAME_REWARD_TOKENS_MESSAGE = 'Activity bonus!'
 
 /**
- * The gift-drop the new-activity bonus hands over: tokens in a box, no item, no XP. Like
+ * The gift-drop a claimed game reward's token payout hands over: tokens in a box, no item, no XP. Like
  * {@link toGameRewardDrop}, `grantGiftDrop` creates only the box from it — the tokens are
  * credited to the balance separately, and the copy here is what the box displays.
  */
-function toNewActivityBonusDrop(): StoreGiftDrop {
+function toGameRewardTokensDrop(): StoreGiftDrop {
 	return {
 		FriendlyName: '',
 		Tooltip: '',
@@ -2318,7 +2335,7 @@ function toNewActivityBonusDrop(): StoreGiftDrop {
 		EquipmentModificationGuid: '',
 		Rarity: 0,
 		Context: GIFT_CONTEXT_GAME_REWARDS_TOKENS,
-		Currency: NEW_ACTIVITY_BONUS_TOKENS,
+		Currency: GAME_REWARD_TOKENS,
 		CurrencyType: CurrencyType.RecCenterTokens,
 		Xp: 0,
 	}
@@ -6031,7 +6048,8 @@ const app = new Hono<App>({ strict: false })
 	// posting the type and the message to show for it (`rewardType=FirstActivityOfDay&
 	// Message=First Game of the Day`, or `rewardType=PostGameActivity&Message=Activity
 	// completed!&giftContext=Soccer`) — so whether a reward is actually OWED is decided
-	// here, from `reward_status`: one claim per type per activity per hour, atomically.
+	// here, from `reward_status`: one claim per type per activity per hour, atomically —
+	// except FirstActivityOfDay, one per player per 24h.
 	//
 	// A claim pays GAME_REWARD_XP into `progression` and hands over a gift box carrying that
 	// XP, announced with the same GiftPackageReceivedImmediate frame the weekly gift uses —
@@ -6043,19 +6061,20 @@ const app = new Hono<App>({ strict: false })
 	// reference answers its own (different, selection-based) flow with a success envelope,
 	// not a list of rewards.
 	//
-	// `giftContext` (the activity, e.g. `Soccer`) is part of the cooldown key: the first
-	// activity of the day is per ACTIVITY, so a player who moves from Soccer to Paintball is
-	// owed another reward while a second Soccer match inside the hour is not. An ask that
-	// sends no context keys on `''`.
+	// `giftContext` (the activity, e.g. `Soccer`) is part of the cooldown key, so a player who
+	// moves from Soccer to Paintball is owed another reward while a second Soccer match inside
+	// the hour is not. An ask that sends no context keys on `''` — as FirstActivityOfDay always
+	// does, being the player's first activity of the day, not each activity's.
 	//
 	// It also picks the PRIZE: a context that is a key of `static/quest-rewards.json`
 	// (`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity's rewards — an avatar item
 	// granted into the inventory, or Laser Tag's ticket payout — and the box carries it, with
 	// the activity's own `GiftContext`. A context the table doesn't know gets the XP-only box.
 	//
-	// And the FIRST claim ever in a context — a new activity for this player, whichever type
-	// asked — pays NEW_ACTIVITY_BONUS_TOKENS on top, credited to the balance and delivered in
-	// a second box of its own so the player sees what the tokens were for.
+	// A `PostGameActivity`/`PostQuestActivity` claim also pays GAME_REWARD_TOKENS, up to
+	// GAME_REWARD_DAILY_TOKEN_CAP per player per rolling 24h across every activity, and a
+	// FirstActivityOfDay claim pays them on top of the cap — credited to the balance and
+	// delivered in a second box of its own so the player sees what the tokens were for.
 	.post(
 		'/api/gamerewards/v1/request',
 		describeRoute({
@@ -6067,9 +6086,11 @@ const app = new Hono<App>({ strict: false })
 				'owed another reward while the same one is not; an ask with no `giftContext` keys on',
 				'the empty context. A `giftContext` that names an activity in `quest-rewards.json`',
 				'(`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity’s rewards and grants it;',
-				'any other claim pays XP only. The first claim ever in a `giftContext` — a new activity',
-				'for the player — also pays a one-off 250 tokens, in a box of its own. The reward rides',
-				'in a gift box, so a claim and a rejected (on-cooldown) ask both answer `[]`.',
+				'any other claim pays XP only. A `PostGameActivity` or `PostQuestActivity` claim also',
+				'pays 250 tokens, in a box of its own, up to 1250 per player per rolling 24 hours',
+				'whatever the activity. `FirstActivityOfDay` is once per player per 24 hours, whatever',
+				'the `giftContext`, and pays 250 tokens outside that cap. The reward rides in a gift',
+				'box, so a claim and a rejected (on-cooldown) ask both answer `[]`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
@@ -6086,7 +6107,12 @@ const app = new Hono<App>({ strict: false })
 			// No type, nothing to gate: don't write a row keyed on an empty string.
 			if (rewardType === '') return c.json([])
 			const giftContext = typeof body.giftContext === 'string' ? body.giftContext : ''
-			const claimed = await claimReward(c.env.DB, id, rewardType, giftContext)
+			// FirstActivityOfDay is the player's, not the activity's: claimed on the empty context
+			// and a day's cooldown. Its prize is still picked from the activity that asked.
+			const daily = rewardType === FIRST_ACTIVITY_OF_DAY
+			const claimed = daily
+				? await claimReward(c.env.DB, id, rewardType, '', new Date(), DAILY_REWARD_COOLDOWN_MS)
+				: await claimReward(c.env.DB, id, rewardType, giftContext)
 			// On cooldown: nothing was claimed, so nothing is paid and nothing is announced.
 			if (claimed === null) return c.json([])
 			const message =
@@ -6107,8 +6133,8 @@ const app = new Hono<App>({ strict: false })
 			// A currency reward (Laser Tag's tickets) is credited here: `grantGiftDrop` grants
 			// items, not balances. Seed the signup grant first — `creditCurrency` upserts the
 			// row, and a never-touched RecCenterTokens balance would otherwise lose it.
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 			if (drop.Currency > 0 && drop.CurrencyType !== CurrencyType.Invalid) {
-				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 				await ensureStartingBalances(c.env.DB, id, startingTokens)
 				const balance = await creditCurrency(
 					c.env.DB,
@@ -6121,25 +6147,34 @@ const app = new Hono<App>({ strict: false })
 			}
 			const granted = await grantGiftDrop(c, id, drop, message)
 			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
-			// A new activity pays its token bonus in a second box — after the reward's own, so
-			// the player sees the reward they asked for first and the bonus as the extra it is.
-			// Same order as the currency reward above: balance first, then the box that shows it.
-			let bonusGiftId: number | null = null
-			if (await isNewActivity(c.env.DB, id, giftContext, claimed)) {
-				const bonus = toNewActivityBonusDrop()
-				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-				await ensureStartingBalances(c.env.DB, id, startingTokens)
-				const balance = await creditCurrency(
+			// The tokens ride in a second box — after the reward's own, so the player sees the
+			// reward they asked for first — while the player's daily allowance has room. Same
+			// order as the currency reward above: balance first, then the box that shows it.
+			let tokensGiftId: number | null = null
+			let tokensToday: number | null = null
+			if (TOKEN_REWARD_TYPES.has(rewardType)) {
+				tokensToday = await claimDailyTokens(
 					c.env.DB,
 					id,
-					bonus.CurrencyType,
-					bonus.Currency,
+					GAME_REWARD_TOKENS,
+					GAME_REWARD_DAILY_TOKEN_CAP
+				)
+			}
+			// FirstActivityOfDay's claim already held it to once a day: it pays without the cap.
+			if (daily || tokensToday !== null) {
+				const tokensDrop = toGameRewardTokensDrop()
+				await ensureStartingBalances(c.env.DB, id, startingTokens)
+				const tokenBalance = await creditCurrency(
+					c.env.DB,
+					id,
+					tokensDrop.CurrencyType,
+					tokensDrop.Currency,
 					startingTokens
 				)
-				await pushBalanceUpdate(c, id, bonus.CurrencyType, balance)
-				const bonusGift = await grantGiftDrop(c, id, bonus, NEW_ACTIVITY_BONUS_MESSAGE)
-				await pushGiftReceived(c, id, bonusGift, NEW_ACTIVITY_BONUS_MESSAGE, COACH_ACCOUNT_ID)
-				bonusGiftId = bonusGift.id
+				await pushBalanceUpdate(c, id, tokensDrop.CurrencyType, tokenBalance)
+				const tokensGift = await grantGiftDrop(c, id, tokensDrop, GAME_REWARD_TOKENS_MESSAGE)
+				await pushGiftReceived(c, id, tokensGift, GAME_REWARD_TOKENS_MESSAGE, COACH_ACCOUNT_ID)
+				tokensGiftId = tokensGift.id
 			}
 			// Every grant moves the bar, whether or not it crossed a level.
 			await pushProgressionUpdate(c, id, progression)
@@ -6156,8 +6191,9 @@ const app = new Hono<App>({ strict: false })
 				levelsGained,
 				levelXp: progression.XP,
 				giftId: granted.id,
-				newActivityBonus: bonusGiftId === null ? 0 : NEW_ACTIVITY_BONUS_TOKENS,
-				bonusGiftId,
+				tokens: tokensGiftId === null ? 0 : GAME_REWARD_TOKENS,
+				tokensToday,
+				tokensGiftId,
 			})
 			return c.json([])
 		}

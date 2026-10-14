@@ -466,17 +466,19 @@ rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Soccer
 Since the client asks rather than the server offering, whether a reward is actually **owed**
 is decided here, from `reward_status` — one row per (account, reward type, gift context)
 holding the last claim and a count. One claim per type per activity per hour
-(`REWARD_COOLDOWN_MS`), flat for every type despite what a name like `FirstActivityOfDay`
-suggests; per-type windows would be a map keyed by type.
+(`REWARD_COOLDOWN_MS`) — except `FirstActivityOfDay`, which is one per PLAYER per rolling
+24h (`DAILY_REWARD_COOLDOWN_MS`): it is always claimed on the `''` context, whichever
+activity asked, so its row's `granted_at` is simply the player's last one.
 
 - **The claim is one SQL statement** (`ON CONFLICT … DO UPDATE … WHERE`). The client fires
   these off right after a match, so two can land together; a read-then-write would let both
   see the same stale `granted_at` and pay out twice.
 - **A rejected claim leaves `granted_at` alone.** If an on-cooldown ask pushed the timestamp
   forward, a client that retries in a loop would never become eligible.
-- **`giftContext` (the activity, e.g. `Soccer`) is part of the key** — the "first activity of
-  the day" is per activity, so a player who moves from Soccer to Paintball is owed another
-  reward while a second Soccer match inside the hour is not.
+- **`giftContext` (the activity, e.g. `Soccer`) is part of the key** for the hourly types,
+  so a player who moves from Soccer to Paintball is owed another reward while a second Soccer
+  match inside the hour is not. The prize is still picked from the `giftContext` that asked,
+  `FirstActivityOfDay` included.
 - **A contextless ask keys on `''`, not NULL.** SQLite allows — and does not dedupe — NULLs
   in a non-INTEGER primary key, so a NULL context would insert a fresh row on every ask
   instead of hitting the conflict, and the cooldown would never apply. Migration
@@ -491,22 +493,23 @@ empty, `GiftContext` 50 (`GameRewards`). The box wears the `Message` the client 
 same push the weekly-challenge gift uses. XP is banked **before** the box is created, so a
 failure can't leave a box promising XP nobody was credited.
 
-- **One flat amount for every reward type**, matching the one flat cooldown they share.
-  Pricing `FirstActivityOfDay` differently from `PostGameActivity` is a map keyed by type,
-  the same shape the per-type cooldown would take.
+- **One flat amount for every reward type.** Pricing `FirstActivityOfDay` differently from
+  `PostGameActivity` is a map keyed by type.
 - **Deliberately smaller than a level.** The first level costs 10 XP, so a single action
   can't be a level-up — it takes two rewards to reach level 2, and the early levels are paced
   by the hourly cooldown rather than cleared in one match.
-- **A NEW activity pays 250 tokens on top** (`NEW_ACTIVITY_BONUS_TOKENS`): the first claim
-  ever in a `giftContext`, whichever reward type asked for it — `isNewActivity` counts the
-  player's rows in that context right after the claim and is true when the claim's own row
-  is the only one. Counting after the write is what stops two asks landing together
-  (`FirstActivityOfDay` and `PostGameActivity` for the same match) from both paying: a race
-  can skip the bonus, never double it. The tokens are credited to the RecCenterTokens
-  balance (`StorefrontBalanceUpdate` with the resulting total) and arrive in a **second box**
-  of their own — `GiftContext` 51 (`GameRewardsTokens`), `Currency` 250, no XP — after the
-  reward's, so the player sees what they were for. The contextless `''` bucket is not an
-  activity and never pays it.
+- **`PostGameActivity`/`PostQuestActivity` pay 250 tokens, up to 1,250 a day**
+  (`GAME_REWARD_TOKENS`, `GAME_REWARD_DAILY_TOKEN_CAP`) — per player, whatever the
+  `giftContext`. `FirstActivityOfDay` pays 250 more OUTSIDE that cap — its own once-a-day
+  claim already limits it, so it has no allowance row. The running total
+  is one row per player in `reward_status` under the reserved type `$tokens` (context `''`):
+  `grant_count` is the TOKENS paid in the window and `granted_at` when the window opened.
+  `claimDailyTokens` adds to it in one atomic upsert, refusing a grant that would cross the cap
+  (all or nothing, so the cap is a multiple of the amount), and resets it in place once the
+  window is 24h old — a rolling window, so no time zone's midnight decides it. The tokens are
+  credited to the RecCenterTokens balance (`StorefrontBalanceUpdate` with the resulting total)
+  and arrive in a **second box** of their own — `GiftContext` 51 (`GameRewardsTokens`),
+  `Currency` 250, no XP — after the reward's, so the player sees what they were for.
 - **The response stays `[]`.** It's what the client already accepts, and the reward is
   delivered as a box, so there's nothing to put in the body. The reference answers its own
   (different) flow with `{ error, success, value: null }`, not a list of rewards.
