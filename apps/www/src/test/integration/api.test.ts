@@ -25,7 +25,7 @@ import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progres
 import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
-import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
+import { getOrCreateDormRoom, ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
 import { recordStat, STAT_SCHEMA_DDL } from '@repo/domain/src/stats-db'
 import { generateToken } from '@repo/jwt'
 
@@ -871,6 +871,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/players/1/clear-dorm',
 		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
@@ -2138,6 +2139,87 @@ it('clears a player’s password so they can set a new one in game', async () =>
 		{ actor: 8110, data: { playerId: 8320, hadPassword: false } },
 	])
 	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
+})
+
+it('clears a player’s dorm by publishing an empty save over the newest one', async () => {
+	await updateAccount(env.DB, 8340, { username: 'Timetraveler' })
+	expect((await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})).status).toBe(404)
+
+	const dorm = await getOrCreateDormRoom(env.DB, 8340)
+	const roomId = Number(dorm.RoomId)
+	const { sub_room_id: subRoomId } = (await env.DB.prepare(
+		'SELECT sub_room_id FROM subroom WHERE room_id = ?1 LIMIT 1'
+	)
+		.bind(roomId)
+		.first<{ sub_room_id: number }>())!
+
+	// A dorm that has never been saved: nothing to clear, still a success.
+	let res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: null, saveId: null })
+
+	const insertSave = (blob: string) =>
+		env.DB.prepare(
+			'INSERT INTO subroom_save (sub_room_id, data) VALUES (?1, ?2) RETURNING sub_room_data_save_id AS id'
+		)
+			.bind(
+				subRoomId,
+				JSON.stringify({
+					DataBlob: blob,
+					DataBlobHash: 'hash',
+					Description: blob,
+					PersistenceVersion: 7,
+					CreatedAt: '2025-08-01T00:00:00.000Z',
+				})
+			)
+			.first<{ id: number }>()
+	const older = (await insertSave('old.blob'))!.id
+	const newer = (await insertSave('new.blob'))!.id
+	await env.DB.prepare(
+		'UPDATE subroom SET current_save_id = ?2, staged_save_id = ?2 WHERE sub_room_id = ?1'
+	)
+		.bind(subRoomId, newer)
+		.run()
+	const saveData = async (id: number) =>
+		JSON.parse(
+			(await env.DB.prepare('SELECT data FROM subroom_save WHERE sub_room_data_save_id = ?1')
+				.bind(id)
+				.first<{ data: string }>())!.data
+		)
+	const pointers = () =>
+		env.DB.prepare('SELECT current_save_id, staged_save_id FROM subroom WHERE sub_room_id = ?1')
+			.bind(subRoomId)
+			.first<{ current_save_id: number; staged_save_id: number | null }>()
+
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(res.status).toBe(200)
+	const { saveId } = (await res.json()) as { saveId: number }
+	expect(saveId).toBeGreaterThan(newer)
+
+	// The blank save copies the newest one but for the blob, and goes live.
+	const blank = await saveData(saveId)
+	expect(blank).toEqual({
+		DataBlob: '',
+		DataBlobHash: null,
+		Description: 'Cleared by staff',
+		PersistenceVersion: 7,
+		CreatedAt: expect.any(String),
+	})
+	expect(blank.CreatedAt).not.toBe('2025-08-01T00:00:00.000Z')
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+	// Nothing is erased: both earlier saves are as they were.
+	expect((await saveData(newer)).DataBlob).toBe('new.blob')
+	expect((await saveData(older)).DataBlob).toBe('old.blob')
+
+	// Clearing an already-empty dorm writes nothing more.
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: saveId, saveId: null })
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+
+	expect((await auditRows('clear_dorm', 8340)).map((r) => r.data)).toEqual([
+		{ playerId: 8340, roomId, previousSaveId: null, saveId: null },
+		{ playerId: 8340, roomId, previousSaveId: newer, saveId },
+		{ playerId: 8340, roomId, previousSaveId: saveId, saveId: null },
+	])
 })
 
 it('grants a player Plus, developers only', async () => {

@@ -1,6 +1,7 @@
 import {
 	addUsernameChange,
 	addXp,
+	clearDormSaveBlob,
 	clearPasswordHash,
 	createGift,
 	getAccount,
@@ -1530,6 +1531,25 @@ export async function clearPasswordHandler(c: Context<App>) {
 	await recordPlayerAudit(c, 'clear_password', { playerId, hadPassword })
 	logger.info('staff cleared a password', { moderatorId: staffId(c), playerId, hadPassword })
 	return c.json({ playerId, hadPassword })
+}
+
+/**
+ * Blank the scene on a player's dorm, for a player going back to the 2023 client: a dorm
+ * saved by a newer one won't load there. It publishes a new, empty save rather than erasing
+ * anything, so `previousSaveId` is the save to restore if they want the old dorm back.
+ * `saveId` is null when there was nothing to clear, which writes nothing and is still
+ * logged; a player with no dorm at all is a 404.
+ */
+export async function clearDormHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const cleared = await clearDormSaveBlob(c.env.DB, playerId)
+	if (cleared === null) return c.json({ error: 'That player has no dorm' }, 404)
+
+	await recordPlayerAudit(c, 'clear_dorm', { playerId, ...cleared })
+	logger.info('staff cleared a dorm', { moderatorId: staffId(c), playerId, ...cleared })
+	return c.json({ playerId, ...cleared })
 }
 
 /**

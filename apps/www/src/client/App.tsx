@@ -1397,6 +1397,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	// One message for every box sent from this card; it stays put between sends.
 	const [message, setMessage] = useState('')
 	const [confirmingClear, setConfirmingClear] = useState(false)
+	const [confirmingDorm, setConfirmingDorm] = useState(false)
 	const [itemId, setItemId] = useState('')
 	const [xp, setXp] = useState('')
 	const gift = useAction()
@@ -1404,6 +1405,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	const itemGift = useAction()
 	const usernameChange = useAction()
 	const clearPassword = useAction()
+	const clearDorm = useAction()
 	const grantPlus = useAction()
 	const base = `/api/staff/players/${account.accountId}`
 
@@ -1626,6 +1628,41 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 						Clear password
 					</button>
 				)}
+				{confirmingDorm ? (
+					<>
+						<button
+							type="submit"
+							disabled={clearDorm.pending}
+							onClick={() =>
+								void clearDorm.run(async () => {
+									const res = await call<{ previousSaveId: number | null; saveId: number | null }>(
+										`${base}/clear-dorm`,
+										{ authed: true, method: 'POST' }
+									)
+									setConfirmingDorm(false)
+									if (res.previousSaveId === null)
+										return `@${account.username}'s dorm has never been saved.`
+									if (res.saveId === null) return `@${account.username}'s dorm is already empty.`
+									return `Dorm cleared: @${account.username}'s dorm loads empty now (save ${res.saveId}). Their old dorm is kept as save ${res.previousSaveId}.`
+								})
+							}
+						>
+							{clearDorm.pending ? 'Clearing…' : 'Confirm clear dorm'}
+						</button>
+						<button
+							type="button"
+							className="linkish"
+							disabled={clearDorm.pending}
+							onClick={() => setConfirmingDorm(false)}
+						>
+							Cancel
+						</button>
+					</>
+				) : (
+					<button type="submit" onClick={() => setConfirmingDorm(true)}>
+						Clear dorm
+					</button>
+				)}
 				<button
 					type="submit"
 					onClick={() =>
@@ -1639,10 +1676,17 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 				<strong>Clear password:</strong> Only use if the player has requested a password clear and
 				they can still login via Steam or Meta.
 			</p>
+			<p className="hint">
+				<strong>Clear dorm:</strong> Empties the player&apos;s dorm so it loads in the 2023 client
+				again — a dorm saved in a newer client won&apos;t. It publishes a new, empty save; the old
+				one stays in the dorm&apos;s save history and can be restored.
+			</p>
 			{usernameChange.error && <p className="error">{usernameChange.error}</p>}
 			{usernameChange.done && <p className="ok">{usernameChange.done}</p>}
 			{clearPassword.error && <p className="error">{clearPassword.error}</p>}
 			{clearPassword.done && <p className="ok">{clearPassword.done}</p>}
+			{clearDorm.error && <p className="error">{clearDorm.error}</p>}
+			{clearDorm.done && <p className="ok">{clearDorm.done}</p>}
 			{grantPlus.error && <p className="error">{grantPlus.error}</p>}
 			{grantPlus.done && <p className="ok">{grantPlus.done}</p>}
 		</section>

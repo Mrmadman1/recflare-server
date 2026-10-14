@@ -3983,6 +3983,64 @@ export async function getDormRoom(db: D1Database, accountId: number): Promise<Ro
 }
 
 /**
+ * Blank the scene on a player's dorm by publishing a NEW save with an empty `DataBlob` (and a
+ * null `DataBlobHash`) on top of the dorm's most recent one. A dorm saved by a newer client
+ * won't load in the 2023 one, and this puts it back to the empty dorm. Nothing is erased: the
+ * new save copies every other field of the newest one, and that save stays in the history, so
+ * `publish_save` with `previousSaveId` restores the dorm as it was.
+ *
+ * Dorms always publish, so the newest save is the one `CurrentSave` serves, and the new save
+ * goes live the same way — `current_save_id`, with any staged save dropped.
+ *
+ * Null when the player has no dorm. `previousSaveId` is the newest save beforehand (null when
+ * the dorm has never been saved); `saveId` is the blank save made here, null when there was
+ * no blob to clear and so nothing was written.
+ */
+export async function clearDormSaveBlob(
+	db: D1Database,
+	accountId: number
+): Promise<{ roomId: number; previousSaveId: number | null; saveId: number | null } | null> {
+	const dorm = await db
+		.prepare('SELECT room_id FROM room WHERE creator_account_id = ?1 AND is_dorm = 1 LIMIT 1')
+		.bind(accountId)
+		.first<{ room_id: number }>()
+	if (!dorm) return null
+
+	const latest = await db
+		.prepare(
+			`SELECT s.sub_room_data_save_id AS id, s.sub_room_id AS subRoomId,
+			        json_extract(s.data, '$.DataBlob') AS blob
+			   FROM subroom_save s JOIN subroom r ON r.sub_room_id = s.sub_room_id
+			  WHERE r.room_id = ?1
+			  ORDER BY s.sub_room_data_save_id DESC LIMIT 1`
+		)
+		.bind(dorm.room_id)
+		.first<{ id: number; subRoomId: number; blob: string | null }>()
+	if (!latest || !latest.blob) {
+		return { roomId: dorm.room_id, previousSaveId: latest?.id ?? null, saveId: null }
+	}
+
+	const save = await db
+		.prepare(
+			`INSERT INTO subroom_save (sub_room_id, data)
+			 SELECT sub_room_id, json_set(data, '$.DataBlob', '', '$.DataBlobHash', NULL,
+			                              '$.Description', 'Cleared by staff', '$.CreatedAt', ?2)
+			   FROM subroom_save WHERE sub_room_data_save_id = ?1
+			 RETURNING sub_room_data_save_id AS id`
+		)
+		.bind(latest.id, new Date().toISOString())
+		.first<{ id: number }>()
+	if (!save) return { roomId: dorm.room_id, previousSaveId: latest.id, saveId: null }
+	await db
+		.prepare(
+			'UPDATE subroom SET current_save_id = ?2, staged_save_id = NULL WHERE sub_room_id = ?1'
+		)
+		.bind(latest.subRoomId, save.id)
+		.run()
+	return { roomId: dorm.room_id, previousSaveId: latest.id, saveId: save.id }
+}
+
+/**
  * The player's personal dorm room, created on first access. Cloned from the
  * seeded template dorm (RoomId 1) but owned by the player and flagged IsDorm — so
  * matchmaking routes them into their own dorm and they can save it via the

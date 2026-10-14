@@ -43,6 +43,7 @@ import {
 	addUsernameChangeHandler,
 	banReportHandler,
 	bansInForceHandler,
+	clearDormHandler,
 	clearPasswordHandler,
 	createReportHandler,
 	getReportHandler,
@@ -610,6 +611,8 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
+	// Blanks the dorm's newest save so a player can go back to the 2023 client.
+	.post('/api/staff/players/:id/clear-dorm', clearDormHandler)
 	// The signed-in staff member's OWN sandbox flag: read it, and opt in or out. Self-only,
 	// so plain staff (not developer-only) — it moves nobody but the caller, and `match`
 	// honours it on their next room join.
