@@ -5,6 +5,7 @@ import {
 	clearPasswordHash,
 	createGift,
 	getAccount,
+	getImageById,
 	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
@@ -340,6 +341,22 @@ async function recordBanAudit(
 /** The evasion arms in force, read from the same knob `api` and `match` read. */
 const armsFor = (env: Env) => banEvasionMatch(env.BAN_EVASION_MATCH)
 
+/**
+ * Reports with the reported photo's `image_name` alongside its `image_id`, so the panel can
+ * link to the picture — `img` serves by name, and the row only stores the id. Read whatever
+ * the photo's accessibility: one made private after it was reported is still evidence. A
+ * photo since deleted gets a null name and the panel shows the bare id.
+ */
+async function withImageNames(db: D1Database, reports: ReportRow[]) {
+	const ids = [...new Set(reports.flatMap((r) => (r.image_id == null ? [] : [r.image_id])))]
+	const images = await Promise.all(ids.map((id) => getImageById(db, id)))
+	const names = new Map(ids.map((id, i) => [id, images[i]?.ImageName ?? null]))
+	return reports.map((r) => ({
+		...r,
+		image_name: r.image_id == null ? null : (names.get(r.image_id) ?? null),
+	}))
+}
+
 // ---- Handlers ---------------------------------------------------------------
 
 /**
@@ -361,7 +378,7 @@ export async function searchReportsHandler(c: Context<App>) {
 		skip: intQuery(c, 'skip') ?? 0,
 		take: Math.min(intQuery(c, 'take') ?? 50, MAX_TAKE),
 	})
-	return c.json(page)
+	return c.json({ ...page, reports: await withImageNames(c.env.DB, page.reports) })
 }
 
 /** One report by id — the detail behind a search row. */
@@ -370,7 +387,8 @@ export async function getReportHandler(c: Context<App>) {
 	if (Number.isNaN(id)) return c.json({ error: 'A numeric report id is required' }, 400)
 	const report = await getReportById(c.env.DB, id)
 	if (report === null) return c.json({ error: 'No such report' }, 404)
-	return c.json(report)
+	const [withName] = await withImageNames(c.env.DB, [report])
+	return c.json(withName)
 }
 
 /**
@@ -525,7 +543,12 @@ export async function playerHistoryHandler(c: Context<App>) {
 		getWarningsAgainst(c.env.DB, playerId),
 		getActiveBan(c.env.DB, playerId),
 	])
-	return c.json({ playerId, reports, warnings, activeBan })
+	return c.json({
+		playerId,
+		reports: await withImageNames(c.env.DB, reports),
+		warnings,
+		activeBan,
+	})
 }
 
 /**

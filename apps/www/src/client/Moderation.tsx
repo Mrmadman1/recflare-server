@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import { KickReportCategory } from '../../../notify/src/notification-payloads'
-import { accountIdForUsername, call, isAdmin, useAction, usernamesFor } from './api'
+import { accountIdForUsername, call, isAdmin, useAction, usernamesFor, where } from './api'
 
 import type { PublicAccount } from './api'
 
@@ -95,6 +95,11 @@ interface ReportRow {
 	banned_at: string | null
 	chat_message_id: number | null
 	image_id: number | null
+	/**
+	 * The reported photo's key on `img`, joined on by `www` (the `report` table stores only
+	 * the id). Null for a report that isn't against a photo, or one whose photo is gone.
+	 */
+	image_name?: string | null
 	/**
 	 * Who lifted the ban that once stood on this row, and when — null until one is lifted,
 	 * and cleared again by a re-ban. A lift wipes the four ban columns, so this pair is the
@@ -925,7 +930,20 @@ function ReportTable({
 							<td>
 								<PlayerName id={report.reporter_player_id} names={names} />
 							</td>
-							<td>{reportKind(report)}</td>
+							<td>
+								{report.image_name ? (
+									<a
+										href={`${where().img}/${report.image_name}`}
+										target="_blank"
+										rel="noreferrer"
+										title={`Photo #${report.image_id}`}
+									>
+										{reportKind(report)}
+									</a>
+								) : (
+									reportKind(report)
+								)}
+							</td>
 							<td>{categoryLabel(report.report_category)}</td>
 							{/* The reporter's own words, untruncated in the title so a long
 							    description is readable without leaving the table. */}
