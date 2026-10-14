@@ -6701,56 +6701,43 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
 
-		// 5 XP is deliberately less than the 10 the first level costs, so one action moves the
-		// bar without levelling anyone up.
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
+		// 10 XP is exactly what level 1 costs, so a fresh player's first reward is a level-up.
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
 
-		// One reward box: the XP itself, carrying the message the client asked to show and no
-		// item — a game reward is not an item. (Its tokens come in a box of their own.)
+		// Two reward boxes: the XP itself, carrying the message the client asked to show and no
+		// item — a game reward is not an item — then the level-up's. (The tokens come in a box
+		// of their own.)
 		const first = await rewardBoxes()
-		expect(first).toHaveLength(1)
+		expect(first).toHaveLength(2)
 		expect(first[0]).toMatchObject({
-			Xp: 5,
+			Xp: 10,
 			Message: 'First Game of the Day',
 			AvatarItemDesc: '',
 			EquipmentModificationGuid: '',
 			ConsumableItemDesc: '',
 		})
 
-		// The box, then the bar — no level-up box, since no level was crossed.
+		// The box, then the bar, then the level-up box.
 		const frames = await rewardFrames()
 		expect(frames.map((f) => f.notificationType)).toEqual([
 			NotificationType.GiftPackageReceivedImmediate,
 			NotificationType.PlayerProgressionLevelUpdate,
+			NotificationType.GiftPackageReceivedImmediate,
 		])
 		expect(frames[0]?.accountId).toBe(82)
 		expect(frames[0]?.payload).toMatchObject({
 			Id: first[0]?.Id,
 			FromPlayerId: 1,
-			Xp: 5,
+			Xp: 10,
 			// GiftContext.GameRewards — the box came from gameplay, not a purchase.
 			GiftContext: 50,
 			Message: 'First Game of the Day',
 		})
-		expect(frames[1]?.payload).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
+		expect(frames[1]?.payload).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
 
-		// An on-cooldown ask pays nothing: no more boxes, no frames, no more XP.
-		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
-		expect(await giftBoxes('82')).toHaveLength(2)
-		expect(await drainFrames()).toEqual([])
-
-		// A SECOND reward completes the 10 XP level 1 costs — two actions per early level, which
-		// is the pacing the smaller grant buys.
-		await passADay()
-		expect((await request('rewardType=FirstActivityOfDay&Message=Second')).status).toBe(200)
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
-
-		// …and level 2 pays 2-Star Clothing per the published table: an AVATAR ITEM, never an
+		// Level 2 pays 2-Star Clothing per the published table: an AVATAR ITEM, never an
 		// equipment skin, which is what the avatar-only roll is for.
-		const afterLevel2 = await rewardBoxes()
-		expect(afterLevel2).toHaveLength(3)
-		const clothingBox = afterLevel2[2]
+		const clothingBox = first[1]
 		expect(clothingBox?.Message).toBe('Level 2!')
 		expect(clothingBox?.AvatarItemDesc).not.toBe('')
 		expect(clothingBox?.EquipmentModificationGuid).toBe('')
@@ -6763,18 +6750,18 @@ describe('econ endpoints', () => {
 		// v4 serves the camelCase DTO, unlike the PascalCase records on the gift box.
 		const owned = (await items.json()) as Array<{ avatarItemDesc: string }>
 		expect(owned.map((i) => i.avatarItemDesc)).toContain(clothingBox?.AvatarItemDesc)
-		expect((await rewardFrames()).map((f) => f.notificationType)).toEqual([
-			NotificationType.GiftPackageReceivedImmediate,
-			NotificationType.PlayerProgressionLevelUpdate,
-			NotificationType.GiftPackageReceivedImmediate,
-		])
 
-		// Two more rewards reach level 3, which the table pays as a CONSUMABLE rather than
+		// An on-cooldown ask pays nothing: no more boxes, no frames, no more XP.
+		const boxCount = (await giftBoxes('82')).length
+		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
+		expect(await giftBoxes('82')).toHaveLength(boxCount)
+		expect(await drainFrames()).toEqual([])
+
+		// The next reward reaches level 3, which the table pays as a CONSUMABLE rather than
 		// clothing — rolled without a rarity, since the table names none for them.
-		for (const message of ['Third', 'Fourth']) {
-			await passADay()
-			expect((await request(`rewardType=FirstActivityOfDay&Message=${message}`)).status).toBe(200)
-		}
+		await passADay()
+		expect((await request('rewardType=FirstActivityOfDay&Message=Second')).status).toBe(200)
 		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 3, XP: 0 })
 
 		const afterLevel3 = await giftBoxes('82')
@@ -6809,12 +6796,14 @@ describe('econ endpoints', () => {
 		)
 		expect(goblin.status).toBe(200)
 		expect(await goblin.json()).toEqual([])
-		// Two boxes: the quest reward, and the PostGameActivity tokens (covered below).
+		// Three boxes: the quest reward, the PostGameActivity tokens (covered below), and — 10 XP
+		// being level 1's whole cost — the level-2 box.
 		const boxes = await giftBoxes('83')
-		expect(boxes).toHaveLength(2)
+		expect(boxes).toHaveLength(3)
 		const box = boxes[0]
-		expect(box).toMatchObject({ Xp: 5, Message: 'Quest complete', GiftContext: 4003 })
+		expect(box).toMatchObject({ Xp: 10, Message: 'Quest complete', GiftContext: 4003 })
 		expect(boxes[1]).toMatchObject({ GiftContext: 51, Currency: 250 })
+		expect(boxes[2]?.Message).toBe('Level 2!')
 		expect(box?.AvatarItemDesc).not.toBe('')
 		const row = questRewards.Quest_Goblin_S.find((r) => r.AvatarItemDesc === box?.AvatarItemDesc)
 		expect(row).toBeDefined()
@@ -6862,7 +6851,7 @@ describe('econ endpoints', () => {
 		// GameRewards box, behind Bowling's own tokens.
 		expect((await request('rewardType=PostGameActivity&giftContext=Bowling')).status).toBe(200)
 		const plain = (await giftBoxes('83')).findLast((b) => b.GiftContext === 50)
-		expect(plain).toMatchObject({ Xp: 5, AvatarItemDesc: '', Currency: 0, GiftContext: 50 })
+		expect(plain).toMatchObject({ Xp: 10, AvatarItemDesc: '', Currency: 0, GiftContext: 50 })
 
 		// A reward the player already owns is never drawn again: Dodgeball has three rows, so
 		// three claims hand over all three, and a fourth — nothing left to give — pays the
@@ -6974,6 +6963,86 @@ describe('econ endpoints', () => {
 		const reopened = await allowance()
 		expect(reopened?.grant_count).toBe(250)
 		expect((reopened?.granted_at ?? '') > (opened ?? '')).toBe(true)
+	})
+
+	test('game-reward XP stops at 150 per player per 24h, FirstActivityOfDay aside', async () => {
+		const request = async (body: string) =>
+			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('85')),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body,
+			})
+		const xp = async () => {
+			const { Level, XP } = await getProgression(env.DB, 85)
+			return { Level, XP }
+		}
+		const allowance = () =>
+			env.DB.prepare(
+				"SELECT granted_at, grant_count FROM reward_status WHERE account_id = 85 AND reward_type = '$xp'"
+			).first<{ granted_at: string; grant_count: number }>()
+		const rewardBoxes = async () =>
+			(await giftBoxes('85')).filter((b) => b.GiftContext !== 51 && !b.Message?.startsWith('Level'))
+
+		// A claim's XP draws on the allowance.
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await allowance()).toMatchObject({ grant_count: 10 })
+		expect(await xp()).toEqual({ Level: 2, XP: 0 })
+
+		// One claim short of the cap: the next pays its 10 and fills it.
+		await env.DB.prepare(
+			"UPDATE reward_status SET grant_count = 140 WHERE account_id = 85 AND reward_type = '$xp'"
+		).run()
+		expect((await request('rewardType=PostGameActivity&giftContext=Paintball')).status).toBe(200)
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+		const boxesAtCap = (await rewardBoxes()).length
+		await drainFrames()
+
+		// At the cap: no XP, no progression frame, and — nothing else to carry — no reward box.
+		// The tokens are their own allowance and still pay.
+		const tokensBefore = await getBalance(
+			env.DB,
+			85,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS
+		)
+		expect((await request('rewardType=PostGameActivity&giftContext=Bowling')).status).toBe(200)
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+		expect(await rewardBoxes()).toHaveLength(boxesAtCap)
+		expect(
+			await getBalance(env.DB, 85, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(tokensBefore + 250)
+		expect((await drainFrames()).map((f) => f.notificationType)).not.toContain(
+			NotificationType.PlayerProgressionLevelUpdate
+		)
+
+		// An activity with a prize still hands it over, in a box carrying no XP.
+		expect(
+			(await request('rewardType=PostQuestActivity&giftContext=Quest_Goblin_S')).status
+		).toBe(200)
+		const quest = (await rewardBoxes()).at(-1)
+		expect(quest).toMatchObject({ GiftContext: 4003, Xp: 0 })
+		expect(quest?.AvatarItemDesc).not.toBe('')
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+
+		// FirstActivityOfDay's XP is a bonus on top of the cap.
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
+		expect(await xp()).toEqual({ Level: 4, XP: 0 })
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+
+		// Once the window is 24h old, the next claim opens a fresh one.
+		await env.DB.prepare(
+			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 85 AND reward_type = '$xp'"
+		)
+			.bind(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString())
+			.run()
+		expect((await request('rewardType=PostGameActivity&giftContext=Basketball')).status).toBe(200)
+		expect(await allowance()).toMatchObject({ grant_count: 10 })
+		expect(await xp()).toEqual({ Level: 4, XP: 10 })
 	})
 
 	test('POST /api/gamerewards/v1/request is 401 without a token, and ignores a typeless ask', async () => {

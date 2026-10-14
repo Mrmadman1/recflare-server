@@ -39,19 +39,19 @@ export const REWARD_COOLDOWN_MS = 60 * 60 * 1000
 export const DAILY_REWARD_COOLDOWN_MS = 24 * 60 * 60 * 1000
 
 /**
- * The game reward's tokens are a per-PLAYER daily allowance, kept in `reward_status` as one
- * row under this reserved type and the empty context: `grant_count` is the TOKENS paid in the
- * current window (not a count of claims) and `granted_at` is when that window opened. The `$`
- * keeps it apart from the client's own type names (`FirstActivityOfDay`, `PostGameActivity`),
- * which a client-sent type could otherwise forge.
+ * The game reward's per-PLAYER daily allowances, each kept in `reward_status` as one row under
+ * its reserved type and the empty context: `grant_count` is the AMOUNT paid in the current
+ * window (tokens, or XP — not a count of claims) and `granted_at` is when that window opened.
+ * The `$` keeps them apart from the client's own type names (`FirstActivityOfDay`,
+ * `PostGameActivity`), which a client-sent type could otherwise forge.
  */
-export const TOKEN_REWARD_TYPE = '$tokens'
+export type Allowance = '$tokens' | '$xp'
 
 /**
- * How long a token window lasts: a rolling 24h from the first grant in it, rather than a
+ * How long an allowance window lasts: a rolling 24h from the first grant in it, rather than a
  * calendar day — so no time zone's midnight decides when a player's allowance comes back.
  */
-export const TOKEN_REWARD_WINDOW_MS = 24 * 60 * 60 * 1000
+export const ALLOWANCE_WINDOW_MS = 24 * 60 * 60 * 1000
 
 /**
  * Claim a reward if the player is due one, returning how many of that type they have now
@@ -97,10 +97,10 @@ export async function claimReward(
 }
 
 /**
- * Add `amount` tokens to the player's daily allowance if it fits under `cap`, returning the
+ * Add `amount` to the player's daily `allowance` if it fits under `cap`, returning the
  * window's new total — or `null` when it doesn't fit and nothing was granted.
  *
- * A window older than {@link TOKEN_REWARD_WINDOW_MS} is reset in place (the row's key allows
+ * A window older than {@link ALLOWANCE_WINDOW_MS} is reset in place (the row's key allows
  * one per player): `granted_at` moves to now and the total restarts at `amount`. Otherwise the
  * amount is added to the running total, and `granted_at` is left alone so the window keeps its
  * start. All grant-or-nothing: a claim that would cross the cap pays nothing rather than the
@@ -110,15 +110,16 @@ export async function claimReward(
  * read a total under the cap and both pay. SQLite evaluates every `SET` against the row as it
  * was, so both `CASE`s see the old `granted_at`.
  */
-export async function claimDailyTokens(
+export async function claimAllowance(
 	db: D1Database,
 	accountId: number,
+	allowance: Allowance,
 	amount: number,
 	cap: number,
 	now: Date = new Date()
 ): Promise<number | null> {
 	if (amount > cap) return null
-	const cutoff = new Date(now.getTime() - TOKEN_REWARD_WINDOW_MS).toISOString()
+	const cutoff = new Date(now.getTime() - ALLOWANCE_WINDOW_MS).toISOString()
 	const row = await db
 		.prepare(
 			`INSERT INTO reward_status (account_id, reward_type, gift_context, granted_at, grant_count)
@@ -131,7 +132,7 @@ export async function claimDailyTokens(
 			 WHERE reward_status.granted_at <= ?5 OR reward_status.grant_count + ?4 <= ?6
 			 RETURNING grant_count`
 		)
-		.bind(accountId, TOKEN_REWARD_TYPE, now.toISOString(), amount, cutoff, cap)
+		.bind(accountId, allowance, now.toISOString(), amount, cutoff, cap)
 		.first<{ grant_count: number }>()
 	return row?.grant_count ?? null
 }

@@ -168,7 +168,7 @@ import {
 	WishlistItemList,
 	WishlistItemRequest,
 } from './openapi'
-import { claimDailyTokens, claimReward, DAILY_REWARD_COOLDOWN_MS } from './reward-db'
+import { claimAllowance, claimReward, DAILY_REWARD_COOLDOWN_MS } from './reward-db'
 import {
 	awardRoomConsumable,
 	getRoomConsumable,
@@ -2264,15 +2264,24 @@ function isBulkLine(resolved: BulkPurchaseLine | BulkLineFailure): resolved is B
 }
 
 /**
- * XP paid for a claimed game reward. One flat amount for every reward type, matching the
- * one flat cooldown they share — "First Game of the Day" and "Activity completed!" are the
- * same size of pat on the back until there's reason to price them apart.
+ * XP paid for a claimed game reward. One flat amount for every reward type — "First Game of
+ * the Day" and "Activity completed!" are the same size of pat on the back until there's
+ * reason to price them apart.
  *
- * Deliberately smaller than the 10 XP the first level costs: a single action shouldn't be a
- * level-up, let alone two of them. At 5 it takes two rewards to reach level 2, and the early
- * levels are paced by the hourly cooldown rather than cleared in one match.
+ * Exactly what each of the first three levels costs, so a fresh player's first rewards each
+ * level them up; from level 4 (20 XP a level) it takes two or more. The daily
+ * {@link GAME_REWARD_DAILY_XP_CAP} paces it from there.
  */
-const GAME_REWARD_XP = 5
+const GAME_REWARD_XP = 10
+
+/**
+ * The most game-reward XP a player earns in one rolling 24h window: fifteen claims' worth,
+ * whatever the type or activity — `FirstActivityOfDay` aside, whose XP is a bonus on top, like
+ * its tokens. The running total is the player's `$xp` row in `reward_status`
+ * (`claimAllowance`). A multiple of {@link GAME_REWARD_XP} — a claim that would cross it pays
+ * no XP.
+ */
+const GAME_REWARD_DAILY_XP_CAP = 150
 
 /**
  * `GiftContext.GameRewards` — what the box says it came from, so the client files it under
@@ -2287,7 +2296,7 @@ const DEFAULT_GAME_REWARD_MESSAGE = 'Reward earned!'
 /**
  * Tokens paid with each claimed {@link TOKEN_REWARD_TYPES} reward, until the player has had
  * {@link GAME_REWARD_DAILY_TOKEN_CAP} in the current 24h window — whatever the activity.
- * The running total is the player's `$tokens` row in `reward_status` (`claimDailyTokens`).
+ * The running total is the player's `$tokens` row in `reward_status` (`claimAllowance`).
  */
 const GAME_REWARD_TOKENS = 250
 
@@ -2347,7 +2356,7 @@ function toGameRewardTokensDrop(): StoreGiftDrop {
  * nothing into the inventory and only creates the box. The XP is banked in `progression`;
  * the copy here is what the box and its notification display.
  */
-function toGameRewardDrop(): StoreGiftDrop {
+function toGameRewardDrop(xp: number): StoreGiftDrop {
 	return {
 		FriendlyName: '',
 		Tooltip: '',
@@ -2360,7 +2369,7 @@ function toGameRewardDrop(): StoreGiftDrop {
 		Context: GIFT_CONTEXT_GAME_REWARDS,
 		Currency: 0,
 		CurrencyType: 0,
-		Xp: GAME_REWARD_XP,
+		Xp: xp,
 	}
 }
 
@@ -2425,10 +2434,14 @@ async function pickQuestReward(
  * row, so the item IS granted — unlike {@link toGameRewardDrop}'s empty box. The catalog
  * row for the item, when it resolves, supplies what the table doesn't carry (name, tooltip,
  * `AvatarItemType`), so the inventory entry reads like a bought one rather than blank.
- * The XP is the flat game-reward amount, not the row's (always 0): the reward is the item,
- * and the XP is the same pat on the back every claim gets.
+ * The XP is the game reward's (`xp`), not the row's (always 0): the reward is the item, and
+ * the XP is the same pat on the back every claim gets while the daily cap has room.
  */
-function toQuestRewardDrop(reward: QuestReward, catalog: CatalogRow | null): StoreGiftDrop {
+function toQuestRewardDrop(
+	reward: QuestReward,
+	catalog: CatalogRow | null,
+	xp: number
+): StoreGiftDrop {
 	return {
 		FriendlyName: catalog?.friendly_name ?? '',
 		Tooltip: catalog?.tooltip ?? '',
@@ -2441,7 +2454,7 @@ function toQuestRewardDrop(reward: QuestReward, catalog: CatalogRow | null): Sto
 		Context: reward.Context,
 		Currency: reward.Currency,
 		CurrencyType: reward.CurrencyType,
-		Xp: GAME_REWARD_XP,
+		Xp: xp,
 	}
 }
 
@@ -6051,7 +6064,8 @@ const app = new Hono<App>({ strict: false })
 	// here, from `reward_status`: one claim per type per activity per hour, atomically —
 	// except FirstActivityOfDay, one per player per 24h.
 	//
-	// A claim pays GAME_REWARD_XP into `progression` and hands over a gift box carrying that
+	// A claim pays GAME_REWARD_XP into `progression` (up to GAME_REWARD_DAILY_XP_CAP per player
+	// per rolling 24h, FirstActivityOfDay's on top) and hands over a gift box carrying that
 	// XP, announced with the same GiftPackageReceivedImmediate frame the weekly gift uses —
 	// the client posted the message to show, so the box wears it. An on-cooldown ask changes
 	// nothing and pays nothing.
@@ -6119,17 +6133,27 @@ const app = new Hono<App>({ strict: false })
 				typeof body.Message === 'string' && body.Message !== ''
 					? body.Message
 					: DEFAULT_GAME_REWARD_MESSAGE
+			// The XP draws on the player's daily allowance — FirstActivityOfDay's is a bonus on top,
+			// its once-a-day claim being limit enough. Past the cap the claim pays no XP.
+			const xpToday = daily
+				? null
+				: await claimAllowance(c.env.DB, id, '$xp', GAME_REWARD_XP, GAME_REWARD_DAILY_XP_CAP)
+			const xp = daily || xpToday !== null ? GAME_REWARD_XP : 0
 			// Bank the XP first: it is the reward, and the box is the wrapper the client shows.
 			// A failure here must not leave a box promising XP that was never credited.
-			const { progression, levelsGained } = await addXp(c.env.DB, id, GAME_REWARD_XP)
+			const gained = xp > 0 ? await addXp(c.env.DB, id, xp) : null
 			// An activity the reward table knows pays one of ITS rewards the player lacks — the
 			// item rides in the box and is granted with it. Anything else gets the plain XP box.
 			const questReward = await pickQuestReward(c.env.DB, id, giftContext)
 			const itemKey = questReward?.AvatarItemDesc || questReward?.EquipmentModificationGuid
 			const drop =
 				questReward === null
-					? toGameRewardDrop()
-					: toQuestRewardDrop(questReward, itemKey ? await getCatalogItem(c.env.DB, itemKey) : null)
+					? toGameRewardDrop(xp)
+					: toQuestRewardDrop(
+							questReward,
+							itemKey ? await getCatalogItem(c.env.DB, itemKey) : null,
+							xp
+						)
 			// A currency reward (Laser Tag's tickets) is credited here: `grantGiftDrop` grants
 			// items, not balances. Seed the signup grant first — `creditCurrency` upserts the
 			// row, and a never-touched RecCenterTokens balance would otherwise lose it.
@@ -6145,17 +6169,24 @@ const app = new Hono<App>({ strict: false })
 				)
 				await pushBalanceUpdate(c, id, drop.CurrencyType, balance)
 			}
-			const granted = await grantGiftDrop(c, id, drop, message)
-			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+			// A box with nothing in it — the XP capped and no item or currency to carry — is not
+			// handed over at all.
+			let rewardGiftId: number | null = null
+			if (questReward !== null || xp > 0) {
+				const granted = await grantGiftDrop(c, id, drop, message)
+				await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+				rewardGiftId = granted.id
+			}
 			// The tokens ride in a second box — after the reward's own, so the player sees the
 			// reward they asked for first — while the player's daily allowance has room. Same
 			// order as the currency reward above: balance first, then the box that shows it.
 			let tokensGiftId: number | null = null
 			let tokensToday: number | null = null
 			if (TOKEN_REWARD_TYPES.has(rewardType)) {
-				tokensToday = await claimDailyTokens(
+				tokensToday = await claimAllowance(
 					c.env.DB,
 					id,
+					'$tokens',
 					GAME_REWARD_TOKENS,
 					GAME_REWARD_DAILY_TOKEN_CAP
 				)
@@ -6176,21 +6207,24 @@ const app = new Hono<App>({ strict: false })
 				await pushGiftReceived(c, id, tokensGift, GAME_REWARD_TOKENS_MESSAGE, COACH_ACCOUNT_ID)
 				tokensGiftId = tokensGift.id
 			}
-			// Every grant moves the bar, whether or not it crossed a level.
-			await pushProgressionUpdate(c, id, progression)
-			// …and every level crossed is worth a box of its own tier.
-			await grantLevelUpGifts(c, id, { progression, levelsGained })
+			if (gained !== null) {
+				// Every grant moves the bar, whether or not it crossed a level.
+				await pushProgressionUpdate(c, id, gained.progression)
+				// …and every level crossed is worth a box of its own tier.
+				await grantLevelUpGifts(c, id, gained)
+			}
 			logger.info('game reward claimed', {
 				accountId: id,
 				rewardType,
 				giftContext,
 				grantCount: claimed,
 				message,
-				xp: GAME_REWARD_XP,
-				level: progression.Level,
-				levelsGained,
-				levelXp: progression.XP,
-				giftId: granted.id,
+				xp,
+				xpToday,
+				level: gained?.progression.Level,
+				levelsGained: gained?.levelsGained,
+				levelXp: gained?.progression.XP,
+				giftId: rewardGiftId,
 				tokens: tokensGiftId === null ? 0 : GAME_REWARD_TOKENS,
 				tokensToday,
 				tokensGiftId,

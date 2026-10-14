@@ -52,7 +52,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | GET      | `/api/challenge/v2/getCurrent`                       | ~    | Weekly rotation + the caller's progress |
 | POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
 | GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
-| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 5 XP + gift box   |
+| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 10 XP + gift box  |
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | The keys a room has listed              |
 | POST     | `/api/roomkeys/v1/create`                            | ✓    | List a key for a room (owner/co-owner)  |
@@ -486,7 +486,7 @@ activity asked, so its row's `granted_at` is simply the player's last one.
   primary key) and lands the pre-existing rows on that same `''` bucket, so cooldowns from
   before it keep counting.
 
-**What a claim pays: 5 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
+**What a claim pays: 10 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
 `progression` and the box is the wrapper the client shows for it — no item, every item field
 empty, `GiftContext` 50 (`GameRewards`). The box wears the `Message` the client posted
 (`First Game of the Day`), and a `GiftPackageReceivedImmediate` frame goes out with it, the
@@ -495,21 +495,26 @@ failure can't leave a box promising XP nobody was credited.
 
 - **One flat amount for every reward type.** Pricing `FirstActivityOfDay` differently from
   `PostGameActivity` is a map keyed by type.
-- **Deliberately smaller than a level.** The first level costs 10 XP, so a single action
-  can't be a level-up — it takes two rewards to reach level 2, and the early levels are paced
-  by the hourly cooldown rather than cleared in one match.
+- **Exactly an early level.** Each of the first three levels costs 10 XP, so a fresh
+  player's first rewards each level them up; from level 4 (20 XP a level) it takes two or
+  more, and the daily XP cap paces it from there.
 - **`PostGameActivity`/`PostQuestActivity` pay 250 tokens, up to 1,250 a day**
   (`GAME_REWARD_TOKENS`, `GAME_REWARD_DAILY_TOKEN_CAP`) — per player, whatever the
   `giftContext`. `FirstActivityOfDay` pays 250 more OUTSIDE that cap — its own once-a-day
   claim already limits it, so it has no allowance row. The running total
   is one row per player in `reward_status` under the reserved type `$tokens` (context `''`):
   `grant_count` is the TOKENS paid in the window and `granted_at` when the window opened.
-  `claimDailyTokens` adds to it in one atomic upsert, refusing a grant that would cross the cap
+  `claimAllowance` adds to it in one atomic upsert, refusing a grant that would cross the cap
   (all or nothing, so the cap is a multiple of the amount), and resets it in place once the
   window is 24h old — a rolling window, so no time zone's midnight decides it. The tokens are
   credited to the RecCenterTokens balance (`StorefrontBalanceUpdate` with the resulting total)
   and arrive in a **second box** of their own — `GiftContext` 51 (`GameRewardsTokens`),
   `Currency` 250, no XP — after the reward's, so the player sees what they were for.
+- **XP is capped too: 150 a day** (`GAME_REWARD_DAILY_XP_CAP`), fifteen claims' worth, on the
+  same machinery — the player's `$xp` row, `grant_count` the XP paid in the window. Every
+  type's XP draws on it but `FirstActivityOfDay`'s, a bonus on top like its tokens. Past the
+  cap a claim still counts against its cooldown and still pays its activity's item (in a box
+  with `Xp` 0) and its tokens; a claim with nothing left to carry gets no box at all.
 - **The response stays `[]`.** It's what the client already accepts, and the reward is
   delivered as a box, so there's nothing to put in the body. The reference answers its own
   (different) flow with `{ error, success, value: null }`, not a list of rewards.
@@ -549,7 +554,7 @@ costs are easy to edit one at a time and hard to eyeball as a curve.
 | 50               | 5-Star Clothing (rarity 50) — the only one |
 
 **One reward per level crossed** — a grant spanning several levels pays each of them. In
-practice a 5 XP game reward crosses at most one, so the second reward a fresh player claims
+practice a 10 XP game reward crosses at most one, so the first reward a fresh player claims
 hands over two boxes: the XP reward itself and the 2-Star Clothing for reaching level 2. Each
 arrives as a gift box announced like any other (`Level 2!`).
 
@@ -652,8 +657,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
 - Several routes (equipment, room consumables/currencies) are empty-list stubs pending
   their own stores.
-- Game rewards pay a flat 5 XP; there is no daily XP cap beyond the hourly cooldown (the
-  reference caps activity XP per day in `daily_xp_ledgers`).
+- Game rewards pay a flat 10 XP, capped at 150 a day (the reference caps activity XP per day
+  in `daily_xp_ledgers`).
 - The level-reward table and the served config's `GiftRarity` disagree in places (see the
   level section); we grant from the table and leave the config as captured, so a client that
   previews an upcoming reward would preview the config's answer, not ours.
