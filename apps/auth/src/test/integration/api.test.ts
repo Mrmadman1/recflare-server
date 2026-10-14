@@ -1301,9 +1301,34 @@ describe('auth worker routes', () => {
 			await seedAccount(9303, 'gate_unlinked')
 			// A Steam link is not a Discord link — it carries no roles to hold.
 			await linkPlatformIdentity(env.DB, 9303, PlatformType.Steam, '76561198000009303')
+			// Staff, with no Discord link at all.
+			for (const [id, username, flag] of [
+				[9304, 'gate_developer', 'isDeveloper'],
+				[9305, 'gate_moderator', 'isModerator'],
+			] as const) {
+				await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+					.bind(
+						JSON.stringify({
+							accountId: id,
+							username,
+							passwordHash: await hashPassword(LOGIN_PASSWORD),
+							[flag]: true,
+						})
+					)
+					.run()
+			}
 		})
 
-		test('with no roles configured the gate is closed to everyone on the build', async () => {
+		test('staff are let in with no Discord link, even with the gate closed', async () => {
+			for (const roleIds of [undefined, supporter]) {
+				await withRoleIds(roleIds, async () => {
+					expect((await login('gate_developer', GATED)).status).toBe(200)
+					expect((await login('gate_moderator', GATED)).status).toBe(200)
+				})
+			}
+		})
+
+		test('with no roles configured the gate is closed to every non-staff account', async () => {
 			await withRoleIds(undefined, async () => {
 				const res = await login('gate_supporter', GATED)
 				expect(res.status).toBe(400)

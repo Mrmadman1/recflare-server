@@ -55,10 +55,11 @@ export type Env = SharedHonoEnv & {
 	 * and/or whitespace, exactly like `www`'s DISCORD_BENEFITS_ROLE_IDS. ANY one of them
 	 * qualifies. A login whose posted `ver` is a gated build is refused unless the account's
 	 * Discord link (`platform_account`, platform 101, written by the website's benefits
-	 * claim) records one of these roles.
+	 * claim) records one of these roles — or the account is STAFF (developer or moderator),
+	 * who are always let in, configured roles or not.
 	 *
-	 * Unset — or parsing to no ids — leaves the gate CLOSED: nobody gets a token on a gated
-	 * build. That is the safe reading of "supporters only" when no supporter role has been
+	 * Unset — or parsing to no ids — leaves the gate CLOSED: nobody but staff gets a token on
+	 * a gated build. That is the safe reading of "supporters only" when no supporter role has been
 	 * named, and it keeps a build that isn't ready from being reachable by accident.
 	 * Logins on every other build are never touched by this.
 	 */
