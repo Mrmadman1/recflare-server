@@ -9,7 +9,7 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 import {
 	AUTHED,
@@ -81,6 +81,13 @@ function maxUploadBytes(value: unknown): number {
 	return configured > 0 ? configured : DEFAULT_MAX_UPLOAD_BYTES
 }
 
+/**
+ * Operator-granted elevated roles (the auth worker stamps them from an account's
+ * isDeveloper/isModerator flags). Same set `rooms` treats as staff. Staff uploads skip
+ * the size limit: they load first-party content by hand that can outgrow it.
+ */
+const STAFF_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
+
 function extensionForFileType(fileType: string): string {
 	return UPLOAD_EXTENSION[Number.parseInt(fileType, 10)] ?? ''
 }
@@ -125,7 +132,8 @@ const app = new Hono<App>()
 		}
 	)
 
-	// File upload. Auth-gated — any valid account token is allowed (no role check).
+	// File upload. Auth-gated — any valid account token is allowed (no role check), but
+	// staff (developer/moderator) skip the size limit.
 	// Multipart form with `FileType` (the client's UploadFileType enum) and a binary
 	// part. Stores the file in the shared CDN R2 bucket under
 	// `<type-subfolder>/<upload-date>/<random-name>` and returns the generated name
@@ -144,7 +152,7 @@ const app = new Hono<App>()
 				'`cdn` worker serves back). The subfolder comes from `FileType`; RoomSave (1) lands',
 				'under `room/` so the cdn worker’s `GET /room/:dataBlob` finds it, and an Invention',
 				'(5) keeps a `.inv` extension on both the key and the returned name. Auth-gated —',
-				'any valid account token is allowed, no role check. A post with no binary part but',
+				'any valid account token is allowed, no role check; staff (developer/moderator) skip the size limit. A post with no binary part but',
 				'an explicit `imageName` / `filename` / `name` just echoes that name back. Mirrors',
 				'the reference server’s `Upload`.',
 			].join(' '),
@@ -154,11 +162,15 @@ const app = new Hono<App>()
 				200: json(UploadResponse, 'The stored (or echoed) file name'),
 				400: json(ErrorResponse, 'Unknown/missing FileType, or neither a file nor a name'),
 				401: UNAUTHORIZED_RESPONSE,
-				413: json(ErrorResponse, 'The binary file exceeds the configured upload limit'),
+				413: json(
+					ErrorResponse,
+					'The binary file exceeds the configured upload limit (staff are exempt)'
+				),
 			},
 		}),
 		async (c) => {
-			const id = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+			const secret = await c.env.JWT_SECRET.get()
+			const id = await validateAndGetAccountId(c.req.raw, secret)
 			if (id === null) return c.body(null, 401)
 
 			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
@@ -168,8 +180,10 @@ const app = new Hono<App>()
 			const file = Object.values(body).find((v): v is File => v instanceof File)
 
 			if (file) {
+				const roles = await validateAndGetRoles(c.req.raw, secret)
+				const isStaff = roles?.some((role) => STAFF_ROLES.has(role)) ?? false
 				const limit = maxUploadBytes(c.env.MAX_UPLOAD_BYTES)
-				if (file.size > limit) {
+				if (!isStaff && file.size > limit) {
 					return c.json({ error: `file exceeds the ${limit}-byte upload limit` }, 413)
 				}
 

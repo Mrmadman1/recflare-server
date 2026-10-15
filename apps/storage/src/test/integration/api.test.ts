@@ -25,10 +25,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(sub = '42', role: string[] = []): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, role, exp: now + 3600 })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -148,6 +148,25 @@ it('POST /upload rejects a binary above the configured size limit without storin
 		expect((await res.json()) as { error: string }).toEqual({
 			error: 'file exceeds the 3-byte upload limit',
 		})
+	} finally {
+		env.MAX_UPLOAD_BYTES = original
+	}
+})
+
+it('POST /upload lets staff upload past the size limit', async () => {
+	const original = env.MAX_UPLOAD_BYTES
+	env.MAX_UPLOAD_BYTES = '3'
+	try {
+		for (const role of ['developer', 'moderator']) {
+			const res = await SELF.fetch(`${ORIGIN}/upload`, {
+				method: 'POST',
+				headers: await bearer('42', ['gameClient', role]),
+				body: uploadForm('3', new Uint8Array([1, 2, 3, 4])),
+			})
+			expect(res.status).toBe(200)
+			const { filename } = (await res.json()) as { filename: string }
+			expect((await env.CDN_ASSETS.get(`image/${filename}`))?.size).toBe(4)
+		}
 	} finally {
 		env.MAX_UPLOAD_BYTES = original
 	}
