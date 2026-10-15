@@ -2144,6 +2144,12 @@ describe('public endpoints', () => {
 		expect(await other.json()).toMatchObject({ ProgressionEventId: 7 })
 	})
 
+	test('GET /api/purchasableXpBoosts/activations is the empty page', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/purchasableXpBoosts/activations`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({ Results: [], TotalResults: 0 })
+	})
+
 	test('GET /api/rooms/v1/filters returns an object with filter arrays', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/rooms/v1/filters`)
 		expect(res.status).toBe(200)
@@ -10247,6 +10253,7 @@ describe('openapi', () => {
 			'GET /api/progressionEvents/active',
 			'GET /api/progressionEvents/event/{id}',
 			'GET /api/progressionEvents/record/{id}',
+			'GET /api/purchasableXpBoosts/activations',
 			'GET /api/quickPlay/v1/getandclear',
 			'GET /api/referee/files',
 			'GET /api/relationships/mutualfriends',

@@ -45,6 +45,7 @@ import {
 	ReputationDto,
 	SetSelectedCheerRequest,
 	UNAUTHORIZED_RESPONSE,
+	XpBoostActivationsResponse,
 } from '../openapi'
 import {
 	addCheer,
@@ -671,4 +672,28 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 				LimitedRewardCollectionState: 0,
 			})
 		}
+	)
+
+	// The XP boosts the caller has bought and has running — the client multiplies the XP it
+	// shows by them and draws a timer for each.
+	//
+	// STUB: always the empty page. Nothing sells boosts yet, so nobody has one running. No
+	// auth while the answer is the same for everybody, like `xpEarnedToday` above; it will
+	// need the caller once it is real, since the path names no player.
+	.get(
+		'/api/purchasableXpBoosts/activations',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'The caller’s active XP boosts (stub)',
+			description:
+				'The XP boosts the caller has running, as `{ Results, TotalResults }`. Always the ' +
+				'empty page (`{ "Results": [], "TotalResults": 0 }`) — nothing on this server sells ' +
+				'boosts yet. Each entry, once there are any, names the purchase ' +
+				'(`PurchasableXpBoostLedgerEntryId`), the boost bought (`PurchasableXpBoostId`), its ' +
+				'`XpMultiplier`, and when it runs (`StartTime`/`EndTime`, ISO-8601 UTC).',
+			responses: {
+				200: json(XpBoostActivationsResponse, 'Always `{ "Results": [], "TotalResults": 0 }`'),
+			},
+		}),
+		(c) => c.json({ Results: [], TotalResults: 0 })
 	)

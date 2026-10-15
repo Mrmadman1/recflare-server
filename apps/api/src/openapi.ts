@@ -327,6 +327,24 @@ export const ProgressionEventRecordDto = z.object({
 })
 
 /**
+ * One XP boost a player bought and has running, as `GET /api/purchasableXpBoosts/activations`
+ * lists it. Documented from the reference shape; nothing here sells or stores boosts yet.
+ */
+export const XpBoostActivationDto = z.object({
+	PurchasableXpBoostLedgerEntryId: z.int().describe('The purchase this activation came from'),
+	PurchasableXpBoostId: z.string().describe('GUID of the boost product bought'),
+	XpMultiplier: z.number().describe('XP is multiplied by this while the boost runs, e.g. 2.0'),
+	StartTime: z.string().describe('ISO-8601 UTC'),
+	EndTime: z.string().describe('ISO-8601 UTC'),
+})
+
+/** `GET /api/purchasableXpBoosts/activations` — a paged list of the caller's active boosts. */
+export const XpBoostActivationsResponse = z.object({
+	Results: XpBoostActivationDto.array(),
+	TotalResults: z.int().describe('The number of entries in `Results`'),
+})
+
+/**
  * The form body of `POST /api/PlayerCheer/v1/create`. Nothing here is stored beyond the
  * counter the cheer increments: `Anonymous` is spent on the notification it triggers and
  * `RoomId` is dropped outright — see the route.
