@@ -1188,6 +1188,17 @@ export const PurchaseRoomCurrencyRequest = z.object({
 })
 
 /**
+ * What a player holds of one room currency, as `GET /api/roomcurrencies/v1/getBalance` answers
+ * it. `ModifiedAt` is the time of the response: `room_balance` keeps no modification time.
+ */
+export const RoomCurrencyBalance = z.object({
+	AccountId: z.int().describe('The player the balance belongs to'),
+	CurrencyId: z.string().describe('The room currency'),
+	Balance: z.int().describe('What the player holds of it; 0 when they have never earned any'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC; the time of the response'),
+})
+
+/**
  * What `POST /api/roomCurrencies/v2/purchase` answers: both balances the purchase moved,
  * inside the `{ Value, Success, Error, error_id }` envelope the room-currency writes use.
  * Each `Balance` is a RESULTING total. Only the success form has been observed; a refusal's

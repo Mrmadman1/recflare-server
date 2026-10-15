@@ -1888,6 +1888,31 @@ describe('econ endpoints', () => {
 				expect(await resultsOf(res)).toEqual([])
 			}
 			expect(await resultsOf(await award([], await bearer('1')))).toEqual([])
+
+			// getBalance reads back what the awards left, for any player the query names.
+			const balance = async (query: string, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/getBalance?${query}`, { headers })
+			expect((await balance(`currencyId=${coin.CurrencyId}&accountId=205`)).status).toBe(401)
+			const read = await balance(`currencyId=${coin.CurrencyId}&accountId=205`, await bearer('999'))
+			expect(read.status).toBe(200)
+			const body205 = (await read.json()) as Record<string, unknown>
+			expect(Object.keys(body205)).toEqual(['AccountId', 'CurrencyId', 'Balance', 'ModifiedAt'])
+			expect(body205).toMatchObject({ AccountId: 205, CurrencyId: coin.CurrencyId, Balance: 6 })
+			expect(Date.parse(body205.ModifiedAt as string)).not.toBeNaN()
+			// Never paid, and an unknown currency, are both a balance of 0.
+			for (const query of [
+				`currencyId=${coin.CurrencyId}&accountId=207`,
+				'currencyId=a3f1e8d2-0000-4000-8000-000000000000&accountId=205',
+			]) {
+				expect(await (await balance(query, await bearer('1'))).json()).toMatchObject({ Balance: 0 })
+			}
+			for (const query of [
+				`currencyId=${coin.CurrencyId}`,
+				'accountId=205',
+				`currencyId=${coin.CurrencyId}&accountId=x`,
+			]) {
+				expect((await balance(query, await bearer('1'))).status).toBe(400)
+			}
 		})
 
 		test('POST awardCurrency/bulk floors at zero and ignores the Limit', async () => {
@@ -3784,7 +3809,9 @@ describe('econ endpoints', () => {
 		})
 		// ConfigurationData is JSON escaped into a string (or null), never a nested object.
 		for (const item of body) {
-			expect(item.ConfigurationData === null || typeof item.ConfigurationData === 'string').toBe(true)
+			expect(item.ConfigurationData === null || typeof item.ConfigurationData === 'string').toBe(
+				true
+			)
 		}
 	})
 
@@ -6613,9 +6640,7 @@ describe('econ endpoints', () => {
 		// first activity of the day, so another activity doesn't claim it either, and writes
 		// no row of its own.
 		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
-		expect(
-			(await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status
-		).toBe(200)
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
 		expect(await statusOf('FirstActivityOfDay')).toEqual(claimed)
 		expect(await statusOf('FirstActivityOfDay', 'Soccer')).toBeNull()
 
@@ -7021,9 +7046,9 @@ describe('econ endpoints', () => {
 		)
 
 		// An activity with a prize still hands it over, in a box carrying no XP.
-		expect(
-			(await request('rewardType=PostQuestActivity&giftContext=Quest_Goblin_S')).status
-		).toBe(200)
+		expect((await request('rewardType=PostQuestActivity&giftContext=Quest_Goblin_S')).status).toBe(
+			200
+		)
 		const quest = (await rewardBoxes()).at(-1)
 		expect(quest).toMatchObject({ GiftContext: 4003, Xp: 0 })
 		expect(quest?.AvatarItemDesc).not.toBe('')
@@ -7491,6 +7516,7 @@ describe('econ endpoints', () => {
 			'GET /api/roomconsumables/v1/roomConsumable/room/{roomId}/me',
 			'GET /api/roomcurrencies/v1/currencies',
 			'GET /api/roomcurrencies/v1/getAllBalances',
+			'GET /api/roomcurrencies/v1/getBalance',
 			'GET /api/roomcurrencies/v1/getPurchaseOffersBatch',
 			'GET /api/roomkeys/v1/mine',
 			'GET /api/roomkeys/v1/room',

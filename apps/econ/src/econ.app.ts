@@ -139,6 +139,7 @@ import {
 	RemoveInfluencerBody,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
+	RoomCurrencyBalance,
 	RoomCurrencyDto,
 	RoomCurrencyEnvelope,
 	RoomCurrencyPurchaseOfferDto,
@@ -4584,6 +4585,59 @@ const app = new Hono<App>({ strict: false })
 	)
 	.get('/api/roomcurrencies/v1/getAllBalances', listRoute('Room balances', 'Empty stub'), (c) =>
 		c.json([])
+	)
+
+	// What one player holds of one room currency. Any signed-in caller may read any player's,
+	// as the query names the player rather than taking the caller.
+	.get(
+		'/api/roomcurrencies/v1/getBalance',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'A player’s balance of one room currency',
+			description: [
+				'What the player named by `accountId` holds of the room currency `currencyId`',
+				'(`room_balance`). A player who has never earned any — and a currency that does not',
+				'exist — is a `Balance` of 0, not a 404.',
+				'',
+				'`ModifiedAt` is the time of the response: `room_balance` keeps no modification time.',
+				'A missing `currencyId` or a non-integer `accountId` is a 400.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'currencyId',
+					in: 'query',
+					required: true,
+					description: 'The room currency',
+					schema: { type: 'string' },
+				},
+				{
+					name: 'accountId',
+					in: 'query',
+					required: true,
+					description: 'The player whose balance to read',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(RoomCurrencyBalance, 'The player’s balance'),
+				400: { description: 'A missing `currencyId` or a non-integer `accountId`' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			if ((await authedId(c)) === null) return unauthorized(c)
+			const currencyId = c.req.query('currencyId')?.trim() ?? ''
+			const rawAccountId = c.req.query('accountId')?.trim() ?? ''
+			if (currencyId === '' || !/^\d+$/.test(rawAccountId)) return c.body(null, 400)
+			const accountId = Number(rawAccountId)
+			return c.json({
+				AccountId: accountId,
+				CurrencyId: currencyId,
+				Balance: await getRoomBalance(c.env.DB, currencyId, accountId),
+				ModifiedAt: new Date().toISOString(),
+			})
+		}
 	)
 
 	// Buy room currency with tokens, through one of the currency's purchase offers. The body
