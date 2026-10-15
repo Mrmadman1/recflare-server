@@ -2119,6 +2119,31 @@ describe('public endpoints', () => {
 		expect(missing.status).toBe(404)
 	})
 
+	test('GET /api/progressionEvents/record/:id is an empty record for the caller', async () => {
+		const url = `${ORIGIN}/api/progressionEvents/record/18`
+		expect((await exports.default.fetch(url)).status).toBe(401)
+
+		const res = await exports.default.fetch(url, { headers: await bearer('2') })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({
+			AccountId: 2,
+			ProgressionEventId: 18,
+			Xp: 0,
+			GameMinutesToday: 0,
+			RewardsCollected: 0,
+			BonusRewardsCollected: 0,
+			XpBoostLastPurchasedAt: null,
+			PremiumRewardsCollected: 0,
+			LimitedRewardCollectionState: 0,
+		})
+
+		// The id is echoed, whichever event is asked for.
+		const other = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/record/7`, {
+			headers: await bearer('2'),
+		})
+		expect(await other.json()).toMatchObject({ ProgressionEventId: 7 })
+	})
+
 	test('GET /api/rooms/v1/filters returns an object with filter arrays', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/rooms/v1/filters`)
 		expect(res.status).toBe(200)
@@ -10221,6 +10246,7 @@ describe('openapi', () => {
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/progressionEvents/active',
 			'GET /api/progressionEvents/event/{id}',
+			'GET /api/progressionEvents/record/{id}',
 			'GET /api/quickPlay/v1/getandclear',
 			'GET /api/referee/files',
 			'GET /api/relationships/mutualfriends',

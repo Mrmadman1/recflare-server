@@ -41,6 +41,7 @@ import {
 	JsonArray,
 	JsonObject,
 	ProgressionDto,
+	ProgressionEventRecordDto,
 	ReputationDto,
 	SetSelectedCheerRequest,
 	UNAUTHORIZED_RESPONSE,
@@ -630,5 +631,44 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 			const event = PROGRESSION_EVENTS.get(Number(c.req.param('id')))
 			if (event === undefined) return c.body(null, 404)
 			return c.body(event, 200, { 'Content-Type': 'application/json' })
+		}
+	)
+
+	// The caller's progress through one progression event — the XP, minutes and rewards the
+	// client draws its event track from.
+	//
+	// STUB: every counter 0, for any event id, echoing the id requested. Nothing tracks
+	// progress through an event yet (see `/active` above). Auth-gated because the record is
+	// the CALLER's and the path names no player.
+	.get(
+		'/api/progressionEvents/record/:id{[0-9]+}',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'The caller’s progress through a progression event (stub)',
+			description:
+				'The caller’s record for the event with this `ProgressionEventId`. Always empty ' +
+				'for now — 0 XP, nothing collected, `XpBoostLastPurchasedAt` null — for any id: ' +
+				'nothing on this server tracks progress through an event yet.',
+			security: AUTHED,
+			parameters: [idParam('id', 'The `ProgressionEventId`')],
+			responses: {
+				200: json(ProgressionEventRecordDto, 'An empty record for the event requested'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json({
+				AccountId: id,
+				ProgressionEventId: Number(c.req.param('id')),
+				Xp: 0,
+				GameMinutesToday: 0,
+				RewardsCollected: 0,
+				BonusRewardsCollected: 0,
+				XpBoostLastPurchasedAt: null,
+				PremiumRewardsCollected: 0,
+				LimitedRewardCollectionState: 0,
+			})
 		}
 	)

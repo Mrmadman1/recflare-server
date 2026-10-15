@@ -311,6 +311,22 @@ export const ProgressionDto = z.object({
 })
 
 /**
+ * The caller's progress through one progression event (`/api/progressionEvents/record/:id`).
+ * A stub for now: every counter is 0 and nothing is collected.
+ */
+export const ProgressionEventRecordDto = z.object({
+	AccountId: z.int().describe('The caller'),
+	ProgressionEventId: z.int().describe('The event requested'),
+	Xp: z.int(),
+	GameMinutesToday: z.int(),
+	RewardsCollected: z.int(),
+	BonusRewardsCollected: z.int(),
+	XpBoostLastPurchasedAt: z.string().nullable().describe('ISO-8601 UTC; null when never bought'),
+	PremiumRewardsCollected: z.int(),
+	LimitedRewardCollectionState: z.int(),
+})
+
+/**
  * The form body of `POST /api/PlayerCheer/v1/create`. Nothing here is stored beyond the
  * counter the cheer increments: `Anonymous` is spent on the notification it triggers and
  * `RoomId` is dropped outright — see the route.
@@ -567,7 +583,9 @@ export const InventionV9Dto = z.object({
 	Name: z.string(),
 	Description: z.string(),
 	ImageName: z.string(),
-	UgcVersion: z.int().describe('The UGC format the blob was written in; 1 when the save named none'),
+	UgcVersion: z
+		.int()
+		.describe('The UGC format the blob was written in; 1 when the save named none'),
 	CurrentVersionNumber: z.int(),
 	LatestVersionNumber: z.int().describe('The same as CurrentVersionNumber on a fresh save'),
 	Accessibility: z.int(),
@@ -760,7 +778,9 @@ export const PublishInventionRequest = z.object({
 		.int()
 		.nullable()
 		.optional()
-		.describe('Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'),
+		.describe(
+			'Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'
+		),
 	Price: z
 		.int()
 		.nullable()
@@ -1359,7 +1379,9 @@ export const PlayerEventsAll = z.object({
 export const PlayerPublicEvents = z.object({
 	Created: z.array(PlayerEventBaseDto).describe('Public events the player created'),
 	Responses: z
-		.array(z.object({ PlayerEvent: PlayerEventBaseDto, PlayerEventResponse: PlayerEventResponseDto }))
+		.array(
+			z.object({ PlayerEvent: PlayerEventBaseDto, PlayerEventResponse: PlayerEventResponseDto })
+		)
 		.describe('Public events the player is attending, each beside their Going RSVP'),
 })
 
