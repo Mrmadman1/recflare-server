@@ -29,7 +29,7 @@ import {
 } from './api'
 import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, ItemPage } from './Item'
-import { ModerationPage } from './Moderation'
+import { ModerationPage, PlayerBanStatus } from './Moderation'
 import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
 
@@ -1412,6 +1412,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	return (
 		<section className="card">
 			<h2>Staff</h2>
+			<PlayerBanStatus playerId={account.accountId} navigate={navigate} />
 			{/* The gifts are developer-only; www refuses them to moderators. */}
 			{isDeveloper() && (
 				<>

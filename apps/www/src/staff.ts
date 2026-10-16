@@ -21,7 +21,7 @@ import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 // Imported rather than reimplemented: the SQL belongs with the table, and `banFromReport`
 // is the same write `api` would do. www owns the ENDPOINTS, not the storage — see the
 // module comment below.
-import { banEvasionMatch, linkedAccounts } from '../../api/src/bans-db'
+import { banEvasionMatch, linkedAccounts, resolveBan } from '../../api/src/bans-db'
 import { getCustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import {
 	banBlockDetails,
@@ -530,6 +530,11 @@ export async function bansInForceHandler(c: Context<App>) {
  * Everything on file about one player: every report against them, every warning handed
  * down, and the ban in force if there is one.
  *
+ * `activeBan` is the ban on THIS account. `blockedBy` is what `auth` and `match` actually
+ * enforce — the same `resolveBan` under the operator's arms — so it also catches a player
+ * who is locked out by a ban on an account they share a platform identity or an IP with.
+ * Without it, a ban evader's new account read "Not banned" while being unable to play.
+ *
  * One call because it is one screen — a moderator deciding what to do about an account
  * reads all three together, and three round trips would let the page render a decision
  * out of a partially-loaded history.
@@ -538,16 +543,18 @@ export async function playerHistoryHandler(c: Context<App>) {
 	const playerId = Number.parseInt(c.req.param('id') ?? '', 10)
 	if (Number.isNaN(playerId)) return c.json({ error: 'A numeric player id is required' }, 400)
 
-	const [reports, warnings, activeBan] = await Promise.all([
+	const [reports, warnings, activeBan, blockedBy] = await Promise.all([
 		getReportsAgainst(c.env.DB, playerId),
 		getWarningsAgainst(c.env.DB, playerId),
 		getActiveBan(c.env.DB, playerId),
+		resolveBan(c.env.DB, playerId, { arms: armsFor(c.env) }),
 	])
 	return c.json({
 		playerId,
 		reports: await withImageNames(c.env.DB, reports),
 		warnings,
 		activeBan,
+		blockedBy,
 	})
 }
 

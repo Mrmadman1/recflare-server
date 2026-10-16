@@ -1482,6 +1482,41 @@ it('previews which other accounts a ban would reach', async () => {
 	expect(preview.linked.map((l) => l.accountId)).not.toContain(8220)
 })
 
+// A ban evader's new account has no ban of its own, but `auth`/`match` lock it out through
+// the linked arms — so the history must say so rather than read "Not banned".
+it('reports a linked account’s ban as what blocks a player', async () => {
+	const seedAccount = (data: Record<string, unknown>) =>
+		env.DB.prepare('INSERT OR REPLACE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify(data))
+			.run()
+	await seedAccount({ accountId: 8230, username: 'Banned', lastLoginIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8231, username: 'Alt', signupIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8232, username: 'Stranger', signupIp: '203.0.113.31' })
+	const report = await createReport(env.DB, { reporterPlayerId: 8233, reportedPlayerId: 8230 })
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+
+	type History = {
+		activeBan: { id: number } | null
+		blockedBy: { via: string; bannedAccountId: number; ban: { id: number } } | null
+	}
+	const history = async (id: number) =>
+		(await (await staffGet(`/api/staff/players/${id}`, 8110)).json()) as History
+
+	// The banned account itself: its own ban, matched directly.
+	expect(await history(8230)).toMatchObject({
+		activeBan: { id: report.id },
+		blockedBy: { via: 'account', bannedAccountId: 8230 },
+	})
+	// The alt: no ban of its own, blocked through the shared IP — naming whose ban it is.
+	expect(await history(8231)).toMatchObject({
+		activeBan: null,
+		blockedBy: { via: 'ip', bannedAccountId: 8230, ban: { id: report.id } },
+	})
+	expect(await history(8232)).toMatchObject({ activeBan: null, blockedBy: null })
+})
+
 // The panel's own URLs must reach the SPA, not the worker's API surface. `requireStaff`
 // is mounted on `/api/staff/*`, and `run_worker_first` lists `/api/*` — so every
 // `/moderation/…` path falls through assets-first to the SPA shell, which is what lets a
