@@ -2561,8 +2561,9 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 // (see {@link parseRow}). It can't be derived the way cheers are — a visit leaves no
 // per-player row to count — and it can't live in the blob, where a read-modify-write of
 // the whole room would drop concurrent visits. `VisitorCount` (distinct visitors) is
-// still left as the blob has it: `interaction.last_visited_at` is only stamped by the
-// cheer/favorite toggles, so counting those rows would report cheerers as visitors.
+// still left as the blob has it: `interaction.last_visited_at` is stamped per player by
+// {@link recordRoomVisit}, but not for dorms, so counting those rows would under-report
+// a dorm's visitors.
 
 /** One room's derived engagement counters (the aggregate maps below key these by RoomId). */
 export interface RoomStats {
@@ -2597,9 +2598,30 @@ function storedStats(stats: unknown): Record<string, unknown> {
  * matchmake (see its `enterRoom`), which is the only way a player ever lands in a room.
  * A blind `visits = visits + 1` UPDATE: it's the whole write, so simultaneous visitors
  * can't clobber each other, and an unknown room id simply matches nothing.
+ *
+ * Also stamps the player's `interaction.last_visited_at`, which is what puts the room on
+ * their visited history ({@link getVisitedRooms}, `lists`' "recently visited" row). This
+ * is the ONLY writer of `last_visited_at` — cheering or favoriting a room is not a visit.
+ * Dorms are left off the history (they are counted in `visits`, but nobody needs their
+ * own dorm, or a friend's, listed as somewhere they went). The upsert leaves
+ * `cheered`/`favorited` alone; selecting from `room` keeps an unknown id from leaving
+ * an orphan row behind.
  */
-export async function recordRoomVisit(db: D1Database, roomId: number): Promise<void> {
-	await db.prepare('UPDATE room SET visits = visits + 1 WHERE room_id = ?1').bind(roomId).run()
+export async function recordRoomVisit(
+	db: D1Database,
+	roomId: number,
+	playerId: number
+): Promise<void> {
+	await db.batch([
+		db.prepare('UPDATE room SET visits = visits + 1 WHERE room_id = ?1').bind(roomId),
+		db
+			.prepare(
+				`INSERT INTO interaction (player_id, room_id, last_visited_at)
+				 SELECT ?1, room_id, ?3 FROM room WHERE room_id = ?2 AND is_dorm IS NOT 1
+				 ON CONFLICT(player_id, room_id) DO UPDATE SET last_visited_at = excluded.last_visited_at`
+			)
+			.bind(playerId, roomId, new Date().toISOString()),
+	])
 }
 
 /**
@@ -3268,18 +3290,19 @@ async function toggleInteraction(
 	roomId: number,
 	column: 'cheered' | 'favorited'
 ): Promise<Interaction> {
-	const now = new Date().toISOString()
 	// First interaction defaults the toggled column to 1; subsequent calls flip it.
+	// `last_visited_at` is left alone: only entering the room ({@link recordRoomVisit})
+	// is a visit, so a room cheered from a feed stays off the visited history.
 	return toInteraction(
 		await db
 			.prepare(
-				`INSERT INTO interaction (player_id, room_id, ${column}, last_visited_at)
-				 VALUES (?1, ?2, 1, ?3)
+				`INSERT INTO interaction (player_id, room_id, ${column})
+				 VALUES (?1, ?2, 1)
 				 ON CONFLICT(player_id, room_id)
-				 DO UPDATE SET ${column} = NOT ${column}, last_visited_at = ?3
+				 DO UPDATE SET ${column} = NOT ${column}
 				 RETURNING cheered, favorited`
 			)
-			.bind(playerId, roomId, now)
+			.bind(playerId, roomId)
 			.first<InteractionRow>()
 	)
 }

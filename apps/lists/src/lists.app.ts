@@ -219,7 +219,7 @@ const ROW_FEEDS: Record<string, RowFeed> = {
 const PERSONAL_ROW_FEEDS: Record<string, (db: D1Database, accountId: number) => Promise<Room[]>> = {
 	// Rooms the caller has been in, most recently visited first — the "Continue Playing"
 	// carousel as an algorithmic row. Backed by the `interaction` table's `last_visited_at`,
-	// which the `match` heartbeat stamps, and served straight from `getVisitedRooms` so this
+	// which every `match` matchmake stamps, and served straight from `getVisitedRooms` so this
 	// row and `rooms` `GET /rooms/visitedby/me` can never disagree about where someone has been.
 	recentlyvisited: (db, accountId) => getVisitedRooms(db, accountId, 0, LIST_SIZE),
 }

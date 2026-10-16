@@ -16,6 +16,7 @@ import {
 	getRoomInstance,
 	modifySubRoom,
 	PRESENCE_SCHEMA_DDL,
+	recordRoomVisit,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
@@ -756,6 +757,57 @@ describe('public endpoints', () => {
 			headers: await bearer('96'),
 		})
 		expect(((await res.json()) as { errorCode: number }).errorCode).toBe(20)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM interaction WHERE player_id = 96').first()
+		).toBeNull()
+	})
+
+	test('a matchmake stamps the room on the player’s visited history', async () => {
+		const enter = async (player: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/77`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(player)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ JoinMode: '2' }).toString(),
+			})
+			expect(res.status).toBe(200)
+		}
+		const row = () =>
+			env.DB.prepare(
+				'SELECT cheered, favorited, last_visited_at FROM interaction WHERE player_id = 97 AND room_id = 77'
+			).first<{ cheered: number; favorited: number; last_visited_at: string | null }>()
+
+		// First visit creates the row with no cheer/favorite.
+		await enter('97')
+		const first = await row()
+		expect(first).toMatchObject({ cheered: 0, favorited: 0 })
+		expect(first!.last_visited_at).not.toBeNull()
+
+		// A later visit moves the timestamp and leaves an existing favorite alone.
+		await env.DB.prepare(
+			"UPDATE interaction SET favorited = 1, last_visited_at = '2000-01-01T00:00:00.000Z' WHERE player_id = 97 AND room_id = 77"
+		).run()
+		await enter('97')
+		const second = await row()
+		expect(second!.favorited).toBe(1)
+		expect(second!.last_visited_at! > '2000-01-01T00:00:00.000Z').toBe(true)
+
+		// A dorm is counted as a visit but kept off the history. Seeded as a bare row and
+		// visited directly: matchmaking into a fresh dorm would take subroom ids other
+		// tests seed by hand.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(JSON.stringify({ RoomId: 98_000, Name: 'DormVisitTest', IsDorm: true }))
+			.run()
+		await recordRoomVisit(env.DB, 98_000, 98)
+		const visits = await env.DB.prepare('SELECT visits FROM room WHERE room_id = 98000').first<{
+			visits: number
+		}>()
+		expect(visits!.visits).toBe(1)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM interaction WHERE player_id = 98').first()
+		).toBeNull()
 	})
 
 	test('POST /matchmake/room/:roomId seeds presence with the account device class', async () => {

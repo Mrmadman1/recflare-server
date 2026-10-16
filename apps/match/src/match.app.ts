@@ -687,10 +687,11 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	// player landed in, and a matchmake is the only way into a room, so this is the one
 	// place a visit can be recorded once — whether they got here by room id, by subroom,
 	// by following a friend, from a club's clubhouse, or into their own dorm. Bumps the
-	// room's `visits` column, which is served as `Stats.VisitCount`. Best-effort: a
-	// counter is not worth failing the matchmake over.
+	// room's `visits` column, which is served as `Stats.VisitCount`, and stamps the
+	// player's `interaction.last_visited_at`, which puts the room on their visited
+	// history (dorms excepted). Best-effort: neither is worth failing the matchmake over.
 	try {
-		await recordRoomVisit(c.env.DB, roomInstance.roomId)
+		await recordRoomVisit(c.env.DB, roomInstance.roomId, id)
 	} catch (err) {
 		logger.error('failed to record room visit', {
 			roomId: roomInstance.roomId,

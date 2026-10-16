@@ -19,6 +19,7 @@ import {
 	PRESENCE_SCHEMA_DDL,
 	publicStudioBundleFilename,
 	putUnityAsset,
+	recordRoomVisit,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
@@ -749,19 +750,25 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
-	it('GET /rooms/visitedby/me returns a bare array of rooms the caller has interacted with (auth-scoped)', async () => {
+	it('GET /rooms/visitedby/me returns a bare array of rooms the caller has visited (auth-scoped)', async () => {
 		const headers = await bearer('779')
 
-		// No interactions yet → empty array.
+		// No visits yet → empty array.
 		const empty = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers })
 		).json()) as unknown[]
 		expect(empty).toEqual([])
 
-		// Interacting (cheer/favorite) records a last-visit on those rooms.
+		// Cheering/favoriting is not a visit — only `match` entering the room stamps one.
 		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, { method: 'PUT', headers })
 		await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me/favorite`, { method: 'PUT', headers })
+		const afterToggles = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers })
+		).json()) as unknown[]
+		expect(afterToggles).toEqual([])
 
+		await recordRoomVisit(env.DB, 2, 779)
+		await recordRoomVisit(env.DB, 12, 779)
 		const body = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me?skip=0&take=100`, { headers })
 		).json()) as Array<{ RoomId: number }>
@@ -782,16 +789,10 @@ describe('rooms endpoints', () => {
 	})
 
 	it('GET /rooms/visitedby/:playerId serves any player’s visited rooms to any authed caller', async () => {
-		// Give 790 a visit history (cheering/favoriting stamps a last-visit).
+		// Give 790 a visit history.
 		const subject = await bearer('790')
-		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, {
-			method: 'PUT',
-			headers: subject,
-		})
-		await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me/favorite`, {
-			method: 'PUT',
-			headers: subject,
-		})
+		await recordRoomVisit(env.DB, 2, 790)
+		await recordRoomVisit(env.DB, 12, 790)
 
 		// Anyone with a token reads it — a bare array. Friendship is not required: a
 		// player's history is as public as the rooms on their profile.
