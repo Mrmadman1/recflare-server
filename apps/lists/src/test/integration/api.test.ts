@@ -797,9 +797,12 @@ it('creates the list and adds the item on PUT …/createlistifneeded', async () 
 	// changed — with the id unquoted, as every read of a list serves it.
 	const body = await res.text()
 	expect(body).toMatch(/"ListId":\d+,/)
-	// The SAVE's projection: every key the read serves EXCEPT `Accessibility`, in the read's
-	// order. Compared exactly, not loosely, because the missing key is the point.
-	const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+	// Wrapped in the write envelope, around the SAVE's projection: every key the read serves
+	// EXCEPT `Accessibility`, in the read's order. Compared exactly, not loosely, because the
+	// missing key is the point.
+	const { Value, ...envelope } = JSON.parse(body) as { Value: Record<string, unknown> }
+	expect(envelope).toEqual({ Success: true, Error: null, error_id: null })
+	const { ListId: _id, ...rest } = Value
 	expect(rest).toEqual({
 		CreatorAccountId: 300,
 		Name: '__SavedForLater_Rooms',
@@ -1510,6 +1513,7 @@ it('generates a spec with no dangling $refs', async () => {
 			'/curatedlists',
 			'/curatedlists/bulk',
 			'/curatedlists/{name}/items/{itemId}/createlistifneeded',
+			'/curatedlists/{listId}/items/{itemId}',
 			'/algorithmiclists/{list}',
 			'/contextualfeatures',
 		])
@@ -1517,4 +1521,89 @@ it('generates a spec with no dangling $refs', async () => {
 	// The spec route keeps itself out of its own output.
 	expect(Object.keys(spec.paths)).not.toContain('/openapi.json')
 	expect(JSON.stringify(spec).match(/\$ref/g)).toBeNull()
+})
+
+it('serves the Coach’s `staffpicks` list for /algorithmiclists/staffpicks', async () => {
+	// No list yet: an empty row, not a 404.
+	const empty = await SELF.fetch(`${ORIGIN}/algorithmiclists/staffpicks?type=1`)
+	expect(await empty.json()).toEqual({ Type: 1, Entities: [] })
+
+	// A player's list of the same name must not fill the row — only the Coach's does.
+	await SELF.fetch(`${ORIGIN}/curatedlists/staffpicks/items/9/createlistifneeded`, {
+		method: 'PUT',
+		headers: await bearer('42'),
+		body: new URLSearchParams({ type: '1', accessibility: '1' }),
+	})
+	const now = new Date().toISOString()
+	const { list_id } = (await env.DB.prepare(
+		`INSERT INTO list (creator_account_id, list_type, list_name, accessibility, created_at)
+		 VALUES (1, 1, 'StaffPicks', 1, ?1) RETURNING list_id`
+	)
+		.bind(now)
+		.first<{ list_id: number }>())!
+	for (const id of ['7', '3', '5']) {
+		await env.DB.prepare('INSERT INTO list_item (list_id, item_id) VALUES (?1, ?2)')
+			.bind(list_id, id)
+			.run()
+	}
+
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/StaffPicks?type=1`)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		Type: 1,
+		Entities: ['7', '3', '5'].map((Id) => ({ Id, Context: null })),
+	})
+})
+
+/** The client's un-save call: DELETE the item from the list by id. */
+async function removeFromList(listId: string, itemId: string, headers: Record<string, string>) {
+	return SELF.fetch(`${ORIGIN}/curatedlists/${listId}/items/${itemId}`, {
+		method: 'DELETE',
+		headers,
+	})
+}
+
+it('removes an item from the caller’s list on DELETE …/items/:itemId', async () => {
+	const headers = await bearer('320')
+	await saveForLater('__SavedForLater_Rooms', '953', headers)
+	const saved = await (await saveForLater('__SavedForLater_Rooms', '2576', headers)).text()
+	const listId = /"ListId":(\d+),/.exec(saved)![1]
+
+	const res = await removeFromList(listId, '2576', headers)
+	expect(res.status).toBe(200)
+	const body = await res.text()
+	expect(body).toMatch(new RegExp(`"ListId":${listId},`))
+	const { Value, ...envelope } = JSON.parse(body) as { Value: Record<string, unknown> }
+	expect(envelope).toEqual({ Success: true, Error: null, error_id: null })
+	const { ListId: _id, ...rest } = Value
+	expect(rest).toEqual({
+		CreatorAccountId: 320,
+		Name: '__SavedForLater_Rooms',
+		Description: null,
+		ImageName: 'DefaultRoomImage.jpg',
+		Type: 1,
+		ItemIds: ['953'],
+		CreatedAt: expect.any(String),
+	})
+
+	// Removing the last item keeps the list; removing an absent one answers it unchanged.
+	await removeFromList(listId, '953', headers)
+	const again = await removeFromList(listId, '953', headers)
+	expect(again.status).toBe(200)
+	expect((await again.json()) as { Value: { ItemIds: string[] } }).toMatchObject({
+		Value: { ItemIds: [] },
+	})
+	expect(await readList(320)).toMatchObject({ ItemIds: [] })
+})
+
+it('refuses to remove from another player’s list, or without a token', async () => {
+	const saved = await (
+		await saveForLater('__SavedForLater_Rooms', '953', await bearer('321'))
+	).text()
+	const listId = /"ListId":(\d+),/.exec(saved)![1]
+
+	expect((await removeFromList(listId, '953', await bearer('322'))).status).toBe(403)
+	expect((await removeFromList(listId, '953', {})).status).toBe(401)
+	expect((await removeFromList('999999', '953', await bearer('321'))).status).toBe(404)
+	expect((await readList(321)).ItemIds).toEqual(['953'])
 })
