@@ -297,10 +297,11 @@ export async function getCustomAvatarItems(
 	ids: string[]
 ): Promise<CustomAvatarItem[]> {
 	if (ids.length === 0) return []
-	const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (${placeholders})`)
-		.bind(...ids)
+		.prepare(
+			`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (SELECT value FROM json_each(?1))`
+		)
+		.bind(JSON.stringify(ids))
 		.all<Row>()
 	const byId = new Map(results.map(toDto).map((item) => [item.CustomAvatarItemId, item]))
 	return ids.flatMap((id) => byId.get(id) ?? [])
