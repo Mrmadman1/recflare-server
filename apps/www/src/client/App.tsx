@@ -1044,8 +1044,8 @@ const fetchRoomPhotos = (roomId: number): Promise<PublicPhoto[]> =>
 	)
 
 /**
- * Delete a room outright — the staff takedown. `rooms` lets the owner or a developer /
- * moderator through and refuses everyone else; it answers a refusal as a 200 carrying
+ * Delete a room outright — the developer takedown. `rooms` lets the owner or a developer
+ * through and refuses everyone else, moderators included; it answers a refusal as a 200 carrying
  * `Success: false` (the game's envelope), so the check is on the body, not the status.
  */
 async function deleteRoom(roomId: number): Promise<void> {
@@ -2817,12 +2817,12 @@ function PublicRoomView({
 			</section>
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
-			    role itself on the DELETE and the listing PUT. */}
+			    role itself on the DELETE (developers only) and the listing PUT. */}
 			{isAdmin() && (
 				<>
 					{isDeveloper() && <StaffRoomTokens room={room} />}
 					<StaffListing room={room} onRoomChange={onRoomChange} />
-					<StaffTakedown room={room} onTakenDown={onTakenDown} />
+					{isDeveloper() && <StaffTakedown room={room} onTakenDown={onTakenDown} />}
 				</>
 			)}
 		</>

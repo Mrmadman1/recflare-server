@@ -1759,9 +1759,9 @@ describe('rooms endpoints', () => {
 		expect(interactions!.n).toBe(0)
 	})
 
-	it('DELETE /rooms/:id also lets staff through — the website’s takedown — but only there', async () => {
-		// Somebody else's room. A moderator token may delete it; the same token may NOT
-		// rename it, which is what a misapplied check once allowed.
+	it('DELETE /rooms/:id also lets developers through — the website’s takedown — but only there', async () => {
+		// Somebody else's room. A developer token may delete it (a moderator's may not); the
+		// same token may NOT rename it, which is what a misapplied check once allowed.
 		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
 			.bind(
 				JSON.stringify({
@@ -1775,7 +1775,7 @@ describe('rooms endpoints', () => {
 				})
 			)
 			.run()
-		const staff = await bearer('999', ['gameClient', 'moderator'])
+		const staff = await bearer('999', ['gameClient', 'developer'])
 		const roomExists = async () =>
 			(await env.DB.prepare('SELECT 1 FROM room WHERE room_id = 9501').first()) !== null
 
@@ -1786,10 +1786,14 @@ describe('rooms endpoints', () => {
 		})
 		expect(await bodyOf(rename)).toMatchObject({ Success: false, ErrorId: 'Rooms.NotOwner' })
 
-		// A plain player is still refused; the moderator gets through.
+		// A plain player and a moderator are refused; the developer gets through.
 		const del = async (headers: Record<string, string>) =>
 			bodyOf(await SELF.fetch(`${ORIGIN}/rooms/9501`, { method: 'DELETE', headers }))
 		expect(await del(await bearer('2', ['gameClient']))).toMatchObject({
+			Success: false,
+			ErrorId: 'Rooms.NotOwner',
+		})
+		expect(await del(await bearer('998', ['gameClient', 'moderator']))).toMatchObject({
 			Success: false,
 			ErrorId: 'Rooms.NotOwner',
 		})

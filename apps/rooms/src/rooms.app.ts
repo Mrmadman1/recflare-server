@@ -518,6 +518,15 @@ async function isStaff(c: Context<App>): Promise<boolean> {
 }
 
 /**
+ * Whether the caller's token carries the `developer` role — the narrower of the two staff
+ * roles, for the actions a moderator may not take (deleting a room that isn't theirs).
+ */
+async function isDeveloper(c: Context<App>): Promise<boolean> {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	return roles?.includes('developer') ?? false
+}
+
+/**
  * Whether the `:playerId` in the path is banned from the `:roomId` in it — the read behind
  * both `isBanned` routes, which differ only in the envelope they wrap the answer in.
  *
@@ -2433,7 +2442,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Delete a room. Auth-gated (401); owners and staff (developers/moderators) may delete.
+	// Delete a room. Auth-gated (401); the owner or a developer may delete — not a moderator.
 	// Removes the room record (and per-player interactions with it) and the room's
 	// image object from the shared CDN bucket. Images players *took* in the room are
 	// left alone — they live in the api/img world and outlast the room.
@@ -2443,7 +2452,7 @@ const app = new Hono<App>()
 			tags: ['Room settings'],
 			summary: 'Delete a room',
 			description: [
-				'Owner or staff. Removes the room record, the per-player interactions with it, and the',
+				'Owner or developer (a moderator token is refused). Removes the room record, the per-player interactions with it, and the',
 				'room’s image object from the shared CDN bucket. Photos players TOOK in the room are',
 				'left alone — those live in the api/img world and outlive the room.',
 			].join(' '),
@@ -2468,7 +2477,7 @@ const app = new Hono<App>()
 				})
 			}
 			const isOwner = room.CreatorAccountId === accountId
-			if (!isOwner && !(await isStaff(c))) {
+			if (!isOwner && !(await isDeveloper(c))) {
 				return roomResult(c, {
 					Success: false,
 					ErrorId: 'Rooms.NotOwner',
@@ -2487,7 +2496,7 @@ const app = new Hono<App>()
 				await c.env.CDN_ASSETS.delete(`room/${imageName}`)
 			}
 
-			// A takedown — staff deleting a room that isn't theirs — goes in the audit log; an
+			// A takedown — a developer deleting a room that isn't theirs — goes in the audit log; an
 			// owner deleting their own room is their business and doesn't. The row keeps the
 			// room's identity, since the room itself is gone and nothing else will answer "which
 			// room was that". Written after the fact and caught: a failed insert must not report
