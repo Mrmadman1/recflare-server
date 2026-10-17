@@ -91,14 +91,19 @@ with `--local` that is econ's dev D1 state, which needs both `balance` and a mig
 ### `cai-load` — load the first-party custom avatar items
 
 ```sh
-bun runx admin cai-load                      # apps/econ/static/db/2025-1-cai.json → local
+bun runx admin cai-load                      # 2025-1-cai.json + studio87-extras.json → local
 bun runx admin cai-load --remote
-bun runx admin cai-load --file path/to/export.json --dry-run
+bun runx admin cai-load --file path/to/export.json --dry-run   # --file takes one or more
 just cai-load --remote                       # the same, as a recipe
 ```
 
-Loads an export of `CustomAvatarItem` records (a JSON array, a `{ Results }` page, or one
-record) into the `custom_avatar_item` table, each stored as the row's JSON with its
+Loads exports of `CustomAvatarItem` records (each a JSON array, a `{ Results }` page, or one
+record) into the `custom_avatar_item` table. With no `--file` it reads
+`apps/econ/static/db/2025-1-cai.json`, then `studio87-extras.json` — the official-store items
+the 2025 export lacks, fetched from another server's `customAvatarItems/v1/bulk` and priced
+from the storefront dump (an item it lists with no price is free). A later export only ADDS:
+an id an earlier one already holds is skipped, so the extras never overwrite a 2025 item. A
+duplicate within one export is refused. Each record is stored as the row's JSON with its
 `CreatorAccountId` forced to 1, the Coach account, whatever the export said: that is what
 files it as stock content (the storefront tab searches by creator) and what a purchase
 pays. Each save's `ThumbnailFileName` is put under `avatar/`, where this server serves
