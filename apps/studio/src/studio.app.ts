@@ -10,7 +10,7 @@ import {
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
-import { listCloudBuilds, storeLocalCloudBuild } from './local-builds'
+import { getUserBuildCount, listCloudBuilds, storeLocalCloudBuild } from './local-builds'
 import { parseMultipart } from './multipart'
 
 import type { Context } from 'hono'
@@ -194,6 +194,18 @@ const app = new Hono<App>()
 			cooldownSeconds: 0,
 		})
 	)
+
+	// Studio checks the authenticated user's counts before it starts a build. The
+	// 2026 editor treats a missing route as a fatal error and silently stops upload.
+	.get('/cloud-builds/get-build-count-for-user', async (c) => {
+		const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+		if (accountId == null) return c.body(null, 401)
+		return c.json({
+			success: true,
+			error: null,
+			value: await getUserBuildCount(c.env.DB, accountId),
+		})
+	})
 
 	// Who of this room's co-owners is standing in this subroom right now. Studio
 	// shows them as "Co-owners in Room" and reads a Result<List<int>>: `success`

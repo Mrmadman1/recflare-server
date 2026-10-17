@@ -123,6 +123,40 @@ it('serves a stubbed cloud build rate limit config', async () => {
 	})
 })
 
+it('requires authentication for the user build count', async () => {
+	const res = await SELF.fetch('https://example.com/cloud-builds/get-build-count-for-user')
+	expect(res.status).toBe(401)
+})
+
+it('serves the authenticated user build count expected by Studio 2026', async () => {
+	const res = await SELF.fetch('https://example.com/cloud-builds/get-build-count-for-user', {
+		headers: await bearer('11899'),
+	})
+	expect(res.status).toBe(200)
+	const body = await res.json<{
+		success: boolean
+		error: string | null
+		value: {
+			accountId: number
+			startTime: string
+			endTime: string
+			subRoomTotalBuildCount: number
+			subRoomFailedBuildCount: number
+			avatarItemTotalBuildCount: number
+			avatarItemFailedBuildCount: number
+		}
+	}>()
+	expect(body.success).toBe(true)
+	expect(body.error).toBeNull()
+	expect(body.value.accountId).toBe(11899)
+	expect(body.value.subRoomTotalBuildCount).toBe(0)
+	expect(body.value.subRoomFailedBuildCount).toBe(0)
+	expect(body.value.avatarItemTotalBuildCount).toBe(0)
+	expect(body.value.avatarItemFailedBuildCount).toBe(0)
+	expect(Date.parse(body.value.startTime)).not.toBeNaN()
+	expect(Date.parse(body.value.endTime)).not.toBeNaN()
+})
+
 describe('GET /collaboration/owners-in-room', () => {
 	const roomId = 1106
 	const subRoomId = 22941
