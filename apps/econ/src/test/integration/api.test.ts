@@ -4331,7 +4331,7 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/storefronts/v2/buyItem grants a consumable and stacks on re-buy', async () => {
-		// Item 2266 (Supreme Pizza) in storefront 300 is a consumable — its gift-drop
+		// Item 574 (Supreme Pizza) in storefront 300 is a consumable — its gift-drop
 		// carries a ConsumableItemDesc, not an AvatarItemDesc.
 		const consumableDesc = 'wUCIKdJSvEmiQHYMyx4X4w'
 		const buy = async () =>
@@ -4340,7 +4340,7 @@ describe('econ endpoints', () => {
 				headers: { ...(await bearer('25')), 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					StorefrontType: 300,
-					PurchasableItemId: 2266,
+					PurchasableItemId: 574,
 					CurrencyType: 2,
 					RequestedPrice: 95,
 				}),
@@ -4500,7 +4500,7 @@ describe('econ endpoints', () => {
 		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 }])
 	})
 
-	// sf300's item 2263 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
+	// sf300's item 2089 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
 	// client applies the Plus discount itself, but not to every item, so the server takes any
 	// price in the band [85, 95] from a subscriber and charges what they asked to pay.
 	const buy2263 = async (headers: Record<string, string>, RequestedPrice: number) =>
@@ -4509,7 +4509,7 @@ describe('econ endpoints', () => {
 			headers: { ...headers, 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 300,
-				PurchasableItemId: 2263,
+				PurchasableItemId: 2089,
 				CurrencyType: 2,
 				RequestedPrice,
 				CouponConsumablePlayerMappingId: null,
@@ -5976,14 +5976,14 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/avatar/v2/gifts/consume opens a consumable box (fires ConsumableMappingAdded)', async () => {
-		// Buy a consumable (Supreme Pizza, item 2266 in storefront 300) for account 26 —
+		// Buy a consumable (Supreme Pizza, item 574 in storefront 300) for account 26 —
 		// its gift box carries a ConsumableItemDesc, so opening it notifies the client.
 		const buy = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await bearer('26')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 300,
-				PurchasableItemId: 2266,
+				PurchasableItemId: 574,
 				CurrencyType: 2,
 				RequestedPrice: 95,
 			}),
@@ -7441,7 +7441,7 @@ describe('econ endpoints', () => {
 		expect(await dev.json()).toEqual({})
 
 		// …and it buys nothing at the subscriber price either, so the report and the buy path
-		// agree. 85 is the SubscriberPrices entry for sf300's 2263; 95 is the list price.
+		// agree. 85 is the SubscriberPrices entry for sf300's 2089; 95 is the list price.
 		const discounted = await buy2263(await bearer('9211', ['gameClient', 'developer']), 85)
 		expect(discounted.status).toBe(409)
 	})
