@@ -59,7 +59,7 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
-import { getCatalogItem, toCatalogAvatarItem } from './catalog-db'
+import { getCatalogItem, getStoreListings, toCatalogAvatarItem } from './catalog-db'
 // `LEGACY_CLIENT_BUILD` is shared with the storefront generator rather than restated: it picks
 // which store FILE a caller is served here, and is what the generator's help names.
 import { CatalogKind, LEGACY_CLIENT_BUILD } from './catalog-load'
@@ -130,6 +130,7 @@ import {
 	OPTIONAL_AUTHED,
 	OwnsRoomKeysRequest,
 	OwnsRoomKeysResponse,
+	PurchasableItemsRequest,
 	PurchaseRoomCurrencyEnvelope,
 	PurchaseRoomCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyRequest,
@@ -5058,6 +5059,45 @@ const app = new Hono<App>({ strict: false })
 			})
 			const items = await getCustomAvatarItems(c.env.DB, ids)
 			return c.json(items.map(toItemPurchaseInfo))
+		}
+	)
+
+	// Store listings by `PurchasableItemId` — `{ PurchasableItemIds: [2594], GiftDropIds: null }`.
+	// Answers a bare array of the listings exactly as the served 2025 store (`sf3-2025.json`)
+	// lists them, read from the `catalog` table's `listing` column rather than the 4 MB file
+	// (a row's `catalog_id` IS its `PurchasableItemId`). Every item kind resolves; unknown ids
+	// are dropped, so the answer is in request order but not positional. `GiftDropIds` has only
+	// been seen null and is ignored. No auth: a listing is what the public store shows anyone.
+	.post(
+		'/api/storefronts/v1/purchasableitems',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Store listings by PurchasableItemId',
+			description: [
+				'Resolves `PurchasableItemIds[]` against the `catalog` table and answers each listing',
+				'verbatim as the served 2025 store (`sf3-2025.json`) lists it — `GiftDrop`, `Prices`,',
+				'`SubscriberPrices` and the rest. Avatar items, consumables, skins and custom avatar',
+				'items all resolve. Unknown ids (and repeats) are dropped, so the response follows',
+				'request order but is never a positional match. `GiftDropIds` is ignored.',
+			].join(' '),
+			requestBody: jsonBody(PurchasableItemsRequest, 'The listings to resolve'),
+			responses: {
+				200: json(JsonArray, 'The resolved listings (unknown ids omitted)'),
+				400: json(ErrorResponse, 'Malformed body'),
+			},
+		}),
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (!body || typeof body !== 'object')
+				return c.json({ error: 'A JSON body is required' }, 400)
+			const raw = body.PurchasableItemIds
+			if (raw !== undefined && raw !== null && !Array.isArray(raw)) {
+				return c.json({ error: 'PurchasableItemIds must be an array' }, 400)
+			}
+			const ids = ((raw as unknown[] | null | undefined) ?? []).filter((id): id is number =>
+				Number.isInteger(id)
+			)
+			return c.json(await getStoreListings(c.env.DB, ids))
 		}
 	)
 

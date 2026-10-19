@@ -134,3 +134,12 @@ reload-plus *args:
 [no-cd]
 cai-load *args:
   bun runx admin cai-load "$@"
+
+# Merges by default; --replace drops rows the file no longer lists. Defaults to --local; pass
+# --remote for production, --dry-run to only validate. Run it whenever sf3-2025.json changes.
+# Reload the item catalog (econ `catalog` table) from apps/econ/static/storefronts/sf3-2025.json
+[group('4. utility')]
+[positional-arguments]
+[no-cd]
+catalog-load *args:
+  bun runx catalog load "$@"

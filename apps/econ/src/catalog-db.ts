@@ -1,6 +1,6 @@
 import { CatalogKind } from './catalog-load'
 
-import type { CatalogKindValue } from './catalog-load'
+import type { CatalogKindValue, StoreListing } from './catalog-load'
 
 /**
  * The item CATALOG on the shared `recflare` D1 database — every avatar item, consumable and
@@ -96,7 +96,8 @@ export const CATALOG_SCHEMA_DDL: string[] = [
 		tag_list TEXT,
 		created_at TEXT,
 		prefab_name TEXT,
-		unlocked_level INTEGER
+		unlocked_level INTEGER,
+		listing TEXT
 	)`,
 	// The search index. Folded, because a name search is case-insensitive and SQLite's LIKE is
 	// only case-insensitive for ASCII — which these names are not all of.
@@ -138,6 +139,12 @@ export interface CatalogRow {
 	created_at: string | null
 	prefab_name: string | null
 	unlocked_level: number | null
+	/**
+	 * The served store listing behind the row — its `sf3-2025.json` `StoreItems[]` entry,
+	 * verbatim, as JSON (migration 0028). NULL where `catalog_id` is: a row the store does not
+	 * list has no listing. Read it through {@link getStoreListings}.
+	 */
+	listing: string | null
 }
 
 /**
@@ -272,6 +279,35 @@ export async function getCatalogItemById(
 }
 
 /**
+ * Store listings by `PurchasableItemId` (the `catalog_id`), as the served store lists them —
+ * what `POST /api/storefronts/v1/purchasableitems` answers. In the order asked; an unknown id,
+ * a repeat, or a row without a listing is skipped rather than left as a hole, so the result may
+ * be SHORTER than the input and must not be read positionally.
+ *
+ * Every kind resolves — avatar items, consumables, skins and custom avatar items alike — and the
+ * listing is served exactly as the store lists it. Only listings that load as no row at all
+ * (loot boxes, token bundles, consumable packs; see `ListingKind`) are unknown here.
+ */
+export async function getStoreListings(db: D1Database, ids: number[]): Promise<StoreListing[]> {
+	const unique = [...new Set(ids)]
+	if (unique.length === 0) return []
+	// One bound JSON array rather than a placeholder per id: D1 caps a statement at 100 bound
+	// variables, and nothing stops the client asking for more.
+	const { results } = await db
+		.prepare(
+			`SELECT catalog_id, listing FROM catalog
+			 WHERE catalog_id IN (SELECT value FROM json_each(?1)) AND listing IS NOT NULL`
+		)
+		.bind(JSON.stringify(unique))
+		.all<{ catalog_id: number; listing: string }>()
+	const byId = new Map(results.map((r) => [r.catalog_id, r.listing]))
+	return unique.flatMap((id) => {
+		const listing = byId.get(id)
+		return listing === undefined ? [] : [JSON.parse(listing) as StoreListing]
+	})
+}
+
+/**
  * Resolve many keys at once, in the order asked; unknown keys are skipped rather than left as
  * holes, so the result may be SHORTER than the input and must not be read positionally. One
  * statement for a whole inventory, which is the point of the table.
@@ -350,8 +386,8 @@ export async function getAvatarItemsByTag(
 	tag: string
 ): Promise<CatalogAvatarItem[]> {
 	const { results } = await db
-		.prepare('SELECT * FROM catalog WHERE tag_list = ?1 ORDER BY friendly_name')
-		.bind(tag)
+		.prepare('SELECT * FROM catalog WHERE kind = ?1 AND tag_list = ?2 ORDER BY friendly_name')
+		.bind(CatalogKind.AvatarItem, tag)
 		.all<CatalogRow>()
 	return results.map(toCatalogAvatarItem)
 }

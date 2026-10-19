@@ -53,10 +53,12 @@ export const STORE_DUMP = 'apps/econ/static/db/Watch_EnumValue_3.json'
 export const SKINS = 'apps/econ/static/db/skins.json'
 
 /**
- * Rows per INSERT. Batched because thousands of single-row statements parse far more slowly
- * than a few dozen multi-row ones, and D1 charges per statement on the remote path.
+ * The largest INSERT a load builds, in bytes of SQL. Batched because thousands of single-row
+ * statements parse far more slowly than a few dozen multi-row ones, and D1 charges per statement
+ * on the remote path; capped by SIZE rather than row count because D1 refuses a statement over
+ * 100 KB, and each row carries its whole store listing (~1.2 KB, up to ~1.4 KB).
  */
-const CHUNK = 100
+const STATEMENT_BYTES = 64 * 1024
 
 /**
  * One SQL literal. Booleans become 1/0 (SQLite has no boolean), `undefined` is treated as the
@@ -271,16 +273,27 @@ const load = new Command('load')
 			// afterwards is visibly a row the store no longer lists.
 			statements.push('UPDATE catalog SET catalog_id = NULL;')
 		}
-		for (let start = 0; start < rows.length; start += CHUNK) {
-			const batch = rows.slice(start, start + CHUNK)
+		let batch: string[] = []
+		let batchBytes = 0
+		const flush = (): void => {
+			if (batch.length === 0) return
 			statements.push(
 				`INSERT INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')}) VALUES\n` +
-					batch.map((r) => `\t(${r.values.map(lit).join(', ')})`).join(',\n') +
+					batch.join(',\n') +
 					// Harmless after a DELETE (nothing can conflict), and kept there anyway so both
 					// paths run the identical statement rather than two shapes that could diverge.
 					`\nON CONFLICT(item_key) DO UPDATE SET ${CONFLICT_UPDATE};`
 			)
+			batch = []
+			batchBytes = 0
 		}
+		for (const row of rows) {
+			const tuple = `\t(${row.values.map(lit).join(', ')})`
+			if (batch.length > 0 && batchBytes + tuple.length > STATEMENT_BYTES) flush()
+			batch.push(tuple)
+			batchBytes += tuple.length + 2
+		}
+		flush()
 		// No numbering step after the inserts. A row's `catalog_id` is its listing's
 		// `PurchasableItemId` in sf3-2025.json and nothing else; a row a merge keeps that the file
 		// no longer lists has no such number, so it stays NULL (every reader filters on

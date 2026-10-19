@@ -1302,8 +1302,11 @@ async function findGiftableItem(db: D1Database, requested: string): Promise<Gift
 		getCatalogItem(db, requested),
 	])
 	const item = custom !== null && custom.Accessibility !== 0 ? custom : null
-	const row =
+	const found =
 		byKey ?? (/^\d{1,9}$/.test(requested) ? await getCatalogItemById(db, Number(requested)) : null)
+	// A custom avatar item's catalog row only carries its store listing; the item itself is the
+	// `custom_avatar_item` record found above, so the row must not make its guid `ambiguous`.
+	const row = found?.kind === CatalogKind.CustomAvatarItem ? null : found
 
 	if (item !== null && row !== null) return { kind: 'ambiguous' }
 	if (item !== null) return { kind: 'custom_item', item }

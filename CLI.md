@@ -88,6 +88,25 @@ This command targets the `balance` table, so it runs under `apps/econ`'s wrangle
 with `--local` that is econ's dev D1 state, which needs both `balance` and a migrated
 `account` table in it.
 
+### `catalog load` — reload the item catalog
+
+```sh
+just catalog-load                 # sf3-2025.json → local (merge)
+just catalog-load --remote        # production
+just catalog-load --replace       # also drop rows the file no longer lists
+just catalog-load --dry-run       # build and validate, write nothing
+bun runx catalog check            # validate the store file without touching a database
+```
+
+Fills econ's `catalog` table from `apps/econ/static/storefronts/sf3-2025.json`, the 2025
+store as the game is served it, and nothing else. Re-run it whenever that file changes (after
+`runx storefront build`). Each row's `catalog_id` is its listing's `PurchasableItemId` and its
+`listing` column the listing verbatim, which is what
+`POST /api/storefronts/v1/purchasableitems` serves. Avatar items, consumables, skins and
+first-party custom avatar items all load; loot boxes, token bundles and consumable packs do
+not. A merge leaves rows the file no longer lists in place with no `catalog_id` or `listing`;
+`--replace` deletes them. The inventory does not read this table, so either is safe.
+
 ### `cai-load` — load the first-party custom avatar items
 
 ```sh

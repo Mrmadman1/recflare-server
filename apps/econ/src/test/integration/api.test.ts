@@ -42,6 +42,7 @@ import { NotificationType } from '../../../../notify/src/notification-types'
 // SQL, not modules: they are never executed here, only read.
 import catalogStructureSql from '../../../migrations/0015_catalog.sql?raw'
 import catalogIdSql from '../../../migrations/0016_catalog_id.sql?raw'
+import catalogListingSql from '../../../migrations/0028_catalog_listing.sql?raw'
 import skinsJson from '../../../static/db/skins.json'
 // The 2025 store DUMP, the source `runx storefront build` and `runx catalog load` both read.
 import storeDump from '../../../static/db/Watch_EnumValue_3.json'
@@ -3705,6 +3706,57 @@ describe('econ endpoints', () => {
 				IsFeatured: false,
 			},
 		])
+	})
+
+	test('POST /api/storefronts/v1/purchasableitems answers the served listings verbatim', async () => {
+		// One listing of each kind the catalog holds, loaded exactly as `runx catalog load` would.
+		const pick = (pred: (l: StoreListing) => boolean) => storeListings.find(pred)!
+		const wanted = [
+			pick((l) => l.PurchasableItemId === 2594), // an avatar item
+			pick((l) => l.GiftDrop.ConsumableItemDesc !== ''),
+			pick((l) => l.GiftDrop.EquipmentModificationGuid !== ''),
+			pick((l) => (l.GiftDrop.CustomAvatarItemId ?? '') !== ''),
+		]
+		const ids = new Set(wanted.map((l) => l.PurchasableItemId))
+		const rows = buildCatalogLoad(storeListings).rows.filter((r) => ids.has(r.id))
+		expect(rows).toHaveLength(wanted.length)
+		await env.DB.batch(
+			rows.map((row) =>
+				env.DB.prepare(
+					`INSERT OR REPLACE INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')})
+					 VALUES (${CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')})`
+				).bind(...row.values.map((v) => v ?? null))
+			)
+		)
+
+		// Request order, unknown ids and repeats dropped, `GiftDropIds` ignored. No token needed.
+		const order = [...wanted].reverse().map((l) => l.PurchasableItemId)
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({
+				PurchasableItemIds: [order[0], 12_345_678, ...order, order[1]],
+				GiftDropIds: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as StoreListing[]
+		expect(body).toEqual(order.map((id) => storeListings.find((l) => l.PurchasableItemId === id)))
+		expect(body.at(-1)?.GiftDrop.FriendlyName).toBe('Hot Dog Suit (Ketchup)')
+
+		// Null ids answer an empty list; a non-array is a malformed body.
+		const none = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ PurchasableItemIds: null, GiftDropIds: null }),
+		})
+		expect(await none.json()).toEqual([])
+		const bad = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ PurchasableItemIds: 2594 }),
+		})
+		expect(bad.status).toBe(400)
 	})
 
 	test('POST /api/items/purchaseInfos 400s without Ids and 401s without a token', async () => {
@@ -7571,6 +7623,7 @@ describe('econ endpoints', () => {
 			'POST /api/roomkeys/v1/create',
 			'POST /api/roomkeys/v1/owns/bulk',
 			'POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency',
+			'POST /api/storefronts/v1/purchasableitems',
 			'POST /api/storefronts/v2/buyItem',
 			'POST /api/storefronts/v3/buyInvention',
 			'POST /api/timedCurrencyGrants/update',
@@ -7893,7 +7946,7 @@ describe('catalog', () => {
 		// separate because 0015 was already applied, and an edit there would never re-run — which
 		// is exactly the drift this test exists to catch. `CATALOG_SCHEMA_DDL` declares the end
 		// state in one CREATE, so it is compared against the pair.
-		const migrations = `${catalogStructureSql}\n${catalogIdSql}`
+		const migrations = `${catalogStructureSql}\n${catalogIdSql}\n${catalogListingSql}`
 
 		// Compared on identifiers rather than text, since the two are formatted differently, and
 		// `catalog_id` arrives via ALTER rather than inside the CREATE.
@@ -7904,6 +7957,7 @@ describe('catalog', () => {
 		expect(catalogStructureSql).toContain('item_key TEXT PRIMARY KEY')
 		expect(CATALOG_SCHEMA_DDL[0]).toContain('item_key TEXT PRIMARY KEY')
 		expect(catalogIdSql).toContain('ALTER TABLE catalog ADD COLUMN catalog_id INTEGER')
+		expect(catalogListingSql).toContain('ALTER TABLE catalog ADD COLUMN listing TEXT')
 		for (const index of [
 			'idx_catalog_name',
 			'idx_catalog_prefab',
@@ -7968,13 +8022,27 @@ describe('catalog', () => {
 		)
 		expect(row.values[CATALOG_INSERT_COLUMNS.indexOf('rarity')]).toBe(both.GiftDrop.Rarity)
 
-		// What the store lists that is NOT a catalog item is counted, not loaded: first-party
-		// custom items (the `custom_avatar_item` table's), loot boxes, token bundles — and the
-		// PACKS, a consumable listed again under another number with a count. Every listing is
-		// accounted for: a row, a skipped count, or nothing else.
-		expect(skipped.custom_avatar_item).toBe(
-			storeListings.filter((l) => l.GiftDrop.CustomAvatarItemId).length
+		// First-party custom items load as rows of their own, keyed by guid: the item is
+		// `api`'s `custom_avatar_item` record, but its LISTING has to resolve by number too.
+		expect(kinds.filter((k) => k === 'custom_avatar_item')).toHaveLength(
+			listed((l) => l.GiftDrop.CustomAvatarItemId ?? '')
 		)
+
+		// Every row carries its listing verbatim, so the store's own JSON comes back out.
+		const listingAt = CATALOG_INSERT_COLUMNS.indexOf('listing')
+		const byPurchasableId = new Map(storeListings.map((l) => [l.PurchasableItemId, l]))
+		expect(
+			rows.every(
+				(r) =>
+					r.values[listingAt] === JSON.stringify(byPurchasableId.get(r.id)) &&
+					r.values[listingAt] !== undefined
+			)
+		).toBe(true)
+
+		// What the store lists that is NOT a catalog item is counted, not loaded: loot boxes,
+		// token bundles — and the PACKS, a consumable listed again under another number with a
+		// count. Every listing is accounted for: a row, a skipped count, or nothing else.
+		expect(skipped.custom_avatar_item).toBeUndefined()
 		expect(skipped.query).toBe(storeListings.filter((l) => l.GiftDrop.IsQuery).length)
 		expect(skipped.consumable_pack).toBeGreaterThan(0)
 		expect(
@@ -8031,7 +8099,12 @@ describe('catalog', () => {
 			const drop = byId.get(row.id)?.GiftDrop
 			expect(drop, String(row.id)).toBeDefined()
 			expect(
-				[drop!.AvatarItemDesc, drop!.ConsumableItemDesc, drop!.EquipmentModificationGuid],
+				[
+					drop!.AvatarItemDesc,
+					drop!.ConsumableItemDesc,
+					drop!.EquipmentModificationGuid,
+					drop!.CustomAvatarItemId,
+				],
 				String(row.id)
 			).toContain(row.key)
 		}

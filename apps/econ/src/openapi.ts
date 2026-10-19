@@ -633,6 +633,18 @@ export const ItemPurchaseInfosRequest = z.object({
 	),
 })
 
+/** `POST /api/storefronts/v1/purchasableitems` — store listings by id. */
+export const PurchasableItemsRequest = z.object({
+	PurchasableItemIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('The listings to resolve, by `PurchasableItemId`'),
+	GiftDropIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('Sent by the client (observed null); accepted and ignored'),
+})
+
 /** One `Prices[]` entry: what the item costs in one currency, and any sale on top. */
 export const ItemPriceDto = z.object({
 	CurrencyType: z.number().int().describe('2 = RecCenterTokens — what UGC items are priced in'),
