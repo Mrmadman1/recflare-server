@@ -5167,6 +5167,46 @@ describe('econ endpoints', () => {
 		expect(list[0].friendlyName).toBe(SF3_ITEM.name)
 	})
 
+	test('POST /api/items/bulkpurchase announces a box-less consumable with ConsumableMappingAdded', async () => {
+		// No box means nothing is ever opened to announce the consumable, so the bag announces it
+		// at grant time — without this it didn't show in the client until an inventory refetch.
+		// 2182 is a consumable; three copies stack into one granted row.
+		await drainFrames()
+		const res = await bulkPurchase('951', {
+			BypassGiftPackages: true,
+			PurchaseItemRequests: [line(2182, 100, { DuplicateItemCount: 3 })],
+		})
+		expect(((await res.json()) as BulkBody).Success).toBe(true)
+		const added = (await drainFrames()).filter(
+			(f) => f.notificationType === NotificationType.ConsumableMappingAdded
+		)
+		expect(added).toHaveLength(1)
+		const [frame] = added
+		expect(frame!.accountId).toBe(951)
+		expect(frame!.payload).toMatchObject({
+			// The item's own desc, as the store it was bought from (2023 sf3: Assorted Donuts)
+			// lists it — 2026 applies the frame only for a desc it knows.
+			ConsumableItemDesc: 'ZuvkidodzkuOfGLDnTOFyg',
+			Count: 3,
+			InitialCount: 0,
+			IsActive: false,
+			IsTransferable: false,
+			ActivatedByRoomie: false,
+			// Must equal the definition's (consumables.json: true) or 2026 throws and drops it.
+			IsRRO: true,
+		})
+		expect((frame!.payload as { Id: number }).Id).toBeGreaterThan(0)
+
+		// With a box, the frame waits for the box to be opened: never sent twice for one grant.
+		await drainFrames()
+		await bulkPurchase('951', { PurchaseItemRequests: [line(2182, 100)] })
+		expect(
+			(await drainFrames()).filter(
+				(f) => f.notificationType === NotificationType.ConsumableMappingAdded
+			)
+		).toEqual([])
+	})
+
 	test('POST /api/items/bulkpurchase routes a gifted line to its receiver', async () => {
 		await seedAccount(207, 'BagReceiver')
 		await drainFrames()

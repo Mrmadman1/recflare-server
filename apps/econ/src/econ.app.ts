@@ -216,6 +216,7 @@ import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type { SavedInvention } from '../../api/src/inventions-db'
 import type {
 	BalanceResponsePayload,
+	ConsumableMappingPayload,
 	LocalRoomKeyPayload,
 	PurchaseBalanceModificationPayload,
 	RoomCurrencyPayload,
@@ -565,6 +566,24 @@ async function pushRoomKeyCreated(
 }
 
 /**
+ * Whether a consumable is a first-party (Rec Room Original) item, as its definition in
+ * `static/consumables.json` says — the value every consumable instance we serve must carry.
+ *
+ * The 2026 client keys an instance on this flag and checks it against the definition it holds:
+ * a mismatch throws (`Key IsRRO=False does not match Definition IsRRO=True!`) and the frame is
+ * lost, so the purchase never shows. Every definition in the file says true; a desc with none
+ * is still a built-in store item, so it defaults to true too.
+ */
+const RRO_BY_DESC = new Map(
+	(consumableDefinitions as Array<{ ConsumableItemDesc: string; IsRRO?: boolean }>).map((d) => [
+		d.ConsumableItemDesc,
+		d.IsRRO !== false,
+	])
+)
+const isRroConsumable = (consumableItemDesc: string): boolean =>
+	RRO_BY_DESC.get(consumableItemDesc) ?? true
+
+/**
  * Push a ConsumableMappingRemoved notification to a player after they consume a
  * consumable, mirroring the reference's
  * `HubSendToPlayer(accountID, NotifFrame(ConsumableMappingRemoved, {...}))` — the
@@ -589,7 +608,9 @@ async function pushConsumableRemoved(
 				IsActive: false,
 				ActiveDurationMinutes: 0,
 				IsTransferable: false,
-			}
+				ActivatedByRoomie: false,
+				IsRRO: isRroConsumable(consumed.consumableItemDesc),
+			} satisfies ConsumableMappingPayload
 		)
 	} catch (err) {
 		logger.error('failed to push ConsumableMappingRemoved notification', {
@@ -612,20 +633,48 @@ async function pushConsumableAdded(
 	accountId: number,
 	gift: StoredGift
 ): Promise<void> {
+	await pushConsumableMappingAdded(c, accountId, {
+		mappingId: gift.ConsumableMappingId ?? 0,
+		consumableItemDesc: gift.ConsumableItemDesc,
+		count: gift.ConsumableCount,
+		preExistingCount: gift.ConsumablePreExistingCount ?? 0,
+	})
+}
+
+/**
+ * The `ConsumableMappingAdded` frame itself — one granted consumable instance (its row id,
+ * how many it holds, and the player's count before it). Sent when a box carrying it is
+ * opened ({@link pushConsumableAdded}) or, when there IS no box, at grant time: a purchase
+ * under `BypassGiftPackages` is never opened, and without this the consumable didn't show
+ * until the client refetched its inventory. Never both for one grant — a second frame for
+ * the same row id could be counted twice. Best-effort like the removed push.
+ */
+async function pushConsumableMappingAdded(
+	c: Context<App>,
+	accountId: number,
+	granted: {
+		mappingId: number
+		consumableItemDesc: string
+		count: number
+		preExistingCount: number
+	}
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			accountId,
 			NotificationType.ConsumableMappingAdded,
 			{
-				Id: gift.ConsumableMappingId ?? 0,
-				ConsumableItemDesc: gift.ConsumableItemDesc,
+				Id: granted.mappingId,
+				ConsumableItemDesc: granted.consumableItemDesc,
 				CreatedAt: new Date().toISOString(),
-				Count: gift.ConsumableCount,
-				InitialCount: gift.ConsumablePreExistingCount ?? 0,
+				Count: granted.count,
+				InitialCount: granted.preExistingCount,
 				IsActive: false,
 				ActiveDurationMinutes: 0,
 				IsTransferable: false,
-			}
+				ActivatedByRoomie: false,
+				IsRRO: isRroConsumable(granted.consumableItemDesc),
+			} satisfies ConsumableMappingPayload
 		)
 	} catch (err) {
 		logger.error('failed to push ConsumableMappingAdded notification', {
@@ -1834,7 +1883,19 @@ async function grantGiftDrop(
 			consumableCount
 		)
 	}
-	if (options.skipGiftBox === true) return { id: 0, drop: giftDrop }
+	if (options.skipGiftBox === true) {
+		// No box means nothing will ever be opened to announce the consumable, so announce it
+		// now — otherwise a bag bought with `BypassGiftPackages` doesn't show it until a refetch.
+		if (isConsumable) {
+			await pushConsumableMappingAdded(c, accountId, {
+				mappingId: consumableMappingId,
+				consumableItemDesc: giftDrop.ConsumableItemDesc,
+				count: consumableCount,
+				preExistingCount: consumablePreExisting,
+			})
+		}
+		return { id: 0, drop: giftDrop }
+	}
 	const { id } = await createGift(
 		db,
 		accountId,
@@ -5168,11 +5229,14 @@ const app = new Hono<App>({ strict: false })
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			const consumables = await getConsumables(c.env.DB, id)
-			// These rows are purchases of built-in store items. The 2026 client
-			// includes this flag in the instance key and verifies it against the definition.
+			// The 2026 client includes this flag in the instance key and verifies it against the
+			// definition, so it comes from the definition — see `isRroConsumable`.
 			return c.json(
 				((await authedBuild(c)) ?? 0) >= 20260323
-					? consumables.map((item) => ({ ...item, IsRRO: true }))
+					? consumables.map((item) => ({
+							...item,
+							IsRRO: isRroConsumable(item.ConsumableItemDesc),
+						}))
 					: consumables
 			)
 		}
