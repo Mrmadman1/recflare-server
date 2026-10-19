@@ -204,17 +204,20 @@ async function verifyLoad(
 		)
 	}
 
-	// Every row must have come out with a numeric handle. A NULL here is a load that stopped
-	// between writing rows and numbering them, which nothing else would notice until a lookup by
-	// number quietly returned nothing.
-	const unnumbered = await execSql(
-		'SELECT COUNT(*) AS n FROM catalog WHERE catalog_id IS NULL',
+	// Every row this load wrote must carry its `PurchasableItemId`. Ids are cleared before the
+	// inserts and only the inserts set them, so exactly the loaded rows are numbered — fewer is a
+	// load cut short, which nothing else would notice until a lookup by id quietly found nothing.
+	// Rows the file does not list stay NULL by design and are not counted.
+	const numbered = await execSql(
+		'SELECT COUNT(*) AS n FROM catalog WHERE catalog_id IS NOT NULL',
 		remote,
 		OWNER
 	)
-	const missing = Number(unnumbered.results[0]?.n ?? 0)
-	if (missing > 0) {
-		throw new Error(`load did not finish: ${missing} row(s) have no catalog_id. Re-run it.`)
+	const withId = Number(numbered.results[0]?.n ?? 0)
+	if (withId !== rows.length) {
+		throw new Error(
+			`load did not finish: ${withId} row(s) carry a PurchasableItemId, expected ${rows.length}. Re-run it.`
+		)
 	}
 }
 
@@ -265,8 +268,7 @@ const load = new Command('load')
 			// load carries the store's numbers: without this, a row already holding one of them
 			// (because it was in an earlier load under a different key, or the store renumbered)
 			// collides and the whole merge fails. Nulling first also means a row left un-numbered
-			// afterwards is visibly a row the store no longer lists, which the tail statement
-			// below then numbers above everything this load assigned.
+			// afterwards is visibly a row the store no longer lists.
 			statements.push('UPDATE catalog SET catalog_id = NULL;')
 		}
 		for (let start = 0; start < rows.length; start += CHUNK) {
@@ -279,18 +281,11 @@ const load = new Command('load')
 					`\nON CONFLICT(item_key) DO UPDATE SET ${CONFLICT_UPDATE};`
 			)
 		}
-		if (!opts.replace) {
-			// Anything still un-numbered is a row the store no longer lists — a merge keeps those,
-			// so they need handles too. They go ABOVE the highest id this load assigned, so they can
-			// never collide with it, ordered by rowid for determinism. Usually this matches nothing
-			// at all, and it is a single statement either way.
-			const highest = Math.max(0, ...rows.map((r) => r.id))
-			statements.push(
-				`UPDATE catalog SET catalog_id = ${highest} +\n` +
-					`\t(SELECT COUNT(*) FROM catalog c WHERE c.catalog_id IS NULL AND c.rowid <= catalog.rowid)\n` +
-					`WHERE catalog_id IS NULL;`
-			)
-		}
+		// No numbering step after the inserts. A row's `catalog_id` is its listing's
+		// `PurchasableItemId` in sf3-2025.json and nothing else; a row a merge keeps that the file
+		// no longer lists has no such number, so it stays NULL (every reader filters on
+		// `catalog_id IS NOT NULL`). Inventing one would hand the client an id the store it is
+		// served does not contain.
 		const sql = statements.join('\n')
 
 		if (opts.dryRun) {

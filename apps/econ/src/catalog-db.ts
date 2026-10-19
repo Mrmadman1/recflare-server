@@ -72,9 +72,9 @@ export {
  *
  * `catalog_id` is the small NUMERIC handle the site uses where a key would be unwieldy. For a
  * row the store lists it is the listing's own `PurchasableItemId` — the number `sf3-2025.json`
- * sells it under — and for a skin the store never listed it is handed out by the loader from
- * `CATALOG_ID_BASE`, well above any real one. It is unique where set, and the migration that
- * adds it is 0016, since 0015 was already applied.
+ * sells it under, including the skins we added to the store (numbered there from
+ * `UNLISTED_SKIN_ID_BASE`, 1 000 000). A row the file does not list has none and is NULL. It is
+ * unique where set, and the migration that adds it is 0016, since 0015 was already applied.
  *
  * Nullability is load-bearing rather than incidental: `tooltip` is genuinely NULL on some rows
  * of BOTH kinds and `""` on others, and the client's DTOs serve the distinction through, so the
@@ -120,10 +120,9 @@ export interface CatalogRow {
 	 * the store's `PurchasableItemId`, so the number resolves a row here and a listing in
 	 * `sf3-2025.json` alike.
 	 *
-	 * Still not an identity: an unlisted skin's number is a load-order surrogate, and a store
-	 * could renumber. Never store it, never treat it as what an item IS — `item_key` is that,
-	 * and it is what the inventory holds. NULL only between a row existing and a load numbering
-	 * it.
+	 * Still not an identity: a store could renumber. Never store it, never treat it as what an
+	 * item IS — `item_key` is that. NULL for a row `sf3-2025.json` does not list (a merge keeps
+	 * such rows); every reader filters on `catalog_id IS NOT NULL`.
 	 */
 	catalog_id: number | null
 	kind: string
@@ -259,8 +258,8 @@ export async function getCatalogItem(db: D1Database, itemKey: string): Promise<C
 /**
  * One catalog row by its numeric handle — a store `PurchasableItemId` for a listed item.
  *
- * Fine for a request that looked the number up moments ago; never for anything stored, since
- * an unlisted skin's number is reassigned by every load.
+ * The number the client looks items up by, since it is the one sf3-2025.json serves. Not for
+ * anything stored: `item_key` is the identity, and a fresher store dump could renumber.
  */
 export async function getCatalogItemById(
 	db: D1Database,
