@@ -2602,6 +2602,15 @@ async function tagsByRoom(db: D1Database, roomIds: number[]): Promise<Map<number
 	return groupTags(results)
 }
 
+/** The ids of every room carrying `tag` (lowercase), off the tag index. */
+async function roomIdsWithTag(db: D1Database, tag: string): Promise<Set<number>> {
+	const { results } = await db
+		.prepare('SELECT room_id FROM room_tag WHERE tag = ?1')
+		.bind(tag)
+		.all<{ room_id: number }>()
+	return new Set(results.map((row) => row.room_id))
+}
+
 /**
  * Fill in each room's `Tags` from `room_tag`. Every room ends up with the key PRESENT —
  * an empty array when it carries none — because the client's DTO has a non-nullable
@@ -3572,11 +3581,6 @@ function roomTags(room: Room): string[] {
 		.map((v) => v.toLowerCase())
 }
 
-/** True if the room carries any of the given (lowercased) tags. */
-function roomHasAnyTag(room: Room, tags: Set<string>): boolean {
-	return roomTags(room).some((t) => tags.has(t))
-}
-
 /**
  * Search public, non-dorm rooms not opted out of search. The query is split into terms
  * (space/`+`): `#tag` terms match the room's Tags; plain terms match the room name
@@ -3739,10 +3743,12 @@ const COACH_ACCOUNT_ID = 1
 /**
  * True if the room is a Rec Room Original. `IsRRO` is the flag the client renders a
  * virtual "RRO" tag from; the auto-derived `rro` tag is checked too so a room that only
- * carries the tag isn't mistaken for player-made.
+ * carries the tag isn't mistaken for player-made. The tag is checked by id against
+ * `rroTagged` ({@link roomIdsWithTag}) rather than off the room, so a caller ranking tagless
+ * stubs needn't load every room's tags to ask.
  */
-function isRRO(room: Room): boolean {
-	return room.IsRRO === true || roomHasAnyTag(room, new Set(['rro']))
+function isRRO(room: Room, rroTagged: Set<number>): boolean {
+	return room.IsRRO === true || rroTagged.has(roomIdOf(room))
 }
 
 /**
@@ -3816,13 +3822,17 @@ export async function getHotRooms(
 		.prepare(sql)
 		.bind(...binds)
 		.all<RoomRow>()
-	let rooms = (await parseAllWithTags(db, results)).filter(isListable)
+	// No tags on the stubs: nothing below ranks on them, and the served page gets its own
+	// from `hydrateRooms`. Attaching them here read ALL of `room_tag` on every call once a
+	// feed had more than a hundred candidates, which every pseudo-tag feed does.
+	let rooms = parseAll(results).filter(isListable)
 
 	if (t === NEW_TAG) {
 		// Newest player-made rooms first; RoomId (which is minted in creation order)
 		// breaks ties so rooms created in the same instant still page stably.
+		const rroTagged = await roomIdsWithTag(db, 'rro')
 		const fresh = rooms
-			.filter((r) => !isRRO(r))
+			.filter((r) => !isRRO(r, rroTagged))
 			.sort((a, b) => createdAt(b) - createdAt(a) || roomIdOf(b) - roomIdOf(a))
 		return {
 			Results: await hydrateRooms(db, await loadRankedPage(db, fresh.slice(skip, skip + take))),
@@ -4107,25 +4117,27 @@ export async function getSimilarRooms(
 	const targetTags = new Set(roomTags(target))
 	if (targetTags.size === 0) return empty
 
+	// Ranking is by SHARED TAG COUNT, which `room_tag` answers on its own: the tag index
+	// finds the rows carrying any of the target's tags, and counting them per room is the
+	// shared count (the key is (room_id, tag), so a room can't count a tag twice). Only rooms
+	// sharing a tag are read at all. This used to read every listable room AND every tag in
+	// the table to work the same thing out in memory. The tags go in as one JSON array, so
+	// a heavily tagged room can't hit D1's bound-parameter cap.
 	const { results } = await db
-		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
-		.all<RoomRow>()
-	const sharedCount = (r: Room): number => roomTags(r).filter((t) => targetTags.has(t)).length
+		.prepare(
+			`SELECT ${RANK_COLUMNS}, s.shared AS shared FROM room r
+			 JOIN (SELECT room_id, COUNT(*) AS shared FROM room_tag
+			       WHERE tag IN (SELECT value FROM json_each(?1)) GROUP BY room_id) s
+			   ON s.room_id = r.room_id
+			 WHERE ${LISTABLE_WHERE} AND r.room_id != ?2`
+		)
+		.bind(JSON.stringify([...targetTags]), roomId)
+		.all<RoomRow & { shared: number }>()
 	const stats = await getRoomStats(db)
 
-	// Ranking is by SHARED TAG COUNT, so every candidate needs its tags before the sort —
-	// not a filter one tag can narrow, since "shares any tag with the target" is the whole
-	// candidate set.
-	const scored = (await parseAllWithTags(db, results))
-		.filter(
-			(r) =>
-				roomIdOf(r) !== roomId &&
-				r.IsDorm !== true &&
-				r.Accessibility === 1 &&
-				r.ExcludeFromLists !== true
-		)
-		.map((room) => ({ room, shared: sharedCount(room) }))
-		.filter((x) => x.shared > 0)
+	const scored = results
+		.map((row) => ({ room: parseRow(row), shared: row.shared }))
+		.filter((x) => isListable(x.room))
 
 	scored.sort(
 		(a, b) =>
