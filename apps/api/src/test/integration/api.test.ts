@@ -3584,9 +3584,9 @@ describe('public endpoints', () => {
 				body: JSON.stringify({ inventionDataFilename: 'a.inv', ...fields }),
 			})
 
-		// A name is 3–24 characters of letters, digits, spaces, dashes and colons.
+		// A name is 3–40 characters of letters, digits, spaces, dashes and colons.
 		expect((await save({ name: 'ab' })).status).toBe(400)
-		expect((await save({ name: 'a'.repeat(25) })).status).toBe(400)
+		expect((await save({ name: 'a'.repeat(41) })).status).toBe(400)
 		expect((await save({ name: 'Rocket!' })).status).toBe(400)
 		expect((await save({ name: 'Café Lamp' })).status).toBe(400)
 		const ok = await save({ name: 'Rocket Sofa-Bed 2' })

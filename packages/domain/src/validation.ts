@@ -58,7 +58,7 @@ export const MAX_EVENT_DURATION_MS = 24 * 60 * 60 * 1000
  * offers `Untitled` rather than an empty box.
  */
 export const MIN_INVENTION_NAME_LENGTH = 3
-export const MAX_INVENTION_NAME_LENGTH = 24
+export const MAX_INVENTION_NAME_LENGTH = 40
 export const MAX_INVENTION_DESCRIPTION_LENGTH = 512
 
 /**
