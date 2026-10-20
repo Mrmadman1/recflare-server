@@ -85,6 +85,21 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		PRIMARY KEY (room_id, tag)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_room_tag_tag ON room_tag (tag)`,
+	// A room's `Roles`, one row per entry (migrations/0029_room_role.sql, rebuilt with the
+	// whole entry by 0030_room_role_entry.sql). Unlike `room_tag` this is a DERIVED copy: the
+	// blob keeps `Roles` and stays authoritative, and every write that changes them batches
+	// {@link roomRoleWrites} alongside. It exists so "which rooms name this account" (and at
+	// what tier) is an index lookup instead of a `json_each` over every room in the table.
+	// Columns mirror {@link roomRoles}, defaults included.
+	`CREATE TABLE IF NOT EXISTS room_role (
+		account_id INTEGER NOT NULL,
+		room_id INTEGER NOT NULL,
+		role INTEGER NOT NULL DEFAULT 0,
+		invited_role INTEGER NOT NULL DEFAULT 0,
+		last_changed_by_account_id INTEGER,
+		PRIMARY KEY (account_id, room_id)
+	) WITHOUT ROWID`,
+	`CREATE INDEX IF NOT EXISTS idx_room_role_room ON room_role (room_id)`,
 	// Per-player interaction state with a room (cheered/favorited + last visit).
 	// One row per (player, room); cheer/favorite are toggled in place.
 	`CREATE TABLE IF NOT EXISTS interaction (
@@ -265,6 +280,40 @@ export function roomRoles(room: Room): RoomRole[] {
 		LastChangedByAccountId: r.LastChangedByAccountId ?? null,
 		InvitedRole: Number(r.InvitedRole ?? Role.None),
 	}))
+}
+
+/**
+ * The statements that bring `room_role` in line with a room's `Roles`: drop the room's rows,
+ * then insert each entry whole, as {@link roomRoles} reads it. Every entry is stored,
+ * pending invites (`Role` 0 with an `InvitedRole`) included. An account named twice keeps
+ * its first entry, which is the one {@link roomRoles}' `find` callers see.
+ *
+ * Batch these WITH the write that changes the blob, so the copy can't drift from it. The
+ * entries go in as one JSON array rather than binds per row, so no role list can hit D1's
+ * bound-parameter cap.
+ */
+export function roomRoleWrites(db: D1Database, roomId: number, room: Room): D1PreparedStatement[] {
+	// A malformed tier reads as NaN, which JSON writes as null and the NOT NULL column would
+	// refuse — failing the room write it is batched with. Store it as None instead.
+	const tier = (n: number) => (Number.isFinite(n) ? n : Role.None)
+	const entries = roomRoles(room)
+		.filter((r) => Number.isInteger(r.AccountId) && r.AccountId > 0)
+		.map((r) => ({ ...r, Role: tier(r.Role), InvitedRole: tier(r.InvitedRole) }))
+	const statements = [db.prepare('DELETE FROM room_role WHERE room_id = ?1').bind(roomId)]
+	if (entries.length > 0) {
+		statements.push(
+			db
+				.prepare(
+					`INSERT OR IGNORE INTO room_role
+					   (account_id, room_id, role, invited_role, last_changed_by_account_id)
+					 SELECT json_extract(value, '$.AccountId'), ?1, json_extract(value, '$.Role'),
+					        json_extract(value, '$.InvitedRole'), json_extract(value, '$.LastChangedByAccountId')
+					 FROM json_each(?2)`
+				)
+				.bind(roomId, JSON.stringify(entries))
+		)
+	}
+	return statements
 }
 
 /**
@@ -830,7 +879,10 @@ export async function cloneRoom(
 
 	// serializeRoom drops the hydrated SubRooms from the blob; the clone's subrooms are
 	// inserted into the subroom table below with fresh globally-unique ids.
-	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(cloned)).run()
+	await db.batch([
+		db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(cloned)),
+		...roomRoleWrites(db, newRoomId, cloned),
+	])
 	// Tags live in `room_tag`, not the blob: the system tags need their own write.
 	if (systemTags.length > 0) await setRoomTags(db, newRoomId, systemTags)
 	const sourceSubRooms = Array.isArray(source.SubRooms) ? (source.SubRooms as SubRoom[]) : []
@@ -922,6 +974,7 @@ export async function createStudioRoom(
 		.first<{ data: string }>()
 	if (!inserted) return null
 	const created = JSON.parse(inserted.data) as Room
+	await db.batch(roomRoleWrites(db, Number(created.RoomId), created))
 	// Studio's picker and empty-save loader support these modern Maker Room scenes,
 	// not the legacy sandbox scene used by generic game subroom creation.
 	const scene =
@@ -1059,10 +1112,10 @@ export async function updateRoomFields(
 	patch: Record<string, unknown>
 ): Promise<Room> {
 	const updated: Room = { ...room, ...patch }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...('Roles' in patch ? roomRoleWrites(db, roomId, updated) : []),
+	])
 	return updated
 }
 
@@ -1124,10 +1177,10 @@ export async function setRoomRole(
 	}
 
 	const updated: Room = { ...room, Roles: roles }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...roomRoleWrites(db, roomId, updated),
+	])
 	return updated
 }
 
@@ -1181,10 +1234,10 @@ export async function removeRoomRole(
 
 	roles.splice(index, 1)
 	const updated: Room = { ...room, Roles: roles }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...roomRoleWrites(db, roomId, updated),
+	])
 	return updated
 }
 
@@ -1244,10 +1297,10 @@ export async function transferRoomOwnership(
 	setRole(fromAccountId, Role.CoOwner)
 
 	const updated: Room = { ...room, CreatorAccountId: toAccountId, Roles: roles }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...roomRoleWrites(db, roomId, updated),
+	])
 	return updated
 }
 
@@ -1304,10 +1357,10 @@ export async function answerRoomRoleInvite(
 	}
 
 	const updated: Room = { ...room, Roles: roles }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...roomRoleWrites(db, roomId, updated),
+	])
 	return updated
 }
 
@@ -1345,10 +1398,10 @@ export async function inviteRoomRole(
 		})
 	}
 	const updated: Room = { ...room, Roles: roles }
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(updated))
-		.run()
+	await db.batch([
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(updated)),
+		...roomRoleWrites(db, roomId, updated),
+	])
 	return updated
 }
 
@@ -3131,7 +3184,12 @@ async function setCurrentSave(db: D1Database, subRoomId: number, saveId: number)
 export async function seedRoomWithSubRooms(db: D1Database, room: Room): Promise<void> {
 	const roomId = Number(room.RoomId)
 	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
-	await db.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
+	const seeded = await db
+		.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
+		.bind(serializeRoom(room))
+		.run()
+	// An ignored insert left an existing room in place; its role rows are already its own.
+	if (seeded.meta.changes > 0) await db.batch(roomRoleWrites(db, roomId, room))
 	// `serializeRoom` drops `Tags`, so a seeded room's tags have to go to their own table or
 	// they'd vanish — the same step the migration's backfill takes for the imported rooms.
 	if (Array.isArray(room.Tags) && room.Tags.length > 0) {
@@ -3178,6 +3236,7 @@ export async function deleteRoom(db: D1Database, roomId: number): Promise<void> 
 		// Tag rows outlive the blob otherwise, and would keep answering `#tag` searches and
 		// category rows for a room nobody can open.
 		db.prepare('DELETE FROM room_tag WHERE room_id = ?1').bind(roomId),
+		db.prepare('DELETE FROM room_role WHERE room_id = ?1').bind(roomId),
 		// Saves and permission overrides first — both are keyed by subroom, so they'd be
 		// unreachable once the subrooms themselves are gone.
 		db
@@ -3270,19 +3329,18 @@ export async function countRoomsByCreator(db: D1Database, accountId: number): Pr
  * room the player made. A room matching BOTH halves appears once — the roles half is an
  * EXISTS, not a join.
  *
- * Roles live inside the room blob rather than in a table of their own, so the match is a
- * `json_each` over `$.Roles`. A room with no `Roles` key (or a null one) simply yields no
- * rows there rather than erroring, so it only reaches the list if the account created it.
+ * Roles live inside the room blob, so the roles half reads `room_role`, the trigger-kept
+ * index of them, rather than a `json_each` over every room's `$.Roles` (which scanned and
+ * parsed the whole table on every call). Both halves are index lookups, and SQLite runs
+ * the OR as a multi-index union. A room with no `Roles` has no `room_role` rows, so it
+ * only reaches the list if the account created it.
  */
 export async function getContributedRooms(db: D1Database, accountId: number): Promise<Room[]> {
 	const { results } = await db
 		.prepare(
 			`SELECT ${ROOM_COLUMNS} FROM room
 			 WHERE creator_account_id = ?1
-			    OR EXISTS (
-			     SELECT 1 FROM json_each(room.data, '$.Roles') AS role
-			     WHERE json_extract(role.value, '$.AccountId') = ?1
-			   )`
+			    OR room_id IN (SELECT room_id FROM room_role WHERE account_id = ?1)`
 		)
 		.bind(accountId)
 		.all<RoomRow>()
@@ -4245,7 +4303,10 @@ export async function getOrCreateDormRoom(db: D1Database, accountId: number): Pr
 	}
 	// serializeRoom drops any SubRooms carried over from the template; the dorm's own
 	// subroom is inserted into the subroom table below with a fresh globally-unique id.
-	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
+	await db.batch([
+		db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(room)),
+		...roomRoleWrites(db, roomId, room),
+	])
 	const subRoom = await insertSubRoom(db, roomId, { ...templateSub, CreatorAccountId: accountId })
 	room.SubRooms = [subRoom]
 	// The template carries these (it was parsed), but a dorm minted without one wouldn't.

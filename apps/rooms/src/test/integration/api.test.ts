@@ -13,6 +13,7 @@ import {
 	countRoomsUsingInvention,
 	createRoomInstance,
 	decodeInventionUsage,
+	getRoomById,
 	getRoomInstance,
 	MessageType,
 	NOTIFICATION_SCHEMA_DDL,
@@ -20,11 +21,14 @@ import {
 	publicStudioBundleFilename,
 	putUnityAsset,
 	recordRoomVisit,
+	removeRoomRole,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	ROOM_XP_SCHEMA_DDL,
+	roomRoleWrites,
 	seedRoomWithSubRooms,
+	setRoomRole,
 	STUDIO_CLOUD_BUILD_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
 	UNITY_ASSET_SCHEMA_DDL,
@@ -456,8 +460,20 @@ describe('rooms endpoints', () => {
 	})
 
 	it('GET /rooms/contributedby/me lists rooms the caller owns or has a role in', async () => {
+		// The roles half reads `room_role`, so a seeded room's roles go there too, as every
+		// write in rooms-db does.
 		const seed = (data: Record<string, unknown>) =>
-			env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)).run()
+			env.DB.batch([
+				env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)),
+				...roomRoleWrites(env.DB, Number(data.RoomId), data as Room),
+			])
+		const contributed = async (accountId: string) => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`, {
+				headers: await bearer(accountId),
+			})
+			const rooms = (await res.json()) as Array<{ RoomId: number }>
+			return rooms.map((r) => r.RoomId).sort((a, b) => a - b)
+		}
 
 		// A room somebody else made, where 820 is a co-owner...
 		await seed({
@@ -545,9 +561,24 @@ describe('rooms endpoints', () => {
 		// Auth-scoped: `me` is the token, so no token is a 401.
 		expect((await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`)).status).toBe(401)
 
+		// Role changes move a room in and out of the list: granting 829 a role in 30404
+		// lists it for them, and taking the role back drops it again.
+		const other = (await getRoomById(env.DB, 30404))!
+		const granted = await setRoomRole(env.DB, 30404, 829, 10, 821, other)
+		expect(await contributed('829')).toEqual([30404])
+		// The row carries the whole entry, as the blob does.
+		expect(
+			await env.DB.prepare(
+				'SELECT role, invited_role, last_changed_by_account_id FROM room_role WHERE room_id = 30404 AND account_id = 829'
+			).first()
+		).toEqual({ role: 10, invited_role: 0, last_changed_by_account_id: 821 })
+		await removeRoomRole(env.DB, 30404, 829, 821, granted!)
+		expect(await contributed('829')).toEqual([])
+
 		// The DB is shared across this file, and these are the only player-made public rooms
 		// in it — leaving them behind changes what the `new`/`community` room feeds serve.
 		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
+		await env.DB.prepare('DELETE FROM room_role WHERE room_id BETWEEN 30401 AND 30407').run()
 	})
 
 	it('GET /rooms/:roomId/experience serves the room’s stored XP settings, no auth', async () => {
