@@ -388,6 +388,18 @@ export const FavoriteThreadRequest = z.object({
 		.describe('`True`/`False` as the client spells it (`1`/`yes` also count as true)'),
 })
 
+/**
+ * `PUT|POST /thread/:id/favorite` response — the client's `FavoriteChatResponse`, a bare
+ * two-key object with no envelope. Unlike the other thread actions it is NOT a bare
+ * ChatResult integer: the client parses this object either way.
+ */
+export const FavoriteChatResponse = z.object({
+	ChatResult,
+	IsFavorited: z
+		.boolean()
+		.describe('The caller’s favorite flag after the call (false when they aren’t on the thread)'),
+})
+
 // ---- Shared parameters -----------------------------------------------------
 
 /** The numeric `:id` path segment naming a thread (constrained to digits by the route). */

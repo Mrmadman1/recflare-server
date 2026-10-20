@@ -20,6 +20,7 @@ import {
 	CreatePartyChatResponse,
 	CreateThreadRequest,
 	CreateThreadResponse,
+	FavoriteChatResponse,
 	FavoriteThreadRequest,
 	form,
 	json,
@@ -572,7 +573,7 @@ async function formField(c: Context<App>, name: string): Promise<string | undefi
 
 /**
  * A concise `describeRoute` spec for one of the thread-scoped actions that answers the
- * bare ChatResult integer rather than an HTTP status — rename, leave, snooze, favorite,
+ * bare ChatResult integer rather than an HTTP status — rename, leave, snooze,
  * add-member and the read-pointer moves. They share the auth gate, the `:id` path param,
  * and the "3 when the caller isn't on the thread" behaviour.
  */
@@ -1361,28 +1362,44 @@ const app = new Hono<App>()
 
 	// Favorite or unfavorite a thread (`favorite=True`), for the caller alone — like
 	// snoozing, it's a per-member flag that pins the thread in their own inbox.
+	//
+	// Answers the client's `FavoriteChatResponse` — a bare `{ ChatResult, IsFavorited }`
+	// object, not the bare ChatResult integer the neighbouring thread actions answer.
 	.on(
 		['PUT', 'POST'],
 		'/thread/:id{[0-9]+}/favorite',
-		chatResultRoute(
-			'Favorite or unfavorite a thread',
-			[
+		describeRoute({
+			tags: ['Chat'],
+			summary: 'Favorite or unfavorite a thread',
+			description: [
 				'Like snoozing, a per-member flag that pins the thread in the caller’s own inbox and',
-				'leaves everyone else’s untouched.',
+				'leaves everyone else’s untouched. Answers the client’s `FavoriteChatResponse`, a bare',
+				'`{ ChatResult, IsFavorited }` object — not the bare ChatResult integer the other thread',
+				'actions answer.',
 			].join(' '),
-			{ requestBody: form(FavoriteThreadRequest, 'The favorite flag') }
-		),
+			security: AUTHED,
+			parameters: [THREAD_ID_PARAM],
+			requestBody: form(FavoriteThreadRequest, 'The favorite flag'),
+			responses: {
+				200: json(
+					FavoriteChatResponse,
+					'ChatResult 0 and the new flag on success; ChatResult 3 when the caller isn’t on the thread'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return c.body(null, 401)
 
 			const chatThreadId = Number.parseInt(c.req.param('id'), 10)
 			if (!(await isThreadMember(c.env.DB, chatThreadId, id))) {
-				return c.json(CHAT_MEMBERSHIP_NOT_FOUND)
+				return c.json({ ChatResult: CHAT_MEMBERSHIP_NOT_FOUND, IsFavorited: false })
 			}
 
-			await setThreadFavorited(c.env.DB, chatThreadId, id, await formBool(c, 'favorite'))
-			return c.json(CHAT_SUCCESS)
+			const isFavorited = await formBool(c, 'favorite')
+			await setThreadFavorited(c.env.DB, chatThreadId, id, isFavorited)
+			return c.json({ ChatResult: CHAT_SUCCESS, IsFavorited: isFavorited })
 		}
 	)
 
