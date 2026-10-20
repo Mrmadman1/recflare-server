@@ -28,7 +28,7 @@ import {
 	where,
 } from './api'
 import { DeviceLinkPage } from './DeviceLink'
-import { customAvatarItemIdFromPath, ItemPage } from './Item'
+import { customAvatarItemIdFromPath, inventionIdFromPath, InventionPage, ItemPage } from './Item'
 import { ModerationPage, PlayerBanStatus } from './Moderation'
 import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
@@ -1227,6 +1227,62 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
 	)
 }
 
+/** The `/image/<id>` path's numeric image id, or null for any other path. */
+function imageIdFromPath(path: string): number | null {
+	const match = /^\/image\/(\d+)\/?$/.exec(path)
+	return match ? Number(match[1]) : null
+}
+
+/**
+ * One photo on its own page (`/image/<id>`) — just the image.
+ *
+ * Read through `api`'s `GET /api/images/v6/:id` WITHOUT the session token, deliberately:
+ * that route serves a private image to the player who took it, and this page is a public
+ * link, so it must show only what anyone could see. Signed out or not, a private image is
+ * the same 404 as an unknown id.
+ */
+async function fetchPublicImage(imageId: number): Promise<{ ImageName: string } | null> {
+	const res = await fetch(`${where().api}/api/images/v6/${imageId}`)
+	if (res.status === 404) return null
+	if (!res.ok) throw new Error(`Couldn’t load the image (${res.status}).`)
+	const image = (await res.json()) as { ImageName: string; Accessibility: number }
+	// The route already refuses a private image to an anonymous caller; checked again so
+	// this page can't show one if that ever changes.
+	return image.Accessibility === Accessibility.Public ? image : null
+}
+
+function ImagePage({ imageId, config }: { imageId: number; config: SiteConfig | undefined }) {
+	// undefined = not fetched yet; null = no public image with this id.
+	const [image, setImage] = useState<{ ImageName: string } | null | undefined>(undefined)
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		// Waits for the config for the hostnames, as PlayerPage does.
+		if (config === undefined) return
+		setImage(undefined)
+		setError('')
+		void fetchPublicImage(imageId)
+			.then(setImage)
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [imageId, config])
+
+	return (
+		<main className="shell wide image-page">
+			{error ? (
+				<p className="error">{error}</p>
+			) : image === undefined ? (
+				<p className="muted">Loading…</p>
+			) : image === null ? (
+				<p className="muted">
+					There&apos;s no image here — it&apos;s private, or it doesn&apos;t exist.
+				</p>
+			) : (
+				<img src={`${where().img}/${image.ImageName}`} alt="" />
+			)}
+		</main>
+	)
+}
+
 /**
  * A player's public profile page (`/u/<username>`) — banner, avatar, bio-adjacent
  * info, their public rooms, and their public photos. Read-only: this is the
@@ -2005,6 +2061,8 @@ export function App() {
 	const roomId = roomIdFromPath(path)
 	const lookupUsername = usernameFromPath(path)
 	const customAvatarItemId = customAvatarItemIdFromPath(path)
+	const imageId = imageIdFromPath(path)
+	const inventionId = inventionIdFromPath(path)
 
 	useEffect(() => {
 		// Config first, and everything else after it: it carries the hostnames every other
@@ -2100,6 +2158,14 @@ export function App() {
 					signedIn={account === undefined ? undefined : account !== null}
 					navigate={navigate}
 				/>
+			) : inventionId !== null ? (
+				// The store share link for an invention. Public, published inventions only (see
+				// InventionPage); a client-side route like the item page above.
+				<InventionPage inventionId={inventionId} ready={config !== undefined} navigate={navigate} />
+			) : imageId !== null ? (
+				// A photo's own link. Public images only, read without the session (see
+				// ImagePage); a client-side route, so a cold load falls through to the SPA shell.
+				<ImagePage imageId={imageId} config={config} />
 			) : lookupUsername !== null ? (
 				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
 			) : roomId !== null ? (

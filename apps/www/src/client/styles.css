@@ -2005,6 +2005,15 @@ button[type='submit']:disabled {
 	background: rgb(0 0 0 / 80%);
 }
 
+/* `/image/<id>`: the one photo, fitted to the page. */
+.image-page img {
+	display: block;
+	max-width: 100%;
+	max-height: 80vh;
+	margin: 0 auto;
+	border-radius: 9px;
+}
+
 .photo-modal img {
 	display: block;
 	max-width: 94vw;
