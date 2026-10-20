@@ -49,6 +49,7 @@ import {
 	recordStat,
 	refreshInstanceFullness,
 	Role,
+	rolloutGameBuilds,
 	RoomInstanceType,
 	roomRoles,
 	setPresence,
@@ -253,7 +254,7 @@ const ROLLOUT_TACHYON_SERVER_ID_PREFIX = 'rollout-'
 interface TachyonCaller {
 	/** The account's `isSandbox` flag. */
 	isSandbox: boolean
-	/** Running a build under staged rollout (`ROLLOUT_GAME_VERSIONS`, off the token's `rn.ver`). */
+	/** Running a build under staged rollout (`rolloutGameBuilds`, off the token's `rn.ver`). */
 	isRollout: boolean
 }
 
@@ -3216,7 +3217,7 @@ const app = new Hono<App>()
 				'…). Both are empty when the pool is unset or the caller is in no instance. A',
 				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the',
 				'same way, with ids `dev-1`, `dev-2`, …; a caller whose token’s `rn.ver` is a build',
-				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, currently `20260323`) out of',
+				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, by default `20260323`) out of',
 				'`TACHYON_HOST_PORT_ROLLOUT`, with ids `rollout-1`, `rollout-2`, …. Sandbox wins when',
 				'both apply, and either special pool left unset falls back to the live one.',
 				'`experiments` carries the client’s networking flags.',
@@ -3264,7 +3265,7 @@ const app = new Hono<App>()
 			const tachyon = tachyonServerFor(
 				tachyonPoolFor(c.env, {
 					isSandbox: account?.isSandbox === true,
-					isRollout: isRolloutGameVersion(await callerVersion(c)),
+					isRollout: isRolloutGameVersion(await callerVersion(c), rolloutGameBuilds(c.env)),
 				}),
 				roomInstanceId
 			)

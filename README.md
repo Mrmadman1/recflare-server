@@ -57,6 +57,12 @@ Alpha builds get past the version check and largely work, but nothing else in th
 stack targets them, so expect protocol differences. Other client or game versions
 may expect different endpoints and response shapes and are not supported.
 
+The table is the default. An operator narrows it with `RECFLARE_SUPPORTED_GAME_VERSIONS`
+in `.env` (a build left out is told to update and refused a sign-in, which is how players
+are moved to a newer build), and `RECFLARE_ROLLOUT_GAME_VERSIONS` names the builds under
+staged rollout to Discord supporters — `20260323` by default, `off` to open it to
+everyone. See `.env.example`.
+
 Generally speaking any client that effectively rewrites the nameserver with the
 right mods (see [RecNet Plugin](https://github.com/djdevin/recnet-plugin), [2025 patch](https://github.com/recflare/patch-2025)) can be used with this server.
 

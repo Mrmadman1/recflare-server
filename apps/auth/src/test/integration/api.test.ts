@@ -1415,6 +1415,140 @@ describe('auth worker routes', () => {
 				expect(after?.n).toBe(before?.n)
 			})
 		})
+
+		// The two lists behind the gates are vars (`SUPPORTED_GAME_VERSIONS`,
+		// `ROLLOUT_GAME_VERSIONS`), so an operator can end the rollout or drop a build without
+		// a deploy of new code. Same env-override discipline as withRoleIds.
+		describe('the lists come from vars', () => {
+			const UNSUPPORTED = 'this game version is not supported by this server; update your game'
+
+			async function withVars<T>(
+				vars: { SUPPORTED_GAME_VERSIONS?: string; ROLLOUT_GAME_VERSIONS?: string },
+				run: () => Promise<T>
+			): Promise<T> {
+				const originals = {
+					SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+					ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+				}
+				const apply = (values: typeof originals) => {
+					for (const key of ['SUPPORTED_GAME_VERSIONS', 'ROLLOUT_GAME_VERSIONS'] as const) {
+						if (values[key] === undefined) delete env[key]
+						else env[key] = values[key]
+					}
+				}
+				apply({ ...originals, ...vars })
+				try {
+					return await run()
+				} finally {
+					apply(originals)
+				}
+			}
+
+			test('a build dropped from SUPPORTED_GAME_VERSIONS is refused a token, staff included', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414,20260323' }, async () => {
+					await withRoleIds(undefined, async () => {
+						// The 2025 build, every point release of it: this is the forced upgrade.
+						for (const version of ['20250718', '20250718.01', '20250718.2']) {
+							const res = await login('gate_outsider', version)
+							expect(res.status, version).toBe(400)
+							expect(res.json, version).toEqual({
+								error: 'invalid_grant',
+								error_description: UNSUPPORTED,
+							})
+						}
+						// Staff get no exception here — the build is not served, full stop.
+						expect((await login('gate_developer', '20250718.01')).status).toBe(400)
+						// The builds that ARE listed, and a grant posting no `ver`, are untouched;
+						// the rollout gate still applies to the one under rollout.
+						expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+						expect((await login('gate_outsider')).status).toBe(200)
+						expect((await login('gate_developer', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+			})
+
+			test('create_account on an unsupported build is refused before anything is minted', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					const res = await postToken(
+						'grant_type=create_account&platform_id=steam-unsupported&password=hunter2&ver=20250718.01'
+					)
+					expect(res.status).toBe(400)
+					expect(res.json).toEqual({ error: 'invalid_grant', error_description: UNSUPPORTED })
+					const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					expect(after?.n).toBe(before?.n)
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS=off ends the rollout: the build opens to everyone', async () => {
+				await withVars({ ROLLOUT_GAME_VERSIONS: 'off' }, async () => {
+					await withRoleIds(undefined, async () => {
+						const res = await login('gate_outsider', GATED)
+						expect(res.status).toBe(200)
+						expect(decodePayload(res.json.access_token as string)['rn.ver']).toBe(GATED)
+						expect((await login('gate_unlinked', GATED)).status).toBe(200)
+						// ...and accounts can be created on it, since nothing needs a Discord link.
+						const created = await postToken(
+							`grant_type=create_account&platform_id=steam-rollout-over&password=hunter2&ver=${GATED}`
+						)
+						expect(created.status).toBe(200)
+					})
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS names which builds are gated', async () => {
+				// Move the gate onto the beta build: it is now supporters-only and the 2026
+				// build is open. Both stay served.
+				await withVars({ ROLLOUT_GAME_VERSIONS: '20250718' }, async () => {
+					await withRoleIds(supporter, async () => {
+						const outsider = await login('gate_outsider', '20250718.01')
+						expect(outsider.status).toBe(400)
+						expect(outsider.json.error_description).toBe(REFUSED)
+						expect((await login('gate_supporter', '20250718.01')).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).status).toBe(200)
+					})
+				})
+			})
+
+			test('a build under rollout is served even when SUPPORTED_GAME_VERSIONS omits it', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					await withRoleIds(supporter, async () => {
+						// Rolling out, so the ROLLOUT gate answers, not the support one.
+						expect((await login('gate_supporter', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+				// In neither list, nobody reaches it — a rollout pulled back entirely.
+				await withVars(
+					{ SUPPORTED_GAME_VERSIONS: '20230414', ROLLOUT_GAME_VERSIONS: 'off' },
+					async () => {
+						await withRoleIds(supporter, async () => {
+							for (const username of ['gate_supporter', 'gate_developer']) {
+								const res = await login(username, GATED)
+								expect(res.status, username).toBe(400)
+								expect(res.json.error_description, username).toBe(UNSUPPORTED)
+							}
+						})
+					}
+				)
+			})
+
+			test('entries are read as builds, so a copied point release still matches', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: ' 20230414, 20250718.01 ' }, async () => {
+					expect((await login('gate_outsider', '20250718.2')).status).toBe(200)
+					expect((await login('gate_outsider', '20250718')).status).toBe(200)
+				})
+				// Blank is unset: the default list applies, including the alpha builds.
+				await withVars({ SUPPORTED_GAME_VERSIONS: '  ' }, async () => {
+					expect((await login('gate_outsider', '20231207')).status).toBe(200)
+				})
+			})
+		})
 	})
 
 	test('the signup caps come from vars, and 0 disables an arm', async () => {

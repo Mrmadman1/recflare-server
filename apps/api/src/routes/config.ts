@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { GAME_VERSION, isSupportedGameVersion } from '@repo/domain'
+import { GAME_VERSION, isSupportedGameVersion, supportedGameBuilds } from '@repo/domain'
 import { validateAndGetBuild } from '@repo/jwt'
 
 import apiConfigV2 from '../../static/api-config-v2.json'
@@ -106,13 +106,17 @@ export const configRoutes = new Hono<App>({ strict: false })
 			summary: 'Client version check',
 			description:
 				'Whether the client build is current. Compares the client’s `?v=` build against ' +
-				'the builds we serve (`SUPPORTED_GAME_VERSIONS`): `VersionStatus` is 0 when the ' +
-				'client is on one of them, 1 when it is on some other build.',
+				'the builds we serve — the operator’s `SUPPORTED_GAME_VERSIONS` var (or the ' +
+				'default list in `@repo/domain`) plus every build under rollout ' +
+				'(`ROLLOUT_GAME_VERSIONS`): `VersionStatus` is 0 when the client is on one of ' +
+				'them, 1 when it is on some other build. The same lists decide which builds ' +
+				'`auth` hands a token to, so a build dropped from them is told to update here ' +
+				'and refused there.',
 			responses: { 200: json(VersionCheck, 'Version status') },
 		}),
 		(c) =>
 			c.json({
-				VersionStatus: isSupportedGameVersion(c.req.query('v')) ? 0 : 1,
+				VersionStatus: isSupportedGameVersion(c.req.query('v'), supportedGameBuilds(c.env)) ? 0 : 1,
 				UpdateNotificationStage: 0,
 				IsVersionIslanded: false,
 				IsCrossPlayDisabled: false,

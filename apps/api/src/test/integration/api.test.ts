@@ -323,6 +323,56 @@ describe('public endpoints', () => {
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
 	})
 
+	// The list is the operator's SUPPORTED_GAME_VERSIONS var when set, plus every build
+	// under rollout (ROLLOUT_GAME_VERSIONS) — the same lists `auth` gates tokens on, so a
+	// build told to update here is refused there too.
+	test('GET /api/versioncheck/v4 reads the lists from vars', async () => {
+		const status = async (version: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			return ((await res.json()) as { VersionStatus: number }).VersionStatus
+		}
+		const originals = {
+			SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+			ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+		}
+		try {
+			// Forced upgrade: the 2025 build drops out, every point release of it.
+			env.SUPPORTED_GAME_VERSIONS = '20230414,20260323'
+			expect(await status('20250718.01')).toBe(1)
+			expect(await status('20250718')).toBe(1)
+			expect(await status(GAME_VERSION)).toBe(0)
+			expect(await status('20260323.14')).toBe(0)
+			// Alphas not named in the var are gone too: the var replaces the default list.
+			expect(await status('20231207')).toBe(1)
+
+			// A build under rollout is current even when the var omits it: who may sign in on
+			// it is `auth`'s call, and the version check must not send a supporter to update.
+			env.SUPPORTED_GAME_VERSIONS = '20230414'
+			expect(await status('20260323.14')).toBe(0)
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await status('20260323.14')).toBe(1)
+			env.ROLLOUT_GAME_VERSIONS = '20250718'
+			expect(await status('20250718.01')).toBe(0)
+
+			// Entries are builds: a copied point release matches, and `off` empties the list.
+			env.ROLLOUT_GAME_VERSIONS = undefined
+			env.SUPPORTED_GAME_VERSIONS = '20250718.01'
+			expect(await status('20250718.2')).toBe(0)
+			expect(await status(GAME_VERSION)).toBe(1)
+			env.SUPPORTED_GAME_VERSIONS = 'off'
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(1)
+
+			// Blank is unset: the default list.
+			env.SUPPORTED_GAME_VERSIONS = ''
+			env.ROLLOUT_GAME_VERSIONS = ''
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(0)
+		} finally {
+			env.SUPPORTED_GAME_VERSIONS = originals.SUPPORTED_GAME_VERSIONS
+			env.ROLLOUT_GAME_VERSIONS = originals.ROLLOUT_GAME_VERSIONS
+		}
+	})
+
 	// Two catalogs, picked off the token's `rn.ver`: a build newer than GAME_VERSION gets
 	// the 2025 one. `Avatars.AdvancedFaceCustomizationEnabled` is a key only that catalog
 	// has, so its presence identifies which body was served.

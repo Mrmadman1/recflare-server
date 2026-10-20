@@ -1814,6 +1814,7 @@ describe('auth-gated endpoints', () => {
 		const original = env.TACHYON_HOST_PORT
 		const originalSandbox = env.TACHYON_HOST_PORT_SANDBOX
 		const originalRollout = env.TACHYON_HOST_PORT_ROLLOUT
+		const originalRolloutVersions = env.ROLLOUT_GAME_VERSIONS
 		try {
 			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
 			env.TACHYON_HOST_PORT_SANDBOX = '203.0.113.30:7777, 203.0.113.30:7778'
@@ -1905,6 +1906,30 @@ describe('auth-gated endpoints', () => {
 				})
 			}
 
+			// WHICH builds are under rollout is the ROLLOUT_GAME_VERSIONS var, the same one
+			// `auth` gates on. `off` ends the rollout and its callers join the live pool; naming
+			// another build moves the pool to that build's players instead.
+			const movedRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-moved',
+				maxCapacity: 12,
+			})
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await rolloutVoiceFor('976', '20260323.14', movedRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+			env.ROLLOUT_GAME_VERSIONS = '20250718'
+			expect(await rolloutVoiceFor('976', '20250718.01', movedRollout.roomInstanceId)).toEqual(
+				rolloutPool[movedRollout.roomInstanceId % rolloutPool.length]
+			)
+			expect(await rolloutVoiceFor('976', '20260323.14', movedRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
+
 			// With no rollout pool configured, a rollout build falls back to the live one, not
 			// the sandbox one.
 			env.TACHYON_HOST_PORT_ROLLOUT = undefined
@@ -1935,6 +1960,7 @@ describe('auth-gated endpoints', () => {
 			env.TACHYON_HOST_PORT = original
 			env.TACHYON_HOST_PORT_SANDBOX = originalSandbox
 			env.TACHYON_HOST_PORT_ROLLOUT = originalRollout
+			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
 		}
 	})
 

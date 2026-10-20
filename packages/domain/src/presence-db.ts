@@ -51,9 +51,11 @@ export function gameBuild(version: string | null | undefined): string | null {
 }
 
 /**
- * Client builds `/api/versioncheck/v4` answers "current" for, in the support tiers the
- * README publishes. They talk close enough to the same protocol to get past the update
- * prompt; how much beyond that is tested differs by tier:
+ * The DEFAULT set of client builds this server serves — what `/api/versioncheck/v4`
+ * answers "current" for and `auth` hands a token to when the operator has not set
+ * `SUPPORTED_GAME_VERSIONS` (see {@link supportedGameBuilds}). In the support tiers the
+ * README publishes; they talk close enough to the same protocol to get past the update
+ * prompt, and how much beyond that is tested differs by tier:
  *
  * - `GAME_VERSION` (`20230414`, manifest `7859140924515540835`) is the DEFAULT — the
  *   build the rest of the stack targets and the one it reports for itself.
@@ -74,21 +76,13 @@ export const SUPPORTED_GAME_VERSIONS: string[] = [
 	'20230616', // alpha
 	'20231207', // alpha
 	'20250424', // alpha (20250424.01)
-	'20260323', // alpha (20260323.14)
+	'20260323', // alpha (20260323.14), under staged rollout — see ROLLOUT_GAME_VERSIONS
 ]
 
 /**
- * Whether a client-supplied version (the version check's `?v=`) names a build we serve.
- * Compared as a build, so the client's point release never decides it.
- */
-export function isSupportedGameVersion(version: string | null | undefined): boolean {
-	const build = gameBuild(version)
-	return build !== null && SUPPORTED_GAME_VERSIONS.includes(build)
-}
-
-/**
- * Supported builds under STAGED ROLLOUT to Discord supporters — kept apart from the live
- * side of the stack:
+ * The DEFAULT builds under STAGED ROLLOUT to Discord supporters, applied when the
+ * operator has not set `ROLLOUT_GAME_VERSIONS` (see {@link rolloutGameBuilds}). A build
+ * here is kept apart from the live side of the stack:
  *
  * - `auth` refuses `/connect/token` on one of these unless the account's Discord link
  *   holds a role in `DISCORD_ROLLOUT_ROLE_IDS` (closed to everyone when none is set).
@@ -96,19 +90,103 @@ export function isSupportedGameVersion(version: string | null | undefined): bool
  *   caller whose token's `rn.ver` is one of these (a sandbox account keeps its sandbox
  *   pool) — the new build runs against its own voice servers, apart from the live pool.
  *
- * One list so the two gates can't drift: a build is either rolling out or it isn't. Remove a
- * build from here when it ships to everyone. Bare dates, like `SUPPORTED_GAME_VERSIONS`:
- * every point release of a listed date is under rollout.
+ * One list so the two gates can't drift: a build is either rolling out or it isn't. A
+ * build under rollout is always SERVED (it is folded into {@link supportedGameBuilds}), it
+ * is just gated. Bare dates, like `SUPPORTED_GAME_VERSIONS`: every point release of a
+ * listed date is under rollout.
  */
 export const ROLLOUT_GAME_VERSIONS: readonly string[] = ['20260323']
 
 /**
- * Whether a version (a token's `rn.ver`, a grant's posted `ver`) names a build under
- * staged rollout.
+ * The two worker vars that override the lists above, both OPTIONAL and set for every
+ * worker at once from the root `.env` (`RECFLARE_SUPPORTED_GAME_VERSIONS`,
+ * `RECFLARE_ROLLOUT_GAME_VERSIONS` — see .env.example and `recflare_vars`). Each is a
+ * list of builds separated by commas (no whitespace survives the deploy script, but it is
+ * accepted), and either may be `off`/`none` for an EMPTY list. Entries are reduced to
+ * their build ({@link gameBuild}), so an operator who copies the client's `20250718.01`
+ * off a screen gets the same gate as `20250718`.
+ *
+ * A worker that reads either declares it in its context.ts and passes its env here;
+ * `auth`, `api` and `match` do. The lifecycle the knobs exist for:
+ *
+ * 1. ROLLOUT: both unset. The 2026 build is served to staff and Discord supporters only.
+ * 2. GENERAL AVAILABILITY: `ROLLOUT_GAME_VERSIONS=off`. The 2026 build is open to all.
+ * 3. FORCED UPGRADE: `SUPPORTED_GAME_VERSIONS=20230414,20260323` (and `off` as above). The
+ *    2025 build fails the version check and is refused a token, so it has to update.
+ *
+ * Or, to pull a rollout back entirely: `SUPPORTED_GAME_VERSIONS=20230414,20250718` with
+ * `ROLLOUT_GAME_VERSIONS=off` — the build is in neither list, so nobody reaches it.
  */
-export function isRolloutGameVersion(version: string | null | undefined): boolean {
+export interface GameVersionVars {
+	/** The served builds; unset means {@link SUPPORTED_GAME_VERSIONS}. */
+	SUPPORTED_GAME_VERSIONS?: string
+	/** The builds under staged rollout; unset means {@link ROLLOUT_GAME_VERSIONS}. */
+	ROLLOUT_GAME_VERSIONS?: string
+}
+
+/**
+ * A game-version var as a list of builds, or null when it is UNSET — absent, not a string
+ * (a var declared in wrangler.jsonc keeps its JSON type) or blank — so the caller applies
+ * its default. `off` or `none` (any case) is an EMPTY list, which is distinct from unset:
+ * it is how an operator empties a list that has a non-empty default. Entries are split on
+ * commas and/or whitespace, reduced to builds and de-duplicated; a lone `.NN` or an empty
+ * entry between two commas contributes nothing.
+ */
+export function parseGameBuilds(raw: unknown): string[] | null {
+	if (typeof raw !== 'string' || raw.trim() === '') return null
+	const trimmed = raw.trim()
+	if (/^(off|none)$/i.test(trimmed)) return []
+	const builds: string[] = []
+	for (const entry of trimmed.split(/[\s,]+/)) {
+		const build = gameBuild(entry)
+		if (build !== null && !builds.includes(build)) builds.push(build)
+	}
+	return builds
+}
+
+/** The builds under staged rollout: the operator's `ROLLOUT_GAME_VERSIONS`, or the default. */
+export function rolloutGameBuilds(env: GameVersionVars): string[] {
+	return parseGameBuilds(env.ROLLOUT_GAME_VERSIONS) ?? [...ROLLOUT_GAME_VERSIONS]
+}
+
+/**
+ * The builds this server serves: the operator's `SUPPORTED_GAME_VERSIONS` (or the default
+ * list) PLUS every build under rollout — a build being rolled out is being served, to
+ * whoever the rollout gate lets through, whether or not the operator also listed it.
+ */
+export function supportedGameBuilds(env: GameVersionVars): string[] {
+	const supported = parseGameBuilds(env.SUPPORTED_GAME_VERSIONS) ?? [...SUPPORTED_GAME_VERSIONS]
+	for (const build of rolloutGameBuilds(env)) {
+		if (!supported.includes(build)) supported.push(build)
+	}
+	return supported
+}
+
+/**
+ * Whether a client-supplied version (the version check's `?v=`, a grant's posted `ver`)
+ * names a build we serve. Compared as a build, so the client's point release never
+ * decides it. `builds` is {@link supportedGameBuilds} for a worker with the vars in hand;
+ * the default list otherwise.
+ */
+export function isSupportedGameVersion(
+	version: string | null | undefined,
+	builds: readonly string[] = SUPPORTED_GAME_VERSIONS
+): boolean {
 	const build = gameBuild(version)
-	return build !== null && ROLLOUT_GAME_VERSIONS.includes(build)
+	return build !== null && builds.includes(build)
+}
+
+/**
+ * Whether a version (a token's `rn.ver`, a grant's posted `ver`) names a build under
+ * staged rollout. `builds` is {@link rolloutGameBuilds} for a worker with the vars in
+ * hand; the default list otherwise.
+ */
+export function isRolloutGameVersion(
+	version: string | null | undefined,
+	builds: readonly string[] = ROLLOUT_GAME_VERSIONS
+): boolean {
+	const build = gameBuild(version)
+	return build !== null && builds.includes(build)
 }
 
 /** Schema DDL (mirror of migrations/0006_presence.sql). */

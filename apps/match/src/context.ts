@@ -84,6 +84,15 @@ export type Env = SharedHonoEnv & {
 	 */
 	TACHYON_HOST_PORT_ROLLOUT?: string
 	/**
+	 * The builds under staged rollout, overriding `ROLLOUT_GAME_VERSIONS` in @repo/domain:
+	 * a comma-separated list of builds, or `off` for none. Set for every worker from the
+	 * root `.env` (`RECFLARE_ROLLOUT_GAME_VERSIONS`), so this agrees with the gate `auth`
+	 * applies by construction. Read through `rolloutGameBuilds`; decides who is served the
+	 * rollout Tachyon pool above. Ending the rollout (`off`) moves those callers to the
+	 * live pool.
+	 */
+	ROLLOUT_GAME_VERSIONS?: string
+	/**
 	 * The Photon region every session is pinned to — both the region named in the connection
 	 * info and the one stamped on every room instance, which must agree. Optional; unlike the
 	 * app ids this DOES default (`us`, us-east1 in the QoS list), because an instance stamped

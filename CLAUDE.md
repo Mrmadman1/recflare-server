@@ -47,6 +47,13 @@
 <game-clients>
 Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 (`packages/domain/src/presence-db.ts`); `GAME_VERSION` is the default the stack targets.
+Those lists are DEFAULTS: the `SUPPORTED_GAME_VERSIONS` and `ROLLOUT_GAME_VERSIONS` worker
+vars (`RECFLARE_*` in `.env`, reaching every worker) override them — read through
+`supportedGameBuilds(env)` / `rolloutGameBuilds(env)`, never the constants, in anything
+that gates on "is this build served / under rollout" (`auth` tokens, `api` versioncheck,
+`match` rollout voice pool). A build outside the supported set is told to update by `api`
+AND refused a token by `auth`; a rollout build is always served, but gated to staff and
+Discord roles until `ROLLOUT_GAME_VERSIONS=off`.
 
 - `20230414` — default, official. Manifest `7859140924515540835` (2023).
 - `20250718` — beta, official (the `20250718.01` client). Manifest `1151455856673601091`;
