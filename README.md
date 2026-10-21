@@ -61,7 +61,8 @@ The table is the default. An operator narrows it with `RECFLARE_SUPPORTED_GAME_V
 in `.env` (a build left out is told to update and refused a sign-in, which is how players
 are moved to a newer build), and `RECFLARE_ROLLOUT_GAME_VERSIONS` names the builds under
 staged rollout to Discord supporters — `20260323` by default, `off` to open it to
-everyone. See `.env.example`.
+everyone (`RECFLARE_TACHYON_ROLLOUT_GAME_VERSIONS` keeps a build on the rollout voice
+servers past that). See `.env.example`.
 
 Generally speaking any client that effectively rewrites the nameserver with the
 right mods (see [RecNet Plugin](https://github.com/djdevin/recnet-plugin), [2025 patch](https://github.com/recflare/patch-2025)) can be used with this server.

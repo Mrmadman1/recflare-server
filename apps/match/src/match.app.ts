@@ -43,6 +43,7 @@ import {
 	MatchmakingErrorCode,
 	MessageType,
 	MOST_ACTIVE_CLUBHOUSE_LIMIT,
+	parseGameBuilds,
 	putPlayerSettingsIfChanged,
 	readPlayerSettings,
 	recordRoomVisit,
@@ -254,8 +255,22 @@ const ROLLOUT_TACHYON_SERVER_ID_PREFIX = 'rollout-'
 interface TachyonCaller {
 	/** The account's `isSandbox` flag. */
 	isSandbox: boolean
-	/** Running a build under staged rollout (`rolloutGameBuilds`, off the token's `rn.ver`). */
+	/** Running a build served the rollout pool (`tachyonRolloutGameBuilds`, off the token's `rn.ver`). */
 	isRollout: boolean
+}
+
+/**
+ * The builds served the rollout Tachyon pool: the operator's `TACHYON_ROLLOUT_GAME_VERSIONS`
+ * when set (`off` for none), otherwise the builds under staged rollout
+ * ({@link rolloutGameBuilds}, the same list `auth` gates sign-in on). The override exists
+ * because the two lists part ways at general availability: `ROLLOUT_GAME_VERSIONS=off`
+ * opens the new build to everyone, and without this it would also move every player on it
+ * onto the live voice servers. Entries are reduced to builds by {@link parseGameBuilds},
+ * so `20260323.14` lists the same build as `20260323`, and the caller's version is
+ * compared the same way by {@link isRolloutGameVersion}.
+ */
+function tachyonRolloutGameBuilds(env: Env): string[] {
+	return parseGameBuilds(env.TACHYON_ROLLOUT_GAME_VERSIONS) ?? rolloutGameBuilds(env)
 }
 
 /**
@@ -265,10 +280,12 @@ interface TachyonCaller {
  *
  *  - `TACHYON_HOST_PORT_SANDBOX` for a SANDBOX account, which runs against its own servers
  *    apart from the live pool;
- *  - `TACHYON_HOST_PORT_ROLLOUT` for a caller on a build under staged rollout — the build
- *    `auth` only lets Discord supporters sign in on, which gets its own voice servers while
- *    it rolls out. Sessions are already split by build ({@link callerGameVersion}), so a
- *    rollout instance's players are all on that build and all land here together;
+ *  - `TACHYON_HOST_PORT_ROLLOUT` for a caller on a build in {@link tachyonRolloutGameBuilds}
+ *    — by default the build under staged rollout, which `auth` only lets Discord supporters
+ *    sign in on and which gets its own voice servers while it rolls out;
+ *    `TACHYON_ROLLOUT_GAME_VERSIONS` keeps a build there after the gate opens. Sessions are
+ *    already split by build ({@link callerGameVersion}), so a rollout instance's players
+ *    are all on that build and all land here together;
  *  - `TACHYON_HOST_PORT`, the live pool, for everyone else.
  *
  * Sandbox wins when both apply: a sandbox account on the rollout build is still a sandbox
@@ -3217,8 +3234,10 @@ const app = new Hono<App>()
 				'…). Both are empty when the pool is unset or the caller is in no instance. A',
 				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the',
 				'same way, with ids `dev-1`, `dev-2`, …; a caller whose token’s `rn.ver` is a build',
-				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, by default `20260323`) out of',
-				'`TACHYON_HOST_PORT_ROLLOUT`, with ids `rollout-1`, `rollout-2`, …. Sandbox wins when',
+				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, by default `20260323`; or whatever',
+				'`TACHYON_ROLLOUT_GAME_VERSIONS` names instead, so a build can keep its own voice',
+				'servers after its rollout ends) out of `TACHYON_HOST_PORT_ROLLOUT`, with ids',
+				'`rollout-1`, `rollout-2`, …. Sandbox wins when',
 				'both apply, and either special pool left unset falls back to the live one.',
 				'`experiments` carries the client’s networking flags.',
 			].join(' '),
@@ -3261,11 +3280,11 @@ const app = new Hono<App>()
 			const account = await getAccount(c.env.DB, id)
 			// The instance's server, the same one every other player in it is handed — except
 			// that a SANDBOX account is picked out of the sandbox pool, and a caller on a
-			// rollout build out of the rollout pool, instead of the live one.
+			// rollout-pool build out of the rollout pool, instead of the live one.
 			const tachyon = tachyonServerFor(
 				tachyonPoolFor(c.env, {
 					isSandbox: account?.isSandbox === true,
-					isRollout: isRolloutGameVersion(await callerVersion(c), rolloutGameBuilds(c.env)),
+					isRollout: isRolloutGameVersion(await callerVersion(c), tachyonRolloutGameBuilds(c.env)),
 				}),
 				roomInstanceId
 			)

@@ -53,7 +53,10 @@ vars (`RECFLARE_*` in `.env`, reaching every worker) override them — read thro
 that gates on "is this build served / under rollout" (`auth` tokens, `api` versioncheck,
 `match` rollout voice pool). A build outside the supported set is told to update by `api`
 AND refused a token by `auth`; a rollout build is always served, but gated to staff and
-Discord roles until `ROLLOUT_GAME_VERSIONS=off`.
+Discord roles until `ROLLOUT_GAME_VERSIONS=off`. The rollout VOICE pool
+(`TACHYON_HOST_PORT_ROLLOUT`) follows that list by default but `TACHYON_ROLLOUT_GAME_VERSIONS`
+overrides it (`tachyonRolloutGameBuilds` in `match`), so a build can stay on its own Tachyon
+servers after its rollout ends.
 
 - `20230414` — default, official. Manifest `7859140924515540835` (2023).
 - `20250718` — beta, official (the `20250718.01` client). Manifest `1151455856673601091`;

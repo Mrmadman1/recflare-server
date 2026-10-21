@@ -1815,8 +1815,10 @@ describe('auth-gated endpoints', () => {
 		const originalSandbox = env.TACHYON_HOST_PORT_SANDBOX
 		const originalRollout = env.TACHYON_HOST_PORT_ROLLOUT
 		const originalRolloutVersions = env.ROLLOUT_GAME_VERSIONS
+		const originalTachyonRolloutVersions = env.TACHYON_ROLLOUT_GAME_VERSIONS
 		try {
 			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = undefined
 			env.TACHYON_HOST_PORT_SANDBOX = '203.0.113.30:7777, 203.0.113.30:7778'
 
 			const voiceFor = async (player: string, roomInstanceId?: number) => {
@@ -1928,6 +1930,50 @@ describe('auth-gated endpoints', () => {
 				voiceConnectionInfo: '198.51.100.12:7777',
 				voiceServerId: 'tachyon-1',
 			})
+
+			// TACHYON_ROLLOUT_GAME_VERSIONS decouples the pool from the gate: set, it alone
+			// decides which builds get the rollout pool, so a build opened to everyone
+			// (ROLLOUT_GAME_VERSIONS=off) keeps its own voice servers while the 2025 build
+			// stays live. Matched as a build — a listed point release covers every point
+			// release of it, and a token carrying the bare build matches a listed one.
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			const keptRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-kept',
+				maxCapacity: 12,
+			})
+			for (const listed of ['20260323', '20260323.14', ' 20260323.2 ,20231207']) {
+				env.TACHYON_ROLLOUT_GAME_VERSIONS = listed
+				for (const version of ['20260323', '20260323.14', '20260323.99']) {
+					expect(await rolloutVoiceFor('976', version, keptRollout.roomInstanceId)).toEqual(
+						rolloutPool[keptRollout.roomInstanceId % rolloutPool.length]
+					)
+				}
+				expect(await rolloutVoiceFor('976', '20250718.01', keptRollout.roomInstanceId)).toEqual({
+					voiceConnectionInfo: '198.51.100.12:7777',
+					voiceServerId: 'tachyon-1',
+				})
+			}
+			// Sandbox still wins over it.
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = '20260323'
+			expect(await rolloutVoiceFor('974', '20260323.14', keptRollout.roomInstanceId)).toEqual(
+				sandboxPool[keptRollout.roomInstanceId % sandboxPool.length]
+			)
+			// Set, it overrides the gate's list in BOTH directions: `off` sends a build still
+			// under rollout to the live pool.
+			env.ROLLOUT_GAME_VERSIONS = '20260323'
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await rolloutVoiceFor('976', '20260323.14', keptRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+			// Blank is unset: the gate's list decides again.
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = ''
+			expect(await rolloutVoiceFor('976', '20260323.14', keptRollout.roomInstanceId)).toEqual(
+				rolloutPool[keptRollout.roomInstanceId % rolloutPool.length]
+			)
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = undefined
 			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
 
 			// With no rollout pool configured, a rollout build falls back to the live one, not
@@ -1961,6 +2007,7 @@ describe('auth-gated endpoints', () => {
 			env.TACHYON_HOST_PORT_SANDBOX = originalSandbox
 			env.TACHYON_HOST_PORT_ROLLOUT = originalRollout
 			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = originalTachyonRolloutVersions
 		}
 	})
 
