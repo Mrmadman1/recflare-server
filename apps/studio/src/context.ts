@@ -21,6 +21,8 @@ export type Env = SharedHonoEnv & {
 	CLOUD_BUILD_KEY?: string
 	CLOUD_BUILD_TARGETS?: string
 	CLOUD_BUILD_TEMPLATE_VERSION?: string
+	/** R2 key of an operator-published template catalog; unset disables downloads. */
+	STUDIO_DISTRIBUTION_MANIFEST?: string
 }
 
 /** Variables can be extended */

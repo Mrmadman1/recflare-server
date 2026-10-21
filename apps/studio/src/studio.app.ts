@@ -11,6 +11,7 @@ import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 import cloudBuilds from './cloud-builds'
+import distribution from './distribution'
 import { getUserBuildCount, listCloudBuilds, storeLocalCloudBuild } from './local-builds'
 import { parseMultipart } from './multipart'
 
@@ -162,6 +163,7 @@ const app = new Hono<App>()
 	.onError(withOnError())
 	.notFound(withNotFound())
 	.route('/', cloudBuilds)
+	.route('/', distribution)
 
 	.get('/', async (c) => {
 		return c.text('hello, world!')
