@@ -17,7 +17,7 @@
  * database read-only and uses `getRoomById`. Each imports the subset it needs.
  */
 
-import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
+import { chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
 import { resyncInstanceCapacity } from './room-instance-db'
@@ -41,6 +41,15 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		-- in the blob so a visit is one atomic UPDATE that can't lose a concurrent
 		-- read-modify-write of the whole room.
 		visits INTEGER NOT NULL DEFAULT 0,
+		-- Cheer and favorite counters (migrations/0031_room_engagement_counters.sql, which
+		-- appends them here): how many players currently have \`interaction.cheered\` /
+		-- \`favorited\` set on the room, served as \`Stats.CheerCount\`/\`FavoriteCount\`.
+		-- Maintained by the toggles ({@link toggleCheer} and friends) in the same batch as the
+		-- per-player row, as a \`cheers = cheers ± 1\` UPDATE like \`visits\`. They used to be
+		-- aggregated from \`interaction\` on every read, and the feeds — which rank every
+		-- listable room — aggregated the WHOLE table per call; see parseRow.
+		cheers INTEGER NOT NULL DEFAULT 0,
+		favorites INTEGER NOT NULL DEFAULT 0,
 		-- The two flags every public feed filters on, alongside \`is_dorm\`
 		-- (migrations/0014_room_listable.sql, which appends them here). Generated like the
 		-- rest so the blob stays the only copy; they exist to be INDEXED — see
@@ -111,9 +120,10 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		PRIMARY KEY (player_id, room_id)
 	)`,
 	// Per-ROOM access (migrations/0021_interaction_room_index.sql): the primary key
-	// serves the per-player reads, but the cheer/favorite aggregate every room read runs
-	// (`getRoomStats`) filters by room_id, which without this scanned the whole table.
-	// Covering — both counters are in the index, so the aggregate never touches the table.
+	// serves the per-player reads; this serves deleting a room's rows ({@link deleteRoom})
+	// and the one-off backfill of `room.cheers`/`favorites` (migration 0031). It was
+	// added for a per-read cheer/favorite aggregate that no longer exists — the counters
+	// are columns on `room` now — and covers the two flags from that era.
 	`CREATE INDEX IF NOT EXISTS idx_interaction_room ON interaction (room_id, cheered, favorited)`,
 	// Per-room player bans (migrations/0010_room_ban.sql). One row per (room, player),
 	// so re-banning someone already banned updates their row rather than appending.
@@ -2215,14 +2225,20 @@ export async function moveSubRoom(
 interface RoomRow {
 	data: string
 	visits: number
+	cheers: number
+	favorites: number
 }
 
 /**
- * The columns every room read selects. `visits` is authoritative for the room's
- * `Stats.VisitCount` (the blob keeps it at 0 — see {@link storedStats}), so it has to
- * come back with the blob on every read; a join aliases them (`r.data AS data`).
+ * The columns every room read selects. `visits`, `cheers` and `favorites` are
+ * authoritative for the room's `Stats.VisitCount`/`CheerCount`/`FavoriteCount` (the blob
+ * keeps them at 0 — see {@link storedStats}), so they have to come back with the blob on
+ * every read; a join aliases them (`r.data AS data`), see {@link COUNTER_COLUMNS}.
  */
-const ROOM_COLUMNS = 'data, visits'
+const ROOM_COLUMNS = 'data, visits, cheers, favorites'
+
+/** The counter columns of {@link ROOM_COLUMNS} as a join selects them, aliased to the row's names. */
+const COUNTER_COLUMNS = 'r.visits AS visits, r.cheers AS cheers, r.favorites AS favorites'
 
 /**
  * The rooms a public feed may consider, as a SQL predicate: public, not a dorm, and not
@@ -2287,7 +2303,7 @@ const RANK_COLUMNS = `json_object(${[
 	'Stats',
 ]
 	.map((key) => `'${key}', data -> '$.${key}'`)
-	.join(', ')}) AS data, visits`
+	.join(', ')}) AS data, visits, cheers, favorites`
 
 /**
  * The full rooms behind a page of {@link RANK_COLUMNS} stubs, in the stubs' order, parsed
@@ -2330,11 +2346,17 @@ function attachRoomDtoDefaults(room: Room): void {
 
 /**
  * Parse a room row: the stored blob with the counters the columns own folded back in.
- * `visits` is a real column, so a room read straight from the DB carries the live count.
+ * `visits`/`cheers`/`favorites` are real columns, so a room read straight from the DB —
+ * a full read or a ranking stub alike — carries the live counts; nothing is derived.
  */
 const parseRow = (row: RoomRow): Room => {
 	const room = JSON.parse(row.data) as Room
-	room.Stats = { ...storedStats(room.Stats), VisitCount: row.visits ?? 0 }
+	room.Stats = {
+		...storedStats(room.Stats),
+		VisitCount: row.visits ?? 0,
+		CheerCount: row.cheers ?? 0,
+		FavoriteCount: row.favorites ?? 0,
+	}
 	attachRoomDtoDefaults(room)
 	return room
 }
@@ -2419,9 +2441,9 @@ const serializeSubRoom = (sub: SubRoom, roomId: number): string => {
 /**
  * Serialize a room for a full-blob write, dropping the parts that belong to another table
  * so the blob can never hold a stale copy: hydrated `SubRooms` (the `subroom` table's job),
- * `Tags` (the `room_tag` table's job — see {@link setRoomTags}), and the derived engagement
+ * `Tags` (the `room_tag` table's job — see {@link setRoomTags}), and the engagement
  * counters, which are zeroed rather than dropped so the key stays present (the
- * `interaction` table's job — see {@link attachStats}).
+ * `visits`/`cheers`/`favorites` columns' job — see {@link parseRow}).
  *
  * Because `Tags` is dropped here, a write that means to CHANGE a room's tags has to write
  * the table itself; passing a room with a new `Tags` array through this silently discards
@@ -2693,8 +2715,9 @@ function roomsByTagsQuery(
 		return `JOIN (SELECT DISTINCT room_id FROM room_tag WHERE tag IN (${placeholders})) f${i}
 		         ON f${i}.room_id = r.room_id`
 	})
-	// `data`/`visits` — in {@link ROOM_COLUMNS} or the ranking stub {@link RANK_COLUMNS} —
-	// are unqualified but unambiguous: the joined subqueries expose only `room_id`.
+	// `data` and the counters — in {@link ROOM_COLUMNS} or the ranking stub
+	// {@link RANK_COLUMNS} — are unqualified but unambiguous: the joined subqueries expose
+	// only `room_id`.
 	return { sql: `SELECT ${columns} FROM room r ${joins.join(' ')}${filter}`, binds }
 }
 
@@ -2732,31 +2755,16 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 }
 
 // ---- Room stats -----------------------------------------------------------
-// A room's cheer/favorite counters are DERIVED from the `interaction` table rather than
-// stored: they're recomputed on every read, so a cheer shows up immediately and the
-// counts can't drift from the per-player rows they're made of. The blob keeps them at 0
-// (see {@link serializeRoom}).
-//
-// `VisitCount` is neither stored in the blob nor derived: it's the `room.visits` column,
-// incremented by {@link recordRoomVisit} on each matchmake and read back with the blob
-// (see {@link parseRow}). It can't be derived the way cheers are — a visit leaves no
-// per-player row to count — and it can't live in the blob, where a read-modify-write of
-// the whole room would drop concurrent visits. `VisitorCount` (distinct visitors) is
-// still left as the blob has it: `interaction.last_visited_at` is stamped per player by
-// {@link recordRoomVisit}, but not for dorms, so counting those rows would under-report
-// a dorm's visitors.
-
-/** One room's derived engagement counters (the aggregate maps below key these by RoomId). */
-export interface RoomStats {
-	CheerCount: number
-	FavoriteCount: number
-}
-
-interface RoomStatsRow {
-	room_id: number
-	cheers: number
-	favorites: number
-}
+// A room's engagement counters are COLUMNS on `room` — `visits`, `cheers`, `favorites` —
+// read back with the blob on every read ({@link parseRow}) and never stored in the blob
+// (see {@link serializeRoom}). Each is bumped by an atomic `col = col ± 1` UPDATE: visits
+// by {@link recordRoomVisit} on each matchmake, cheers/favorites by the toggles below in
+// the same batch as the per-player `interaction` row they mirror. A read-modify-write of
+// the whole room would drop concurrent updates, and deriving the counts by aggregating
+// `interaction` on every read (as this once did) cost a scan of the whole table per feed
+// call. `VisitorCount` (distinct visitors) is still left as the blob has it:
+// `interaction.last_visited_at` is stamped per player by {@link recordRoomVisit}, but not
+// for dorms, so counting those rows would under-report a dorm's visitors.
 
 /** The counters a room starts life with (and the shape the client expects). */
 const ZERO_STATS = { CheerCount: 0, FavoriteCount: 0, VisitorCount: 0, VisitCount: 0 }
@@ -2805,88 +2813,21 @@ export async function recordRoomVisit(
 	])
 }
 
-/**
- * Cheer/favorite counts per room, aggregated from `interaction` by a grouped query.
- * Restricted to `roomIds` when given (a feed page), otherwise covering every room.
- * Rooms nobody has interacted with are absent.
- *
- * The filtered form is an index range per id on `idx_interaction_room`, whose columns
- * cover the counters — the table is never read. That's why a page with more ids than
- * D1 lets us bind is split into batched queries rather than served by the unfiltered
- * scan: every room read runs this, and the scan cost the whole table per call.
- */
-export async function getRoomStats(
-	db: D1Database,
-	roomIds?: number[]
-): Promise<Map<number, RoomStats>> {
-	const byRoom = new Map<number, RoomStats>()
-	if (roomIds && roomIds.length === 0) return byRoom
-	const statement = (ids: number[]): D1PreparedStatement => {
-		const where = ids.length > 0 ? `WHERE room_id IN (${bindPlaceholders(ids)})` : ''
-		return db
-			.prepare(
-				`SELECT room_id, SUM(cheered) AS cheers, SUM(favorited) AS favorites
-				 FROM interaction ${where} GROUP BY room_id`
-			)
-			.bind(...ids)
-	}
-	const chunks = roomIds ? chunkForBinds(roomIds) : [[]]
-	const batches =
-		chunks.length === 1
-			? [await statement(chunks[0]!).all<RoomStatsRow>()]
-			: await db.batch<RoomStatsRow>(chunks.map(statement))
-	for (const { results } of batches) {
-		for (const r of results) {
-			byRoom.set(r.room_id, { CheerCount: r.cheers ?? 0, FavoriteCount: r.favorites ?? 0 })
-		}
-	}
-	return byRoom
-}
-
-/**
- * Overwrite each room's derived counters from the interaction table, in one query for
- * the whole batch. Callers that already aggregated (the feeds rank by these counts, so
- * they need them before paging) pass their map in rather than paying for a second query.
- */
-async function attachStats(
-	db: D1Database,
-	rooms: Room[],
-	stats?: Map<number, RoomStats>
-): Promise<void> {
-	if (rooms.length === 0) return
-	const byRoom = stats ?? (await getRoomStats(db, [...new Set(rooms.map(roomIdOf))]))
-	for (const room of rooms) {
-		const counts = byRoom.get(roomIdOf(room))
-		// `storedStats` zeroes VisitCount (the blob doesn't own it), so carry over the
-		// value `parseRow` folded in from the `visits` column rather than losing it here.
-		const stats = (room.Stats ?? {}) as Record<string, unknown>
-		room.Stats = {
-			...storedStats(stats),
-			VisitCount: typeof stats.VisitCount === 'number' ? stats.VisitCount : 0,
-			CheerCount: counts?.CheerCount ?? 0,
-			FavoriteCount: counts?.FavoriteCount ?? 0,
-		}
-	}
-}
-
-/** Hydrate a single room's `SubRooms` and derived `Stats` (no-op for null). */
+/** Hydrate a single room's `SubRooms` and `Tags` (no-op for null). */
 async function hydrateRoom(db: D1Database, room: Room | null): Promise<Room | null> {
 	if (room) await hydrateRooms(db, [room])
 	return room
 }
 
 /**
- * Hydrate many rooms' `SubRooms`, `Tags` and derived `Stats` (one batched query each).
+ * Hydrate many rooms' `SubRooms` and `Tags` (one batched query each). `Stats` needs no
+ * hydration: its counters came off the row with the blob ({@link parseRow}).
  *
  * `Tags` is re-attached even for the feeds that already did so before ranking
  * ({@link parseAllWithTags}) — it is one query for the page slice and it guarantees the key
  * is present on every room this module hands out, whichever path produced it.
  */
-async function hydrateRooms(
-	db: D1Database,
-	rooms: Room[],
-	stats?: Map<number, RoomStats>
-): Promise<Room[]> {
+async function hydrateRooms(db: D1Database, rooms: Room[]): Promise<Room[]> {
 	for (const room of rooms) {
 		// Studio enumerates these collections directly when opening Room Settings.
 		for (const field of [
@@ -2901,11 +2842,7 @@ async function hydrateRooms(
 		// game's Nullable<DateTime> decoder and discards the entire owned-room list.
 		if (room.PublishedAt === '') room.PublishedAt = null
 	}
-	await Promise.all([
-		attachSubRooms(db, rooms),
-		attachTags(db, rooms),
-		attachStats(db, rooms, stats),
-	])
+	await Promise.all([attachSubRooms(db, rooms), attachTags(db, rooms)])
 	return rooms
 }
 
@@ -3378,7 +3315,7 @@ export async function getFavoritedRooms(
 ): Promise<Room[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT r.data AS data, r.visits AS visits
+			`SELECT r.data AS data, ${COUNTER_COLUMNS}
 			 FROM interaction i
 			 JOIN room r ON r.room_id = i.room_id
 			 WHERE i.player_id = ?1 AND i.favorited = 1
@@ -3439,7 +3376,7 @@ async function visitedRooms(
 	// definition, as everywhere else it is used.
 	const { results } = await db
 		.prepare(
-			`SELECT r.data AS data, r.visits AS visits
+			`SELECT r.data AS data, ${COUNTER_COLUMNS}
 			 FROM interaction i
 			 JOIN room r ON r.room_id = i.room_id
 			 WHERE i.player_id = ?1 AND i.last_visited_at IS NOT NULL
@@ -3483,7 +3420,18 @@ export async function getInteraction(
 	)
 }
 
-/** Upsert+toggle a single boolean column, returning the resulting interaction. */
+/** The `room` counter column an interaction flag is mirrored by. */
+const COUNTER_OF = { cheered: 'cheers', favorited: 'favorites' } as const
+
+/**
+ * Upsert+toggle a single boolean column, returning the resulting interaction.
+ *
+ * The room's counter moves in the same batch (one transaction): +1 when the flag lands
+ * on, -1 when it lands off, read off the row the first statement just wrote. A toggle
+ * always flips the flag, so the move is always exactly one, and concurrent toggles by
+ * different players each apply their own ±1 to the column rather than racing a
+ * read-modify-write. An unknown room id simply matches no `room` row.
+ */
 async function toggleInteraction(
 	db: D1Database,
 	playerId: number,
@@ -3493,8 +3441,9 @@ async function toggleInteraction(
 	// First interaction defaults the toggled column to 1; subsequent calls flip it.
 	// `last_visited_at` is left alone: only entering the room ({@link recordRoomVisit})
 	// is a visit, so a room cheered from a feed stays off the visited history.
-	return toInteraction(
-		await db
+	const counter = COUNTER_OF[column]
+	const [toggled] = await db.batch<InteractionRow>([
+		db
 			.prepare(
 				`INSERT INTO interaction (player_id, room_id, ${column})
 				 VALUES (?1, ?2, 1)
@@ -3502,9 +3451,17 @@ async function toggleInteraction(
 				 DO UPDATE SET ${column} = NOT ${column}
 				 RETURNING cheered, favorited`
 			)
-			.bind(playerId, roomId)
-			.first<InteractionRow>()
-	)
+			.bind(playerId, roomId),
+		db
+			.prepare(
+				`UPDATE room SET ${counter} = ${counter} + CASE
+				   WHEN (SELECT ${column} FROM interaction WHERE player_id = ?1 AND room_id = ?2) = 1
+				   THEN 1 ELSE -1 END
+				 WHERE room_id = ?2`
+			)
+			.bind(playerId, roomId),
+	])
+	return toInteraction(toggled?.results[0] ?? null)
 }
 
 /** Toggle the player's cheer on a room, returning the resulting interaction. */
@@ -3530,6 +3487,10 @@ export async function toggleFavorite(
  * the cheer/favorite toggles). Idempotent: only clears an existing interaction row
  * and never creates one, so clearing a flag on a room the player never interacted
  * with doesn't add a spurious visited/favorited entry. Returns the interaction.
+ *
+ * The room's counter drops by one only when the flag was actually set — a repeated
+ * DELETE changes nothing and must not count down again — so the decrement is gated on
+ * the flag's state BEFORE the clear, in the same batch.
  */
 async function clearInteraction(
 	db: D1Database,
@@ -3537,11 +3498,24 @@ async function clearInteraction(
 	roomId: number,
 	column: 'cheered' | 'favorited'
 ): Promise<Interaction> {
-	await db
-		.prepare(`UPDATE interaction SET ${column} = 0 WHERE player_id = ?1 AND room_id = ?2`)
-		.bind(playerId, roomId)
-		.run()
-	return getInteraction(db, playerId, roomId)
+	const counter = COUNTER_OF[column]
+	const [, , after] = await db.batch<InteractionRow>([
+		db
+			.prepare(
+				`UPDATE room SET ${counter} = ${counter} - 1
+				 WHERE room_id = ?2 AND EXISTS (
+				   SELECT 1 FROM interaction WHERE player_id = ?1 AND room_id = ?2 AND ${column} = 1
+				 )`
+			)
+			.bind(playerId, roomId),
+		db
+			.prepare(`UPDATE interaction SET ${column} = 0 WHERE player_id = ?1 AND room_id = ?2`)
+			.bind(playerId, roomId),
+		db
+			.prepare('SELECT cheered, favorited FROM interaction WHERE player_id = ?1 AND room_id = ?2')
+			.bind(playerId, roomId),
+	])
+	return toInteraction(after?.results[0] ?? null)
 }
 
 /** Clear the player's cheer on a room (DELETE cheer), returning the interaction. */
@@ -3708,14 +3682,14 @@ export async function autocompleteRoomSearch(
 
 /**
  * Engagement score used to order the hot feed (cheers weigh most, then favorites).
- * Cheers/favorites come from the caller's aggregated {@link getRoomStats} map — ranking
- * happens before hydration, so the room blob's copies are still zero at this point.
+ * Cheers/favorites are the `room` row's counter columns, which {@link parseRow} folds
+ * into `Stats` on a ranking stub as on a full room, so the feeds rank without reading
+ * `interaction` at all.
  */
-function hotScore(room: Room, stats: Map<number, RoomStats>): number {
-	const counts = stats.get(roomIdOf(room))
-	const stored = room.Stats as Record<string, unknown> | null | undefined
-	const visitors = typeof stored?.VisitorCount === 'number' ? stored.VisitorCount : 0
-	return (counts?.CheerCount ?? 0) * 3 + (counts?.FavoriteCount ?? 0) * 2 + visitors
+function hotScore(room: Room): number {
+	const stats = room.Stats as Record<string, unknown> | null | undefined
+	const count = (key: string): number => (typeof stats?.[key] === 'number' ? stats[key] : 0)
+	return count('CheerCount') * 3 + count('FavoriteCount') * 2 + count('VisitorCount')
 }
 
 /**
@@ -3848,19 +3822,12 @@ export async function getHotRooms(
 
 	const players = await countPlayersByRoom(db)
 	const playerCount = (r: Room): number => players.get(roomIdOf(r)) ?? 0
-	const stats = await getRoomStats(db)
 	rooms.sort(
 		(a, b) =>
-			playerCount(b) - playerCount(a) ||
-			hotScore(b, stats) - hotScore(a, stats) ||
-			roomIdOf(a) - roomIdOf(b)
+			playerCount(b) - playerCount(a) || hotScore(b) - hotScore(a) || roomIdOf(a) - roomIdOf(b)
 	)
 	return {
-		Results: await hydrateRooms(
-			db,
-			await loadRankedPage(db, rooms.slice(skip, skip + take)),
-			stats
-		),
+		Results: await hydrateRooms(db, await loadRankedPage(db, rooms.slice(skip, skip + take))),
 		TotalResults: rooms.length,
 	}
 }
@@ -3979,12 +3946,11 @@ export async function getRecommendedRooms(
 	const { results } = await db
 		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
-	const stats = await getRoomStats(db)
 	const page = parseAll(results)
 		.filter(isListable)
-		.sort((a, b) => hotScore(b, stats) - hotScore(a, stats) || roomIdOf(a) - roomIdOf(b))
+		.sort((a, b) => hotScore(b) - hotScore(a) || roomIdOf(a) - roomIdOf(b))
 		.slice(skip, skip + take)
-	return hydrateRooms(db, await loadRankedPage(db, page), stats)
+	return hydrateRooms(db, await loadRankedPage(db, page))
 }
 
 /**
@@ -4011,23 +3977,16 @@ export async function getTrendingRooms(
 	const { results } = await db
 		.prepare(`SELECT ${RANK_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
 		.all<RoomRow>()
-	const stats = await getRoomStats(db)
 	const playerCount = (r: Room): number => players.get(roomIdOf(r)) ?? 0
 	const rooms = parseAll(results)
 		.filter((r) => isListable(r) && playerCount(r) > 0)
 		.sort(
 			(a, b) =>
-				playerCount(b) - playerCount(a) ||
-				hotScore(b, stats) - hotScore(a, stats) ||
-				roomIdOf(a) - roomIdOf(b)
+				playerCount(b) - playerCount(a) || hotScore(b) - hotScore(a) || roomIdOf(a) - roomIdOf(b)
 		)
 
 	return {
-		Results: await hydrateRooms(
-			db,
-			await loadRankedPage(db, rooms.slice(skip, skip + take)),
-			stats
-		),
+		Results: await hydrateRooms(db, await loadRankedPage(db, rooms.slice(skip, skip + take))),
 		TotalResults: rooms.length,
 	}
 }
@@ -4133,7 +4092,6 @@ export async function getSimilarRooms(
 		)
 		.bind(JSON.stringify([...targetTags]), roomId)
 		.all<RoomRow & { shared: number }>()
-	const stats = await getRoomStats(db)
 
 	const scored = results
 		.map((row) => ({ room: parseRow(row), shared: row.shared }))
@@ -4142,16 +4100,12 @@ export async function getSimilarRooms(
 	scored.sort(
 		(a, b) =>
 			b.shared - a.shared ||
-			hotScore(b.room, stats) - hotScore(a.room, stats) ||
+			hotScore(b.room) - hotScore(a.room) ||
 			roomIdOf(a.room) - roomIdOf(b.room)
 	)
 	const rooms = scored.map((x) => x.room)
 	return {
-		Results: await hydrateRooms(
-			db,
-			await loadRankedPage(db, rooms.slice(skip, skip + take)),
-			stats
-		),
+		Results: await hydrateRooms(db, await loadRankedPage(db, rooms.slice(skip, skip + take))),
 		TotalResults: rooms.length,
 	}
 }

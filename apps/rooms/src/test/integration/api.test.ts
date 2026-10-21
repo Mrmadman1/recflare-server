@@ -4769,7 +4769,7 @@ describe('rooms endpoints', () => {
 		expect(otherGet).toMatchObject({ Cheered: false, Favorited: false })
 	})
 
-	it('room Stats aggregate cheers/favorites from the interaction table', async () => {
+	it('room Stats count cheers/favorites on the room row, kept by the toggles', async () => {
 		type Stats = {
 			CheerCount: number
 			FavoriteCount: number
@@ -4817,6 +4817,21 @@ describe('rooms endpoints', () => {
 			VisitorCount: 0,
 			VisitCount: 0,
 		})
+
+		// The counts are columns on the room, not an aggregate taken on read — the toggles
+		// keep them. A repeated clear changes nothing (the flag was already off), and neither
+		// does clearing a flag a player never set, so neither counts down again.
+		await interact('562', 'cheer', 'DELETE')
+		await interact('563', 'favorite', 'DELETE')
+		expect(await direct()).toMatchObject({ CheerCount: 1, FavoriteCount: 1 })
+		expect(
+			await env.DB.prepare('SELECT cheers, favorites FROM room WHERE room_id = 15').first()
+		).toEqual({ cheers: 1, favorites: 1 })
+		// Toggling off and on again lands back where it started.
+		await interact('561', 'cheer', 'PUT')
+		expect(await direct()).toMatchObject({ CheerCount: 0 })
+		await interact('561', 'cheer', 'PUT')
+		expect(await direct()).toMatchObject({ CheerCount: 1 })
 
 		// VisitCount is the `room.visits` column (what match bumps on each matchmake),
 		// served on every read of the room — here and in the search results — and it

@@ -149,11 +149,12 @@ export const RoomTagDto = z.object({
 })
 
 /**
- * A room's engagement counters. `CheerCount`/`FavoriteCount` are aggregated from the
- * per-player `interaction` rows on every read. `VisitCount` is the room's lifetime
- * visits — the `room.visits` column, bumped by the `match` worker on every successful
- * matchmake into the room. Nothing records distinct visitors, so `VisitorCount` stays
- * at 0.
+ * A room's engagement counters. `CheerCount`/`FavoriteCount` are the `room.cheers`/
+ * `favorites` columns, moved by the cheer/favorite toggles as they flip the per-player
+ * `interaction` row (so a count is how many players currently have the flag set).
+ * `VisitCount` is the room's lifetime visits — the `room.visits` column, bumped by the
+ * `match` worker on every successful matchmake into the room. Nothing records distinct
+ * visitors, so `VisitorCount` stays at 0.
  */
 export const RoomStatsDto = z.object({
 	CheerCount: z.int(),
