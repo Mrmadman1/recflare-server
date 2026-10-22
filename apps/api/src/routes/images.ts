@@ -220,10 +220,9 @@ export const imageRoutes = new Hono<App>({ strict: false })
 				'`savedImageType` of 4 (profile thumbnail) additionally becomes the account’s ' +
 				'avatar, persisted on the account row.\n\n' +
 				'The file is identified by its bytes, not by the part’s filename or content-type: ' +
-				'it must be a PNG, JPEG, GIF, WebP or BMP, and the stored key’s extension and ' +
+				'it must be a PNG or JPEG, and the stored key’s extension and ' +
 				'content-type come from that signature. Anything else is refused with a 400 — the ' +
-				'`img` worker serves the object back under its stored type, so an HTML body under ' +
-				'an image name would otherwise be a page on the image origin.',
+				'`img` worker serves only those two formats, so it would never display.',
 			security: AUTHED,
 			requestBody: form(UploadImageRequest, 'The image file plus its metadata'),
 			responses: {

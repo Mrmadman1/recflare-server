@@ -189,7 +189,7 @@ it('POST /upload refuses an Image (FileType 3) whose bytes are not an image', as
 		body: form,
 	})
 	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'file is not a PNG, JPEG, GIF, WebP or BMP image' })
+	expect(await res.json()).toEqual({ error: 'file is not a PNG or JPEG image' })
 })
 
 it('POST /upload stores an Image (FileType 3) under the type its bytes say, not the claim', async () => {

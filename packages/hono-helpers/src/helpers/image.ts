@@ -22,9 +22,11 @@ interface Signature extends SniffedImage {
 	parts: Array<{ offset: number; bytes: number[] }>
 }
 
-const ascii = (s: string): number[] => Array.from(s, (ch) => ch.charCodeAt(0))
-
-/** The formats an upload may be — the set the `img` worker decodes and resizes. */
+/**
+ * The formats an upload may be, and the only ones the `img` worker serves — the two it
+ * re-encodes to and the only two the client has been seen to post. Keep upload and serve
+ * in step: a format accepted here but not served there uploads fine and never displays.
+ */
 const SIGNATURES: Signature[] = [
 	{
 		contentType: 'image/png',
@@ -36,20 +38,10 @@ const SIGNATURES: Signature[] = [
 		extension: '.jpg',
 		parts: [{ offset: 0, bytes: [0xff, 0xd8, 0xff] }],
 	},
-	{ contentType: 'image/gif', extension: '.gif', parts: [{ offset: 0, bytes: ascii('GIF8') }] },
-	{
-		contentType: 'image/webp',
-		extension: '.webp',
-		parts: [
-			{ offset: 0, bytes: ascii('RIFF') },
-			{ offset: 8, bytes: ascii('WEBP') },
-		],
-	},
-	{ contentType: 'image/bmp', extension: '.bmp', parts: [{ offset: 0, bytes: ascii('BM') }] },
 ]
 
 /** The formats `sniffImage` accepts, for an error message. */
-export const SNIFFED_IMAGE_FORMATS = 'PNG, JPEG, GIF, WebP or BMP'
+export const SNIFFED_IMAGE_FORMATS = 'PNG or JPEG'
 
 /**
  * Identify an image by its signature, or `undefined` when the bytes are not one of the

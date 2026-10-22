@@ -5017,14 +5017,10 @@ describe('custom avatar items', () => {
 
 		// Both uploads landed in the image bucket under those keys.
 		const thumb = await env.IMAGES.get(body.Value.ThumbnailImageFilename as string)
-		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([1, 2, 3])
-		)
+		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 		expect(thumb!.httpMetadata?.contentType).toBe('image/png')
 		const design = await env.IMAGES.get(body.Value.DesignFilename as string)
-		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([4, 5, 6])
-		)
+		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 
 		// The row is the record as JSON, with the queried fields generated off it.
 		const row = await env.DB.prepare(
@@ -5384,14 +5380,14 @@ describe('custom avatar items', () => {
 		expect(badThumbnail.status).toBe(400)
 		expect(await badThumbnail.json()).toMatchObject({
 			Success: false,
-			Error: 'thumbnailImage is not a PNG, JPEG, GIF, WebP or BMP image',
+			Error: 'thumbnailImage is not a PNG or JPEG image',
 		})
 
 		const badDesign = await upload(PNG_BYTES, html)
 		expect(badDesign.status).toBe(400)
 		expect(await badDesign.json()).toMatchObject({
 			Success: false,
-			Error: 'design is not a PNG, JPEG, GIF, WebP or BMP image',
+			Error: 'design is not a PNG or JPEG image',
 		})
 
 		const row = await env.DB.prepare(
@@ -6974,7 +6970,7 @@ describe('images', () => {
 			body: fd,
 		})
 		expect(res.status).toBe(400)
-		expect(await res.json()).toEqual({ error: 'image is not a PNG, JPEG, GIF, WebP or BMP image' })
+		expect(await res.json()).toEqual({ error: 'image is not a PNG or JPEG image' })
 		expect((await env.IMAGES.list()).objects).toHaveLength(objectsBefore)
 	})
 

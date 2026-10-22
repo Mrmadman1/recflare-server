@@ -107,6 +107,52 @@ describe('img endpoints', () => {
 		expect(notModified.headers.get('x-content-type-options')).toBe('nosniff')
 	})
 
+	// Only an object stored as PNG or JPEG is ever served. Anything else gets the
+	// fallback, as though the key were missing.
+	it('serves the fallback, not the body, for an object not stored as PNG or JPEG', async () => {
+		const fallback = new Uint8Array(
+			await (await SELF.fetch(`${ORIGIN}/does-not-exist-anywhere.jpg`)).arrayBuffer()
+		)
+		const junk = [
+			{ key: 'gate/page.jpg', body: '<html><script>alert(1)</script></html>', type: 'text/html' },
+			{ key: 'gate/octet.jpg', body: IMAGE_BYTES, type: 'application/octet-stream' },
+			{ key: 'gate/anim.gif', body: 'GIF89a\x01\x00\x01\x00', type: 'image/gif' },
+		]
+		for (const { key, body, type } of junk) {
+			await env.IMAGES.put(key, body, { httpMetadata: { contentType: type } })
+			for (const query of ['', '?width=128', '?sig=p1']) {
+				const res = await SELF.fetch(`${ORIGIN}/${key}${query}`)
+				expect(res.status, key + query).toBe(200)
+				expect(res.headers.get('content-type'), key + query).toBe('image/jpeg')
+				if (query === '') expect(new Uint8Array(await res.arrayBuffer()), key).toEqual(fallback)
+				else await res.arrayBuffer()
+			}
+		}
+
+		// A range into a non-image is refused too, not just the whole-object read.
+		const ranged = await SELF.fetch(`${ORIGIN}/gate/page.jpg`, { headers: { range: 'bytes=6-20' } })
+		expect(ranged.status).toBe(200)
+		expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(fallback)
+	})
+
+	// The served type is the stored one, normalised — never a parameter riding on it.
+	it('serves a stored image type bare, and a range of it', async () => {
+		await env.IMAGES.put('gate/params.jpg', IMAGE_BYTES, {
+			httpMetadata: { contentType: 'IMAGE/JPEG; charset=utf-8' },
+		})
+		const res = await SELF.fetch(`${ORIGIN}/gate/params.jpg`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('image/jpeg')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES)
+
+		const ranged = await SELF.fetch(`${ORIGIN}/gate/params.jpg`, {
+			headers: { range: 'bytes=4-7' },
+		})
+		expect(ranged.status).toBe(206)
+		expect(ranged.headers.get('content-type')).toBe('image/jpeg')
+		expect(new Uint8Array(await ranged.arrayBuffer())).toEqual(IMAGE_BYTES.slice(4, 8))
+	})
+
 	it('streams an image stored in R2 with its content type', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/${R2_KEY}`)
 		expect(res.status).toBe(200)

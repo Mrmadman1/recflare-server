@@ -482,7 +482,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'`avatar-item/<date>/<id>-thumb.png` and `avatar-item/<date>/<id>-design.png`; those ' +
 				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row. Each file is ' +
 				'identified by its bytes — the client posts them under `.bin` names — and must be a ' +
-				'PNG, JPEG, GIF, WebP or BMP; the key’s extension and the stored content-type come ' +
+				'PNG or JPEG; the key’s extension and the stored content-type come ' +
 				'from that signature, and anything else is refused with a 400 before either file is ' +
 				'written.\n\n' +
 				'`Price` is capped at 1000 tokens (`MAX_PLAYER_ITEM_PRICE`); one above it, or below ' +

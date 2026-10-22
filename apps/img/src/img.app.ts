@@ -54,6 +54,18 @@ function isPng(bytes: Uint8Array): boolean {
 	return PNG_SIGNATURE.every((b, i) => bytes[i] === b)
 }
 
+/** The only content-types served from R2. */
+const SERVED_CONTENT_TYPES = new Set(['image/png', 'image/jpeg'])
+
+/**
+ * The stored content-type, bare and lower-cased, when it is one this worker serves —
+ * otherwise `undefined`.
+ */
+function servedContentType(stored: string | undefined): string | undefined {
+	const type = stored?.split(';')[0]?.trim().toLowerCase()
+	return type && SERVED_CONTENT_TYPES.has(type) ? type : undefined
+}
+
 /** A requested transform, from `?width=`/`?height=`/`?cropSquare=1`. At least one applies. */
 interface Transform {
 	width?: number
@@ -529,21 +541,36 @@ app.get(
 		// bytes that are not the range asked for — ask R2 for the range only when we are
 		// going to hand its bytes straight back. R2 parses the header itself; see
 		// writeContentRange() below for why it is never answered with a bare 200.
-		const range = needsBody(transform, signing) ? undefined : c.req.raw.headers
+		const buffered = needsBody(transform, signing)
+		const range = buffered ? undefined : c.req.raw.headers
 		const object = await bucket.get(objectKey, {
 			...(ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : {}),
 			...(range ? { range } : {}),
 		})
-		if (!object) {
-			// Missing from both static and R2 → serve the bundled DefaultProfileImage.jpg
-			// static asset so clients still get a valid image instead of a 404. Honour
-			// `?sig=p1` the same way so the fallback is signed like any other image.
+
+		// Missing from both static and R2, or not a PNG/JPEG → serve the bundled
+		// DefaultProfileImage.jpg static asset so clients still get a valid image instead
+		// of a 404. Honour `?sig=p1` the same way so the fallback is signed like any other.
+		const serveFallback = async () => {
 			const asset = await c.env.ASSETS.fetch(new URL(FALLBACK_ASSET_PATH, c.req.url))
 			return serveStaticAsset(c.env, asset, transform, signing)
+		}
+		if (!object) return serveFallback()
+
+		// Only a PNG or JPEG is ever served, judged by the object's stored content-type.
+		// Uploads store the type their bytes name (`sniffImage` in every writer), so the
+		// stored type is trusted rather than re-reading the bytes here; anything else —
+		// an older upload stored under the uploader's `text/html` claim, say — is treated
+		// as missing.
+		const storedType = servedContentType(object.httpMetadata?.contentType)
+		if (!storedType) {
+			if ('body' in object) await object.body.cancel()
+			return serveFallback()
 		}
 
 		const headers = new Headers()
 		object.writeHttpMetadata(headers)
+		headers.set('content-type', storedType)
 		headers.set('etag', object.httpEtag)
 		headers.set('cache-control', CACHE_CONTROL)
 
@@ -554,7 +581,7 @@ app.get(
 		// ever rides a response that actually carries bytes.
 		applyStubSignature(headers, signing)
 
-		if (needsBody(transform, signing)) {
+		if (buffered) {
 			const bytes = await object.arrayBuffer()
 			return finalizeImage(c.env, bytes, headers, transform, signing)
 		}
