@@ -14,7 +14,6 @@ import {
 	NO_SCORE,
 	UNRANKED,
 } from './leaderboard-db'
-
 import {
 	CheckAndSetStatBody,
 	CheckAndSetStatResponse,
@@ -37,11 +36,18 @@ import type { Board } from './leaderboard-db'
  */
 
 /** A board selector as the client posts it. Every field is optional on the wire — a body
- * that names nothing still gets an answer, it's just an empty one. */
+ * that names nothing still gets an answer, it's just an empty one.
+ *
+ * Two shapes name the same board. Up to 2025 the client sends `RoomId` + `StatChannel`; the
+ * 2026 client sends `PrimaryKey` (the room) + `SecondaryKey` (the channel) and adds
+ * `LeaderboardType`, which is 0 for a room board. Same room, same board, either way. */
 interface BoardBody {
 	PlayerId?: number
 	RoomId?: number
 	StatChannel?: number
+	PrimaryKey?: number
+	SecondaryKey?: number
+	LeaderboardType?: number
 	FilterType?: number
 	SortAscending?: boolean
 	RankStart?: number
@@ -63,17 +69,28 @@ const enum FilterType {
 	Friends = 1,
 }
 
+/** The 2026 client's `LeaderboardType`: what kind of thing `PrimaryKey` names. Only the room
+ * board (0) has been observed. */
+const ROOM_LEADERBOARD = 0
+
 /**
- * The board a body names: `RoomId` + `StatChannel`, each 0 when absent, seen through
- * `PlayerId`'s friends when `FilterType` is Friends. A friends board with no `PlayerId`
- * has nobody to be friends of, so it falls back to the global one rather than to nothing.
+ * The board a body names: `RoomId` + `StatChannel` (2026: `PrimaryKey` + `SecondaryKey`),
+ * each 0 when absent, seen through `PlayerId`'s friends when `FilterType` is Friends. A
+ * friends board with no `PlayerId` has nobody to be friends of, so it falls back to the
+ * global one rather than to nothing.
+ *
+ * A `LeaderboardType` other than a room board is one this server has never seen, and its
+ * `PrimaryKey` may not be a room id at all, so it reads as room 0: an empty board, and a
+ * write `CheckAndSetStat` skips. Better than filing it on some room's board.
  */
 function board(body: BoardBody): Board {
 	const playerId = int(body.PlayerId, 0)
+	const type = int(body.LeaderboardType, ROOM_LEADERBOARD)
 	return {
-		roomId: int(body.RoomId, 0),
-		statChannel: int(body.StatChannel, 0),
-		...(int(body.FilterType, 0) === FilterType.Friends && playerId !== 0 && { friendsOf: playerId }),
+		roomId: type === ROOM_LEADERBOARD ? int(body.RoomId, int(body.PrimaryKey, 0)) : 0,
+		statChannel: int(body.StatChannel, int(body.SecondaryKey, 0)),
+		...(int(body.FilterType, 0) === FilterType.Friends &&
+			playerId !== 0 && { friendsOf: playerId }),
 	}
 }
 
@@ -290,12 +307,9 @@ const app = new Hono<App>()
 			const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
 			if (accountId === null) return c.body(null, 401)
 
-			const body = await readBody<{
-				RoomId?: number
-				StatChannel?: number
-				StatValue?: number
-				CurrentStatValue?: number | null
-			}>(c)
+			const body = await readBody<
+				BoardBody & { StatValue?: number; CurrentStatValue?: number | null }
+			>(c)
 			logger.info('CheckAndSetStat', { accountId, body })
 
 			const target = board(body)

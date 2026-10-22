@@ -440,6 +440,68 @@ describe('the nearby window', () => {
 	})
 })
 
+describe('the 2026 body shape', () => {
+	// 2026 renamed the selectors: `PrimaryKey` is the room, `SecondaryKey` the channel, and
+	// `LeaderboardType` 0 says it's a room board. Same room, same board as the 2025 body.
+	const ROOM = 400
+	beforeAll(async () => {
+		await setStat(51, ROOM, 7, null, 1)
+		await setStat(52, ROOM, 9, null, 1)
+	})
+
+	it('reads the board 2025’s RoomId + StatChannel name', async () => {
+		const legacy = await post('GetNearbyScores', {
+			WindowSize: 10,
+			PlayerId: 51,
+			StatChannel: 1,
+			RoomId: ROOM,
+			FilterType: 0,
+			SortAscending: false,
+		})
+		const modern = await post('GetNearbyScores', {
+			WindowSize: 10,
+			PlayerId: 51,
+			PrimaryKey: ROOM,
+			SecondaryKey: 1,
+			FilterType: 0,
+			SortAscending: false,
+			LeaderboardType: 0,
+		})
+		const rows = {
+			Rows: [
+				{ PlayerId: 52, Score: 9, Rank: 0 },
+				{ PlayerId: 51, Score: 7, Rank: 1 },
+			],
+		}
+		expect(await legacy.json()).toEqual(rows)
+		expect(await modern.json()).toEqual(rows)
+	})
+
+	it('writes a stat through PrimaryKey + SecondaryKey', async () => {
+		const res = await post(
+			'CheckAndSetStat',
+			{ PrimaryKey: ROOM, SecondaryKey: 1, StatValue: 12, CurrentStatValue: 7, LeaderboardType: 0 },
+			await bearer(51)
+		)
+		expect(await res.text()).toBe('0')
+		expect(await stored(51, ROOM, 1)).toEqual({ stat_value: 12 })
+	})
+
+	it('serves an unknown LeaderboardType an empty board', async () => {
+		const res = await post('GetRanks', {
+			RankStart: 0,
+			RankEnd: 9,
+			PlayerId: 51,
+			PrimaryKey: ROOM,
+			SecondaryKey: 1,
+			FilterType: 0,
+			SortAscending: false,
+			LeaderboardType: 1,
+		})
+		expect(await res.json()).toEqual({ Rows: [] })
+	})
+})
+
 it('serves an openapi spec with no dangling refs', async () => {
 	const res = await SELF.fetch('https://example.com/openapi.json')
 	expect(res.status).toBe(200)

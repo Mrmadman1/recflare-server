@@ -139,12 +139,26 @@ export const CheckAndSetStatBody = z.object({
 })
 
 /**
- * The body posted to `GetNearbyScores`: {@link GetPlayerRankBody} plus `WindowSize`. This
- * is the reference servers' shape (the client's `GetNearbyScoresRequestDTO` extends its
- * rank request with `WindowSize`); it has not yet been watched from a live client here,
- * which is why the handler still logs it.
+ * The body posted to `GetNearbyScores`: {@link GetPlayerRankBody} plus `WindowSize`, e.g.
+ * (2025) `{"WindowSize":10,"PlayerId":205,"StatChannel":1,"RoomId":6,"FilterType":0,"SortAscending":false}`.
+ *
+ * The 2026 client names the same board differently:
+ * `{"WindowSize":10,"PlayerId":205,"PrimaryKey":6,"SecondaryKey":1,"FilterType":0,"SortAscending":false,"LeaderboardType":0}`
+ * — `PrimaryKey` is the room, `SecondaryKey` the channel. Every endpoint accepts either.
  */
 export const GetNearbyScoresBody = GetPlayerRankBody.extend({
+	PrimaryKey: z
+		.int()
+		.optional()
+		.describe('2026 client: the room, in place of `RoomId` (when `LeaderboardType` is 0)'),
+	SecondaryKey: z
+		.int()
+		.optional()
+		.describe('2026 client: the stat channel, in place of `StatChannel`'),
+	LeaderboardType: z
+		.int()
+		.optional()
+		.describe('2026 client: 0 is a room board, the only kind observed; others read as empty'),
 	WindowSize: z
 		.int()
 		.describe('How many rows either side of the player to return; default and maximum 10'),
