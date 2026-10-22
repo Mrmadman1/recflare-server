@@ -73,15 +73,15 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) =>
 			c.json({
-				ReportBudget: 125,
+				ReportBudget: 0,
 				FilterType: 0,
-				SampleRate: 1,
-				LogLineCount: 50,
-				CaptureNativeCrashes: 1,
-				AMRThresholdMS: 0,
-				MessageCount: 1000,
-				MessageRegex: '^.*$',
-				VersionRegex: '.*',
+				SampleRate: 0,
+				LogLineCount: 0,
+				CaptureNativeCrashes: 0,
+				ANRThresholdMs: 0,
+				MessageCount: 0,
+				MessageRegex: '',
+				VersionRegex: '',
 			})
 	)
 	// ShareBaseUrl is derived from the deploy-time base domain; the rest of the

@@ -143,7 +143,7 @@ export const BacktraceConfig = z.object({
 	SampleRate: z.int(),
 	LogLineCount: z.int(),
 	CaptureNativeCrashes: z.int(),
-	AMRThresholdMS: z.int(),
+	ANRThresholdMs: z.int(),
 	MessageCount: z.int(),
 	MessageRegex: z.string(),
 	VersionRegex: z.string(),

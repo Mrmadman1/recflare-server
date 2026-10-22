@@ -289,7 +289,7 @@ describe('public endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/config/v1/backtrace`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { ReportBudget: number; VersionRegex: string }
-		expect(body).toMatchObject({ ReportBudget: 125, VersionRegex: '.*' })
+		expect(body).toMatchObject({ ReportBudget: 0, ANRThresholdMs: 0, VersionRegex: '' })
 	})
 
 	test('GET /api/versioncheck/v4 reports current for the matching build', async () => {
