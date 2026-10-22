@@ -115,6 +115,7 @@ import {
 	ErrorResponse,
 	form,
 	GameRewardRequest,
+	HeldRoomKeyDto,
 	InfluencerIdsResponse,
 	IsOnWishlistBulkRequest,
 	IsOnWishlistBulkResponse,
@@ -131,6 +132,8 @@ import {
 	OwnsRoomKeysRequest,
 	OwnsRoomKeysResponse,
 	PurchasableItemsRequest,
+	PurchaseRoomConsumableRequest,
+	PurchaseRoomConsumableResponse,
 	PurchaseRoomCurrencyEnvelope,
 	PurchaseRoomCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyRequest,
@@ -140,6 +143,7 @@ import {
 	RemoveInfluencerBody,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
+	RoomConsumableInventoryItemDto,
 	RoomCurrencyBalance,
 	RoomCurrencyDto,
 	RoomCurrencyEnvelope,
@@ -147,7 +151,6 @@ import {
 	RoomCurrencyPurchaseOfferEnvelope,
 	RoomCurrencyPurchaseOffersDto,
 	RoomEconConfig,
-	HeldRoomKeyDto,
 	RoomKeyDto,
 	RoomKeyEnvelope,
 	RoomPurchasableList,
@@ -176,6 +179,8 @@ import {
 	awardRoomConsumable,
 	getRoomConsumable,
 	getRoomConsumables,
+	getRoomInventory,
+	toInventoryItem,
 	upsertRoomConsumable,
 } from './room-consumable-db'
 import {
@@ -195,8 +200,8 @@ import {
 	awardRoomKey,
 	claimRoomKey,
 	createRoomKey,
-	getRoomKey,
 	getHeldRoomKeys,
+	getRoomKey,
 	getRoomKeys,
 	getRoomOwnerId,
 	ownsRoomKeys,
@@ -234,7 +239,7 @@ import type { ConsumeResult } from './consumables-db'
 import type { App, Env } from './context'
 import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
-import type { RoomConsumable } from './room-consumable-db'
+import type { RoomConsumable, RoomConsumableInventoryItem } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 import type { RoomKey, RoomKeyHolding } from './room-key-db'
 import type { WishlistItem } from './wishlist-db'
@@ -3851,7 +3856,15 @@ const app = new Hono<App>({ strict: false })
 					continue
 				}
 
-				const owned = await awardRoomConsumable(c.env.DB, accountId, consumableId, quantity)
+				const code = (request as { ConcurrencyCodes?: { NewConcurrencyCode?: unknown } })
+					.ConcurrencyCodes?.NewConcurrencyCode
+				const owned = await awardRoomConsumable(
+					c.env.DB,
+					accountId,
+					consumableId,
+					quantity,
+					typeof code === 'string' ? code : null
+				)
 				results.push({
 					ConsumableId: consumableId,
 					Success: true,
@@ -3859,13 +3872,209 @@ const app = new Hono<App>({ strict: false })
 					Response: {
 						PlayerId: accountId,
 						ConsumableId: consumableId,
-						Quantity: owned,
+						Quantity: owned.quantity,
 						AwardedAt: new Date().toISOString(),
 					},
 				})
 			}
 
 			return c.json(results)
+		}
+	)
+
+	// Buy some of a room's consumables, for the caller or as a gift. One route for both kinds of
+	// price: a listing in TOKENS pays the room's owner, as a room key does; a listing in a ROOM
+	// CURRENCY pays nobody — that money is the room's own invention. What is bought lands in
+	// `room_inventory`, the same holding `awardBulk` adds to.
+	.put(
+		// Two paths, one sale: the client posts a token listing to `/purchase/tokens` and a
+		// room-currency one to `/purchase/currency`, with the same body. The body's
+		// `ExpectedPriceAndCurrency` is what is checked against the listing, not the path.
+		'/api/roomconsumables/v1/roomconsumable/:id/purchase/:via{currency|tokens}',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Buy a room consumable',
+			description: [
+				'Buys `Quantity` of the consumable named in the path, at its listed price EACH.',
+				'The client posts a listing priced in tokens to `…/purchase/tokens` and one priced',
+				'in a room currency to `…/purchase/currency`; both take the same body and answer',
+				'the same way, and it is the body’s `ExpectedPriceAndCurrency` that must match.',
+				'',
+				'`ExpectedPriceAndCurrency` must be the listing’s own: `Price` its unit price and',
+				'`CurrencyId` its `PurchaseCurrencyId` — null for a listing priced in tokens.',
+				'`Quantity` must be at least 1 and, when the listing sets one, at most its',
+				'`MaximumCountPerPurchase`. `ConcurrencyCodes` is accepted and IGNORED.',
+				'',
+				'- In TOKENS: the total leaves the buyer and is paid to the room’s OWNER, who gets a',
+				'  StorefrontBalanceUpdate; the buyer gets a StorefrontBalancePurchase. Both carry',
+				'  a resulting total.',
+				'- In a ROOM CURRENCY: the total leaves the buyer’s holding of it (`room_balance`)',
+				'  and NOBODY is paid.',
+				'',
+				'The room’s creator and co-owners pay nothing: the client asks them `Price` 0 (the',
+				'listed price is accepted too).',
+				'',
+				'`GiftRecipientAccountId` sends what is bought to that player; the buyer still pays.',
+				'Null (or the buyer’s own id) keeps it. Either way the items are added to the',
+				'recipient’s `room_inventory`.',
+				'',
+				'Answers the client’s purchase result, observed from the live client:',
+				'`BalanceUpdateResult` (an UpdateResponse — 0 OK), `CurrencyBalanceResponse` (what',
+				'the BUYER now holds of what they paid in: `{ AccountId, CurrencyId, Balance,',
+				'ModifiedAt }`, `CurrencyId` null and `Balance` their token total for a token',
+				'listing) and `OperationResult` — `{ Status, InventoryItem }`, the item being what',
+				'the RECIPIENT now owns — the same `RoomConsumableInventoryItem` that',
+				'`…/roomConsumable/room/{roomId}/me` lists: `Count` the resulting total,',
+				'`ConcurrencyCode` the request’s `NewConcurrencyCode` (stored, not checked),',
+				'`Consumable` the listing plus `IsGiftable`/`Visibility`.',
+				'',
+				'A refusal is a 200 in the same shape — `Status` 1, a null `InventoryItem`, the',
+				'balance as it stands — with the reason in `BalanceUpdateResult`: 4 no such',
+				'consumable or room, 7 a bad `Quantity`, 8 a bad gift recipient, 6 a price or',
+				'currency that is not the listing’s, 2 not enough to pay. Nothing is charged or',
+				'given. The refusal form is an ASSUMPTION — only success has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'id',
+					in: 'path',
+					required: true,
+					description: 'The consumable to buy — a `room_consumable` id',
+					schema: { type: 'string' },
+				},
+				{
+					name: 'via',
+					in: 'path',
+					required: true,
+					description: '`tokens` for a listing priced in tokens, `currency` for a room currency',
+					schema: { type: 'string', enum: ['tokens', 'currency'] },
+				},
+			],
+			requestBody: jsonBody(PurchaseRoomConsumableRequest, 'What to buy, and what the client saw'),
+			responses: {
+				200: json(PurchaseRoomConsumableResponse, 'What the recipient now owns, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			const currencyType = CurrencyType.RecCenterTokens
+			const body = await c.req
+				.json<{
+					ConcurrencyCodes?: { NewConcurrencyCode?: unknown } | null
+					ExpectedPriceAndCurrency?: { Price?: unknown; CurrencyId?: unknown } | null
+					Quantity?: unknown
+					GiftRecipientAccountId?: unknown
+				}>()
+				.catch(() => null)
+			const request = body !== null && typeof body === 'object' ? body : {}
+			const expected = request.ExpectedPriceAndCurrency
+			const expectedCurrency =
+				typeof expected?.CurrencyId === 'string' && expected.CurrencyId !== ''
+					? expected.CurrencyId
+					: null
+			const consumable = await getRoomConsumable(c.env.DB, c.req.param('id'))
+			// The balance the answer reports on: what the listing is priced in once it is known,
+			// what the request named on a refusal that never got that far. Null is tokens.
+			const balanceCurrency = consumable ? consumable.PurchaseCurrencyId : expectedCurrency
+
+			// Every key is always sent: the client reads an omitted `Status` or
+			// `BalanceUpdateResult` as its enum's 0 member, which is success.
+			const answer = async (code: number, item: RoomConsumableInventoryItem | null) =>
+				c.json({
+					BalanceUpdateResult: code,
+					CurrencyBalanceResponse: {
+						AccountId: id,
+						CurrencyId: balanceCurrency,
+						Balance:
+							balanceCurrency === null
+								? await getBalance(c.env.DB, id, currencyType, startingTokens)
+								: await getRoomBalance(c.env.DB, balanceCurrency, id),
+						ModifiedAt: new Date().toISOString(),
+					},
+					OperationResult: {
+						Status: item === null ? ROOM_KEY_STATUS_FAILED : ROOM_KEY_STATUS_OK,
+						InventoryItem: item,
+					},
+				})
+
+			if (!consumable) return answer(UpdateResponse.NoItemAvailable, null)
+
+			const quantity = request.Quantity
+			if (
+				typeof quantity !== 'number' ||
+				!Number.isInteger(quantity) ||
+				quantity < 1 ||
+				(consumable.MaximumCountPerPurchase > 0 && quantity > consumable.MaximumCountPerPurchase)
+			) {
+				return answer(UpdateResponse.RequestedAmountNotAllowed, null)
+			}
+
+			const gift = request.GiftRecipientAccountId
+			if (
+				gift !== null &&
+				gift !== undefined &&
+				!(Number.isInteger(gift) && (gift as number) > 0)
+			) {
+				return answer(UpdateResponse.PlayerNotEligible, null)
+			}
+			const recipientId = (gift as number | null | undefined) ?? id
+
+			// Paid in the listing's own currency only — never whichever the request would rather.
+			if (expectedCurrency?.toLowerCase() !== consumable.PurchaseCurrencyId?.toLowerCase()) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch, null)
+			}
+
+			const canManage = await canManageRoomById(c.env.DB, consumable.RoomId, id)
+			if (canManage === null) return answer(UpdateResponse.NoItemAvailable, null)
+			const expectedPrice = expected?.Price
+			if (expectedPrice !== consumable.Price && !(canManage && expectedPrice === 0)) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch, null)
+			}
+
+			const total = canManage ? 0 : consumable.Price * quantity
+			if (total > 0 && consumable.PurchaseCurrencyId !== null) {
+				if (!(await spendRoomCurrency(c.env.DB, consumable.PurchaseCurrencyId, id, total))) {
+					return answer(UpdateResponse.NotEnoughCredit, null)
+				}
+			} else if (total > 0) {
+				const ownerId = await getRoomOwnerId(c.env.DB, consumable.RoomId)
+				if (ownerId === null) return answer(UpdateResponse.NoItemAvailable, null)
+				if (!(await spendCurrency(c.env.DB, id, currencyType, total, startingTokens))) {
+					return answer(UpdateResponse.NotEnoughCredit, null)
+				}
+				// Seed the owner's signup grant BEFORE crediting them, as the key sale does.
+				await ensureStartingBalances(c.env.DB, ownerId, startingTokens)
+				const ownerBalance = await creditCurrency(
+					c.env.DB,
+					ownerId,
+					currencyType,
+					total,
+					startingTokens
+				)
+				await pushBalanceUpdate(c, ownerId, currencyType, ownerBalance)
+				await pushBalancePurchase(
+					c,
+					id,
+					currencyType,
+					-total,
+					await getBalance(c.env.DB, id, currencyType, startingTokens)
+				)
+			}
+
+			const newCode = request.ConcurrencyCodes?.NewConcurrencyCode
+			const owned = await awardRoomConsumable(
+				c.env.DB,
+				recipientId,
+				consumable.RoomConsumableId,
+				quantity,
+				typeof newCode === 'string' ? newCode : null
+			)
+			return answer(UpdateResponse.OK, toInventoryItem(recipientId, owned, consumable))
 		}
 	)
 
@@ -3968,10 +4177,48 @@ const app = new Hono<App>({ strict: false })
 			return roomConsumableEnvelope(c, consumable)
 		}
 	)
+	// What the CALLER owns of one room's consumables. NOT the catalogue the same path without
+	// `/me` serves: a different element type (`RoomConsumableInventoryItem`), so a separate handler.
 	.get(
 		'/api/roomconsumables/v1/roomConsumable/room/:roomId/me',
-		listRoute('The caller’s room consumables', 'Empty stub'),
-		(c) => c.json([])
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The caller’s room consumables',
+			description: [
+				'A bare array of what the caller owns of the room’s consumables, in the shop’s order —',
+				'the client’s `RoomConsumableInventoryItem`, observed from the live client:',
+				'`{ RoomConsumableId, AccountId, Count, ConcurrencyCode, ModifiedAt, Consumable }`.',
+				'',
+				'`Count` is what they hold now; a consumable they hold none of (never had, or spent',
+				'down to zero) is absent. `ConcurrencyCode` is the last `NewConcurrencyCode` written',
+				'(stored, not checked). `Consumable` is the listing plus `IsGiftable` (false) and',
+				'`Visibility` (0), with `ImageName` as "" rather than null — NOT the catalogue',
+				'element `…/room/{roomId}` serves.',
+				'',
+				'An unknown room, or one the caller owns nothing of, is an empty list.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'roomId',
+					in: 'path',
+					required: true,
+					description: 'The room whose consumables to list',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(RoomConsumableInventoryItemDto.array(), 'What the caller owns, shop order'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			if (!Number.isInteger(roomId)) return c.json([])
+			return c.json(await getRoomInventory(c.env.DB, roomId, id))
+		}
 	)
 	// The custom currencies a room has minted. Public, like the room itself: a room's
 	// currencies are shown to every player who walks into it, so the list is not a secret

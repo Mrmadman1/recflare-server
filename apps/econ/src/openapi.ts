@@ -1080,6 +1080,86 @@ export const AwardRoomConsumableResult = z.object({
 export const AwardRoomConsumableResultList = z.array(AwardRoomConsumableResult)
 
 /**
+ * The client's `RoomConsumableInventoryItem` — what a player owns of one consumable. The
+ * element of `GET …/roomConsumable/room/{roomId}/me` and the purchase's `InventoryItem`.
+ */
+export const RoomConsumableInventoryItemDto = z.object({
+	RoomConsumableId: z.string(),
+	AccountId: z.int().describe('Who owns them'),
+	Count: z.int().describe('The RESULTING total owned, never the change'),
+	ConcurrencyCode: z
+		.string()
+		.nullable()
+		.describe('The last `NewConcurrencyCode` written — stored, not checked'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC — the last write'),
+	Consumable: RoomConsumableDto.extend({
+		ImageName: z.string().describe('"" when the listing has no picture (NOT null)'),
+		IsGiftable: z.boolean().describe('Always false — not modelled'),
+		Visibility: z.int().describe('Always 0 — not modelled'),
+	}).describe('The listing — the catalogue element plus two fields'),
+})
+
+/**
+ * `PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{tokens|currency}` — the client's
+ * `RoomConsumablePurchaseRequest`, four keys in declaration order (from its formatter). One
+ * route for both kinds of price: `ExpectedPriceAndCurrency.CurrencyId` null is TOKENS.
+ */
+export const PurchaseRoomConsumableRequest = z.object({
+	ConcurrencyCodes: z
+		.object({
+			CurrentConcurrencyCode: z.string().nullable().optional(),
+			NewConcurrencyCode: z.string().nullable().optional(),
+		})
+		.optional()
+		.describe('Accepted and IGNORED — no optimistic concurrency is implemented yet'),
+	ExpectedPriceAndCurrency: z
+		.object({
+			Price: z.int().describe('The UNIT price the client rendered; must equal the listing’s'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The listing’s room currency, or null for a listing priced in tokens'),
+		})
+		.describe('What the client showed — refused unless it is the listing’s own'),
+	Quantity: z.int().describe('How many to buy; at least 1, at most `MaximumCountPerPurchase`'),
+	GiftRecipientAccountId: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('Who receives them; null for the buyer. The buyer pays either way'),
+})
+
+/**
+ * The consumable purchase's answer, observed from the live client. The refusal form (`Status`
+ * 1, a null `InventoryItem`) is an assumption — only success has been observed.
+ */
+export const PurchaseRoomConsumableResponse = z.object({
+	BalanceUpdateResult: z
+		.int()
+		.describe(
+			'An UpdateResponse: 0 OK, 2 NotEnoughCredit, 4 NoItemAvailable, ' +
+				'6 RequestedPriceDoesNotMatch, 7 RequestedAmountNotAllowed, 8 PlayerNotEligible'
+		),
+	CurrencyBalanceResponse: z
+		.object({
+			AccountId: z.int().describe('The BUYER — who paid, even for a gift'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The room currency paid in; null for a listing priced in tokens'),
+			Balance: z.int().describe('What the buyer holds of it afterwards — the RESULTING total'),
+			ModifiedAt: z.string().describe('ISO-8601 UTC'),
+		})
+		.describe('What the buyer now holds of what they paid in'),
+	OperationResult: z.object({
+		Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+		InventoryItem: RoomConsumableInventoryItemDto.nullable().describe(
+			'What the recipient now owns of the consumable; null on a refusal'
+		),
+	}),
+})
+
+/**
  * The envelope the consumable write answers in — the same
  * `{ Value, Success, Error, error_id }` the room-currency writes use.
  */

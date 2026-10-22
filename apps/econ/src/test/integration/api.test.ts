@@ -1479,6 +1479,300 @@ describe('econ endpoints', () => {
 			}
 		})
 
+		test('PUT roomconsumable/:id/purchase/tokens|currency sells for tokens (paying the owner) or room currency (paying nobody)', async () => {
+			const coin = 'b9f41a7c-32f1-4456-b84f-fdb94b240955'
+			// Room 2511 is account 1's, with 2 as co-owner. One listing in tokens (max 3 a
+			// purchase), one in the room's coin.
+			const tokenItem = (
+				await envOf(
+					await save(
+						{
+							...body,
+							Name: 'Token potion',
+							PriceAndCurrency: { Price: 5, CurrencyId: null },
+							MaximumCountPerPurchase: 3,
+						},
+						await bearer('1')
+					)
+				)
+			).Value!
+			const coinItem = (
+				await envOf(await save({ ...body, Name: 'Coin potion' }, await bearer('1')))
+			).Value!
+			expect(tokenItem).toMatchObject({ Price: 5, PurchaseCurrencyId: null })
+			expect(coinItem).toMatchObject({ Price: 50, PurchaseCurrencyId: coin })
+
+			const purchase = async (
+				sub: string | null,
+				consumableId: string,
+				price: number,
+				currencyId: string | null,
+				quantity = 1,
+				gift: number | null = null
+			) =>
+				exports.default.fetch(
+					// As the client does: a token price to `/tokens`, a room currency to `/currency`.
+					`${ORIGIN}/api/roomconsumables/v1/roomconsumable/${consumableId}/purchase/` +
+						(currencyId === null ? 'tokens' : 'currency'),
+					{
+						method: 'PUT',
+						headers: {
+							'Content-Type': 'application/json',
+							...(sub === null ? {} : await bearer(sub)),
+						},
+						body: JSON.stringify({
+							ConcurrencyCodes: {
+								CurrentConcurrencyCode: null,
+								NewConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+							},
+							ExpectedPriceAndCurrency: { Price: price, CurrencyId: currencyId },
+							Quantity: quantity,
+							GiftRecipientAccountId: gift,
+						}),
+					}
+				)
+			type InventoryItem = {
+				RoomConsumableId: string
+				AccountId: number
+				Count: number
+				ConcurrencyCode: string | null
+				ModifiedAt: string
+				Consumable: Consumable & { IsGiftable: boolean; Visibility: number }
+			}
+			type Purchase = {
+				BalanceUpdateResult: number
+				CurrencyBalanceResponse: {
+					AccountId: number
+					CurrencyId: string | null
+					Balance: number
+					ModifiedAt: string
+				}
+				OperationResult: {
+					Status: number
+					InventoryItem: InventoryItem | null
+				}
+			}
+			const result = async (res: Response) => {
+				expect(res.status).toBe(200)
+				return (await res.json()) as Purchase
+			}
+			// A refusal: the same shape, nothing given, the buyer's balance as it stands.
+			const refused = (
+				code: number,
+				buyer: number,
+				currencyId: string | null,
+				balance: number
+			) => ({
+				BalanceUpdateResult: code,
+				CurrencyBalanceResponse: {
+					AccountId: buyer,
+					CurrencyId: currencyId,
+					Balance: balance,
+					ModifiedAt: expect.any(String),
+				},
+				OperationResult: { Status: 1, InventoryItem: null },
+			})
+			const setTokens = (accountId: number, amount: number) =>
+				env.DB.prepare(
+					'INSERT OR REPLACE INTO balance (account_id, currency_type, amount) VALUES (?1, 2, ?2)'
+				)
+					.bind(accountId, amount)
+					.run()
+			const tokens = async (accountId: number) =>
+				(
+					await env.DB.prepare(
+						'SELECT amount FROM balance WHERE account_id = ?1 AND currency_type = 2'
+					)
+						.bind(accountId)
+						.first<{ amount: number }>()
+				)?.amount
+			const setCoins = (playerId: number, amount: number) =>
+				env.DB.prepare(
+					'INSERT OR REPLACE INTO room_balance (currency_id, player_id, amount) VALUES (?1, ?2, ?3)'
+				)
+					.bind(coin, playerId, amount)
+					.run()
+			const coins = async (playerId: number) =>
+				(
+					await env.DB.prepare(
+						'SELECT amount FROM room_balance WHERE currency_id = ?1 AND player_id = ?2'
+					)
+						.bind(coin, playerId)
+						.first<{ amount: number }>()
+				)?.amount ?? 0
+			const owned = async (playerId: number, consumableId: string) =>
+				(
+					await env.DB.prepare(
+						'SELECT quantity FROM room_inventory WHERE player_id = ?1 AND consumable_id = ?2'
+					)
+						.bind(playerId, consumableId)
+						.first<{ quantity: number }>()
+				)?.quantity ?? 0
+			const drainFrames = async () =>
+				(
+					env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
+						drainFrames(): Promise<Array<{ accountId: number; payload: Record<string, unknown> }>>
+					}
+				).drainFrames()
+
+			await setTokens(1, 1000)
+			await setTokens(2, 40)
+			await setTokens(7701, 100)
+			await setTokens(7702, 4)
+			await setCoins(7701, 120)
+			await drainFrames()
+
+			expect((await purchase(null, tokenItem.RoomConsumableId, 5, null)).status).toBe(401)
+			// Only the two purchase paths exist.
+			const other = await exports.default.fetch(
+				`${ORIGIN}/api/roomconsumables/v1/roomconsumable/${tokenItem.RoomConsumableId}/purchase/gems`,
+				{ method: 'PUT', headers: await bearer('7701'), body: '{}' }
+			)
+			expect(other.status).toBe(404)
+
+			// Refusals charge and give nothing, and say why in `BalanceUpdateResult`.
+			const refusals: Array<[Promise<Response>, ReturnType<typeof refused>]> = [
+				[purchase('7701', 'nope', 5, null), refused(4, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 0), refused(7, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 4), refused(7, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 1, -3), refused(8, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 0, null), refused(6, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, coin), refused(6, 7701, null, 100)],
+				[purchase('7701', coinItem.RoomConsumableId, 50, null), refused(6, 7701, coin, 120)],
+				[purchase('7702', tokenItem.RoomConsumableId, 5, null), refused(2, 7702, null, 4)],
+				[purchase('7701', coinItem.RoomConsumableId, 50, coin, 3), refused(2, 7701, coin, 120)],
+			]
+			for (const [res, expected] of refusals) {
+				expect(await result(await res)).toEqual(expected)
+			}
+			expect([await tokens(1), await tokens(7701), await tokens(7702)]).toEqual([1000, 100, 4])
+			expect(await coins(7701)).toBe(120)
+			expect(await owned(7701, tokenItem.RoomConsumableId)).toBe(0)
+			expect(await drainFrames()).toEqual([])
+
+			// Tokens: 3 × 5 leaves the buyer and reaches the room's owner.
+			const sold = await result(await purchase('7701', tokenItem.RoomConsumableId, 5, null, 3))
+			expect(sold).toEqual({
+				BalanceUpdateResult: 0,
+				CurrencyBalanceResponse: {
+					AccountId: 7701,
+					CurrencyId: null,
+					Balance: 85,
+					ModifiedAt: expect.any(String),
+				},
+				OperationResult: {
+					Status: 0,
+					InventoryItem: {
+						RoomConsumableId: tokenItem.RoomConsumableId,
+						AccountId: 7701,
+						Count: 3,
+						ConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+						ModifiedAt: expect.any(String),
+						// The listing plus two fields, with no picture as '' — not the catalogue's.
+						Consumable: { ...tokenItem, ImageName: '', IsGiftable: false, Visibility: 0 },
+					},
+				},
+			})
+			// Member order as the client was observed receiving it.
+			expect(Object.keys(sold)).toEqual([
+				'BalanceUpdateResult',
+				'CurrencyBalanceResponse',
+				'OperationResult',
+			])
+			expect(Object.keys(sold.OperationResult.InventoryItem!)).toEqual([
+				'RoomConsumableId',
+				'AccountId',
+				'Count',
+				'ConcurrencyCode',
+				'ModifiedAt',
+				'Consumable',
+			])
+			expect([await tokens(1), await tokens(7701)]).toEqual([1015, 85])
+			const frames = await drainFrames()
+			expect(frames.find((f) => f.accountId === 1)?.payload).toMatchObject({
+				Balance: 1015,
+				Platform: -2,
+			})
+			expect(frames.find((f) => f.accountId === 7701)?.payload).toMatchObject({
+				Delta: -15,
+				Balance: 85,
+				Platform: -2,
+			})
+
+			// Room currency: 2 × 50 leaves the buyer's coin and pays nobody.
+			const bought = await result(await purchase('7701', coinItem.RoomConsumableId, 50, coin, 2))
+			expect(bought.CurrencyBalanceResponse).toMatchObject({
+				AccountId: 7701,
+				CurrencyId: coin,
+				Balance: 20,
+			})
+			expect(bought.OperationResult.InventoryItem).toMatchObject({ AccountId: 7701, Count: 2 })
+			expect(await coins(7701)).toBe(20)
+			expect(await coins(1)).toBe(0)
+			expect(await tokens(1)).toBe(1015)
+			expect(await drainFrames()).toEqual([])
+
+			// A gift: the buyer pays, the owner is paid, the recipient owns it.
+			const gift = await result(
+				await purchase('7701', tokenItem.RoomConsumableId, 5, null, 1, 7702)
+			)
+			// The balance is the BUYER's; the item is the RECIPIENT's.
+			expect(gift.CurrencyBalanceResponse).toMatchObject({ AccountId: 7701, Balance: 80 })
+			expect(gift.OperationResult.InventoryItem).toMatchObject({ AccountId: 7702, Count: 1 })
+			expect(await owned(7702, tokenItem.RoomConsumableId)).toBe(1)
+			expect(await owned(7701, tokenItem.RoomConsumableId)).toBe(3)
+			expect([await tokens(1), await tokens(7701), await tokens(7702)]).toEqual([1020, 80, 4])
+			await drainFrames()
+
+			// A co-owner gets it free at the 0 the client asks them, in either currency.
+			const free = await result(await purchase('2', tokenItem.RoomConsumableId, 0, null, 2))
+			expect(free.BalanceUpdateResult).toBe(0)
+			expect(free.OperationResult.InventoryItem).toMatchObject({ AccountId: 2, Count: 2 })
+			const freeCoin = await result(await purchase('2', coinItem.RoomConsumableId, 0, coin))
+			expect(freeCoin.OperationResult.Status).toBe(0)
+			expect([await tokens(1), await tokens(2), await coins(2)]).toEqual([1020, 40, 0])
+			expect(await drainFrames()).toEqual([])
+
+			// `/me` lists what the caller holds of the room, in the shop's order — the same item
+			// the purchase answered with, the stored concurrency code included.
+			const mine = async (sub: string | null, roomId: number | string = 2511) => {
+				const res = await exports.default.fetch(
+					`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/${roomId}/me`,
+					sub === null ? undefined : { headers: await bearer(sub) }
+				)
+				return {
+					status: res.status,
+					items: (await res.json().catch(() => null)) as InventoryItem[],
+				}
+			}
+			expect((await mine(null)).status).toBe(401)
+			const own = await mine('7701')
+			expect(own.status).toBe(200)
+			expect(own.items).toEqual([
+				{
+					RoomConsumableId: tokenItem.RoomConsumableId,
+					AccountId: 7701,
+					Count: 3,
+					ConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+					ModifiedAt: expect.any(String),
+					Consumable: { ...tokenItem, ImageName: '', IsGiftable: false, Visibility: 0 },
+				},
+				expect.objectContaining({ RoomConsumableId: coinItem.RoomConsumableId, Count: 2 }),
+			])
+			expect((await mine('7702')).items).toEqual([
+				expect.objectContaining({ RoomConsumableId: tokenItem.RoomConsumableId, Count: 1 }),
+			])
+			// Another room, an unknown one, and a nonsense id are all empty.
+			expect((await mine('7701', 99999)).items).toEqual([])
+			expect((await mine('7701', 'nope')).items).toEqual([])
+			// Spent down to zero is absent, not a zero row.
+			await env.DB.prepare('UPDATE room_inventory SET quantity = 0 WHERE player_id = 7702').run()
+			expect((await mine('7702')).items).toEqual([])
+
+			await env.DB.prepare('DELETE FROM room_inventory').run()
+			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id = ?1').bind(coin).run()
+		})
+
 		test('GET roomConsumable/room/:id is public and empty for an unknown room', async () => {
 			expect(await shopOf(99999)).toEqual([])
 			const res = await exports.default.fetch(
@@ -3265,14 +3559,6 @@ describe('econ endpoints', () => {
 				.bind(coin, other)
 				.run()
 		})
-	})
-
-	test('GET /api/roomconsumables/v1/roomConsumable/room/:id/me returns []', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/1/me`
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
 	})
 
 	test('GET /api/roomcurrencies/v1/getAllBalances returns []', async () => {
@@ -7761,6 +8047,7 @@ describe('econ endpoints', () => {
 			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
 			'PUT /api/roomconsumables/v1/roomConsumable',
+			'PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{via}',
 			'PUT /api/roomkeys/v1/updateAll',
 		])
 
