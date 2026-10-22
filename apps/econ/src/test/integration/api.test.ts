@@ -3054,7 +3054,8 @@ describe('econ endpoints', () => {
 			expect(await (await buy('7301', key.RoomKeyId, 300)).json()).toEqual(refused(3, key, 200))
 			expect([await tokens(1), await tokens(7301)]).toEqual([1300, 200])
 
-			// A free key moves nothing; nor does the owner buying their own room's key.
+			// A free key moves nothing; nor does a room manager buying their own room's key —
+			// the owner at the stored price, or a co-owner at the 0 the client asks them.
 			const gratis = (await (await buy('7302', free.RoomKeyId)).json()) as {
 				RoomKeyResponse: { Status: number }
 				BalanceUpdateResponse: { Balance: number }
@@ -3064,7 +3065,12 @@ describe('econ endpoints', () => {
 			const own = (await (await buy('1', key.RoomKeyId, 300)).json()) as typeof gratis
 			expect(own.RoomKeyResponse.Status).toBe(0)
 			expect(own.BalanceUpdateResponse.Balance).toBe(1300)
-			expect(await holders(key.RoomKeyId)).toEqual([1, 7301])
+			await setTokens(2, 50)
+			const coOwner = (await (await buy('2', key.RoomKeyId, 0)).json()) as typeof gratis
+			expect(coOwner.RoomKeyResponse.Status).toBe(0)
+			expect(coOwner.BalanceUpdateResponse.Balance).toBe(50)
+			expect(await holders(key.RoomKeyId)).toEqual([1, 2, 7301])
+			expect([await tokens(1), await tokens(2)]).toEqual([1300, 50])
 			expect(await drainFrames()).toEqual([])
 
 			// A key priced in a room currency is not sold for tokens.

@@ -6517,8 +6517,10 @@ const app = new Hono<App>({ strict: false })
 				'Looks the key up by `RoomKeyId`, confirms the client’s `RequestedPrice` matches its',
 				'stored `Price`, debits the buyer that price in RecCenterTokens, pays it to the',
 				'room’s OWNER (its `CreatorAccountId`), and records the buyer as holding the key',
-				'(`room_key_player`). A free key, and an owner buying their own room’s key, move no',
-				'tokens. A GET because that is how the client sends it.',
+				'(`room_key_player`). A free key moves no tokens, and nor does a key bought by the',
+				'room’s creator or a CO-OWNER: they get their own room’s keys free, and the client',
+				'asks them `RequestedPrice=0` (the stored price is accepted too). A GET because that',
+				'is how the client sends it.',
 				'',
 				'Answers the client’s `RoomKeyPurchaseResponseDTO`: `RoomKeyResponse` is the',
 				'`{ Status, RoomKey }` the create answers in, and `BalanceUpdateResponse` carries one',
@@ -6588,17 +6590,21 @@ const app = new Hono<App>({ strict: false })
 			if (key === null || key.PurchaseCurrencyId !== null) {
 				return answer(UpdateResponse.NoItemAvailable)
 			}
-			if (requestedPrice !== key.Price) return answer(UpdateResponse.RequestedPriceDoesNotMatch)
 			const ownerId = await getRoomOwnerId(c.env.DB, key.RoomId)
 			if (ownerId === null) return answer(UpdateResponse.NoItemAvailable)
+			// The room's creator and co-owners get their own room's keys free — the client asks
+			// them `RequestedPrice=0` — and are never charged, whatever price they name.
+			const canManage = (await canManageRoomById(c.env.DB, key.RoomId, id)) === true
+			if (requestedPrice !== key.Price && !(canManage && requestedPrice === 0)) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch)
+			}
 
 			// Claim the key BEFORE charging: the insert is atomic, so of two concurrent buys only
 			// one gets past here and only one is charged. A buyer who cannot pay gives it back.
 			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) {
 				return answer(UpdateResponse.AlreadyOwned)
 			}
-			// The owner paying themselves would be a debit and a credit of the same tokens.
-			if (key.Price > 0 && ownerId !== id) {
+			if (key.Price > 0 && !canManage) {
 				if (!(await spendCurrency(c.env.DB, id, currencyType, key.Price, startingTokens))) {
 					await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
 					return answer(UpdateResponse.NotEnoughCredit)
