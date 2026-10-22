@@ -53,7 +53,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
 | GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
 | POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 10 XP + gift box  |
-| GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
+| GET      | `/api/roomkeys/v1/mine`                              | ✓    | The player's held room keys             |
 | GET      | `/api/roomkeys/v1/room`                              |      | The keys a room has listed              |
 | POST     | `/api/roomkeys/v1/create`                            | ✓    | List a key for a room (owner/co-owner)  |
 | PUT      | `/api/roomkeys/v1/updateAll`                         | ✓    | Edit one key (owner/co-owner)           |

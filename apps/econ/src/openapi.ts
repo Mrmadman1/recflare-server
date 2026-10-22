@@ -779,6 +779,13 @@ export const RoomKeyDto = z.object({
 	Type: z.int().describe('The key type’s ordinal: 0 `Key`, the only one seen'),
 })
 
+/** A held key as `GET /api/roomkeys/v1/mine` serves it — the room key plus two fields. */
+export const HeldRoomKeyDto = RoomKeyDto.extend({
+	ImageName: z.string().describe('The key’s art; "" when it has none (NOT null, unlike the list)'),
+	IsGiftable: z.boolean().describe('Always false — gifting keys is not modelled'),
+	Visibility: z.int().describe('Always 0 — not modelled'),
+})
+
 /**
  * The envelope `POST /api/roomkeys/v1/create` answers in: `{ Status, RoomKey }`, observed from
  * the live client — NOT the `{ Value, Success, Error, error_id }` the room-currency and

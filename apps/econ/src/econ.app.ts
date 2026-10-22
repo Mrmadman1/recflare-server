@@ -147,6 +147,7 @@ import {
 	RoomCurrencyPurchaseOfferEnvelope,
 	RoomCurrencyPurchaseOffersDto,
 	RoomEconConfig,
+	HeldRoomKeyDto,
 	RoomKeyDto,
 	RoomKeyEnvelope,
 	RoomPurchasableList,
@@ -195,6 +196,7 @@ import {
 	claimRoomKey,
 	createRoomKey,
 	getRoomKey,
+	getHeldRoomKeys,
 	getRoomKeys,
 	getRoomOwnerId,
 	ownsRoomKeys,
@@ -6391,9 +6393,31 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The player's room keys. Returns "[]": nothing sells a key yet, so nobody holds one.
-	.get('/api/roomkeys/v1/mine', listRoute('The player’s room keys', 'Empty for now'), (c) =>
-		c.json([])
+	// The caller's room keys: every key they hold (`room_key_player`), across all rooms.
+	.get(
+		'/api/roomkeys/v1/mine',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The player’s room keys',
+			description: [
+				'Every key the caller holds — bought, awarded, or taken free as a room manager —',
+				'across every room, oldest key first. No parameters.',
+				'',
+				'Each entry is the room key plus `IsGiftable` (false) and `Visibility` (0), with',
+				'`ImageName` as "" rather than null when the key has no art — the shape observed',
+				'from the live client, which differs from `/api/roomkeys/v1/room`’s.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(HeldRoomKeyDto.array(), 'The caller’s keys, oldest first'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json(await getHeldRoomKeys(c.env.DB, id))
+		}
 	)
 	// The keys a room has listed. Public, like the room's currencies: a key is offered to
 	// whoever walks up to the door it opens. A room with none, an unknown room and a missing

@@ -214,6 +214,38 @@ export async function getRoomKeys(db: D1Database, roomId: number): Promise<RoomK
 }
 
 /**
+ * A key as `GET /api/roomkeys/v1/mine` serves it — observed from the live client: the
+ * {@link RoomKey} plus `IsGiftable` and `Visibility`, and `ImageName` as '' (not null) on a
+ * key without art. Neither extra field is modelled here, so both are served as their 0/false.
+ */
+export interface HeldRoomKey extends Omit<RoomKey, 'ImageName'> {
+	ImageName: string
+	IsGiftable: boolean
+	Visibility: number
+}
+
+/** Every key `accountId` holds, across all rooms, in creation order. */
+export async function getHeldRoomKeys(db: D1Database, accountId: number): Promise<HeldRoomKey[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT ${SELECT_COLUMNS.split(', ')
+				.map((col) => `k.${col}`)
+				.join(', ')}
+			 FROM room_key_player p JOIN room_key k ON k.room_key_id = p.room_key_id
+			 WHERE p.account_id = ?1 ORDER BY k.room_key_id`
+		)
+		.bind(accountId)
+		.all<RoomKeyRow>()
+
+	return results.map((row) => ({
+		...toRoomKey(row),
+		ImageName: row.image_name,
+		IsGiftable: false,
+		Visibility: 0,
+	}))
+}
+
+/**
  * Award a player a room key, answering when they came to hold it — now, or the first award's
  * time when they already did (a key is held once; re-awarding is a no-op). Null when
  * `roomKeyId` names no listed key: a held key that cannot be described is never written.

@@ -7211,10 +7211,77 @@ describe('econ endpoints', () => {
 		expect(rows?.count).toBe(0)
 	})
 
-	test('GET /api/roomkeys/v1/mine returns []', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/roomkeys/v1/mine`)
+	test('GET /api/roomkeys/v1/mine lists the keys the caller holds, across rooms', async () => {
+		const mine = async (sub: string | null) =>
+			exports.default.fetch(
+				`${ORIGIN}/api/roomkeys/v1/mine`,
+				sub === null ? undefined : { headers: await bearer(sub) }
+			)
+		expect((await mine(null)).status).toBe(401)
+		expect(await (await mine('7601')).json()).toEqual([])
+
+		const insert = async (roomId: number, name: string, imageName: string) =>
+			(await env.DB.prepare(
+				`INSERT INTO room_key
+					(replication_id, room_id, key_type, name, description, price, purchase_currency_id, image_name, created_at)
+				 VALUES ('0f8c3a7e-1d42-4b90-9c11-7a6e5d2b8f03', ?1, 'Key', ?2, '', 0, NULL, ?3, '2026-10-14T12:00:00Z')
+				 RETURNING room_key_id`
+			)
+				.bind(roomId, name, imageName)
+				.first<{ room_key_id: number }>())!.room_key_id
+		const a = await insert(12, 'VIP Key', '')
+		const b = await insert(2511, 'Art Key', 'key.png')
+		const notHeld = await insert(12, 'Other', '')
+		for (const [key, account] of [
+			[b, 7601],
+			[a, 7601],
+			[notHeld, 7602],
+		]) {
+			await env.DB.prepare(
+				"INSERT INTO room_key_player (room_key_id, account_id, awarded_at) VALUES (?1, ?2, '')"
+			)
+				.bind(key, account)
+				.run()
+		}
+
+		const res = await mine('7601')
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		const keys = (await res.json()) as Array<Record<string, unknown>>
+		expect(keys).toEqual([
+			{
+				RoomKeyId: a,
+				ReplicationId: '0f8c3a7e-1d42-4b90-9c11-7a6e5d2b8f03',
+				RoomId: 12,
+				Name: 'VIP Key',
+				Description: '',
+				Price: 0,
+				PurchaseCurrencyId: null,
+				CreatedAt: '2026-10-14T12:00:00Z',
+				ImageName: '',
+				Type: 0,
+				IsGiftable: false,
+				Visibility: 0,
+			},
+			expect.objectContaining({ RoomKeyId: b, RoomId: 2511, ImageName: 'key.png' }),
+		])
+		// Member order as the client was observed receiving it.
+		expect(Object.keys(keys[0]!)).toEqual([
+			'RoomKeyId',
+			'ReplicationId',
+			'RoomId',
+			'Name',
+			'Description',
+			'Price',
+			'PurchaseCurrencyId',
+			'CreatedAt',
+			'ImageName',
+			'Type',
+			'IsGiftable',
+			'Visibility',
+		])
+
+		await env.DB.prepare('DELETE FROM room_key_player').run()
+		await env.DB.prepare('DELETE FROM room_key').run()
 	})
 
 	test('GET /api/subscriptionseasons/v1/seasons/current returns []', async () => {
