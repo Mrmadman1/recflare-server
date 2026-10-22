@@ -3238,6 +3238,24 @@ describe('econ endpoints', () => {
 			)
 			expect(await held(coin, 7501)).toBe(500)
 
+			// A non-manager cannot buy it for 0; the room's managers can — the co-owner at the 0
+			// the client asks them, the owner at the stored price — and nothing is subtracted.
+			expect(await (await purchase('7502', key.RoomKeyId, 0, coin)).json()).toEqual(
+				refused(7502, coin, 999)
+			)
+			await give(coin, 2, 10)
+			const coOwner = (await (await purchase('2', key.RoomKeyId, 0, coin)).json()) as {
+				Balance: { Balance: number }
+				RoomKeyResponse: { Status: number }
+			}
+			expect(coOwner.RoomKeyResponse.Status).toBe(0)
+			expect(coOwner.Balance.Balance).toBe(10)
+			const own = (await (await purchase('1', key.RoomKeyId, 1000, coin)).json()) as typeof coOwner
+			expect(own.RoomKeyResponse.Status).toBe(0)
+			expect(own.Balance.Balance).toBe(0)
+			expect(await holders(key.RoomKeyId)).toEqual([1, 2, 7501])
+			expect([await held(coin, 1), await held(coin, 2)]).toEqual([0, 10])
+
 			await env.DB.prepare('DELETE FROM room_key_player').run()
 			await env.DB.prepare('DELETE FROM room_key').run()
 			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id IN (?1, ?2)')

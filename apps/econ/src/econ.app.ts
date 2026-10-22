@@ -6651,7 +6651,10 @@ const app = new Hono<App>({ strict: false })
 				'NOBODY IS PAID — unlike the token sale, the price does not reach the room’s owner.',
 				'',
 				'`RequestedPurchaseCurrencyId` must be the key’s own `PurchaseCurrencyId` and',
-				'`RequestedPrice` its `Price`. A key priced in TOKENS (a null `PurchaseCurrencyId`)',
+				'`RequestedPrice` its `Price` — except that the room’s creator or a CO-OWNER gets',
+				'their own room’s keys free: the client asks them `RequestedPrice=0` (the stored',
+				'price is accepted too) and nothing is subtracted.',
+				'A key priced in TOKENS (a null `PurchaseCurrencyId`)',
 				'is not sold here — that is `GET /api/storefronts/v1/buyRoomKey`.',
 				'',
 				'Answers the client’s `RoomKeyPurchaseWithCurrencyResponseDTO`, a bare object with no',
@@ -6710,13 +6713,21 @@ const app = new Hono<App>({ strict: false })
 			if (requestedCurrencyId.toLowerCase() !== key.PurchaseCurrencyId.toLowerCase()) {
 				return answer(false)
 			}
-			if (int(body.RequestedPrice) !== key.Price) return answer(false)
+			// The room's creator and co-owners get their own room's keys free, as with the token
+			// sale — the client asks them `RequestedPrice=0` — and are never charged.
+			const canManage = await canManageRoomById(c.env.DB, key.RoomId, id)
+			if (canManage === null) return answer(false)
+			const requestedPrice = int(body.RequestedPrice)
+			if (requestedPrice !== key.Price && !(canManage && requestedPrice === 0)) {
+				return answer(false)
+			}
 
 			// Claim the key BEFORE charging, as the token sale does: the insert is atomic, so of
 			// two concurrent buys only one is charged. A buyer who cannot pay gives it back.
 			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) return answer(false)
 			if (
 				key.Price > 0 &&
+				!canManage &&
 				!(await spendRoomCurrency(c.env.DB, key.PurchaseCurrencyId, id, key.Price))
 			) {
 				await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
