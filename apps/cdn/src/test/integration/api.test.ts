@@ -19,6 +19,38 @@ describe('cdn endpoints', () => {
 		expect(await res.json()).toEqual({ service: 'cdn', status: 'ok' })
 	})
 
+	// A stored blob carries whatever type it was uploaded with; the routes force
+	// octet-stream, and these headers make that binding and sandbox anything that is served
+	// under its own type (the configs). The hand-rolled HEAD sits outside Hono and must
+	// carry them too.
+	test('every response carries headers that stop a stored document executing', async () => {
+		await env.CDN_ASSETS.put('data/a-stored-page', '<script>alert(1)</script>', {
+			httpMetadata: { contentType: 'text/html' },
+		})
+		for (const path of [
+			'/',
+			'/config/LoadingScreenTipData',
+			'/config/RRPlusConfig_v3',
+			'/data/a-stored-page',
+		]) {
+			const res = await exports.default.fetch(`${ORIGIN}${path}`)
+			expect(res.status, path).toBe(200)
+			expect(res.headers.get('x-content-type-options'), path).toBe('nosniff')
+			expect(res.headers.get('content-security-policy'), path).toBe("default-src 'none'; sandbox")
+		}
+		const blob = await exports.default.fetch(`${ORIGIN}/data/a-stored-page`)
+		expect(blob.headers.get('content-type')).toBe('application/octet-stream')
+
+		await env.CDN_ASSETS.put('unityasset/plain.assetbundle', new Uint8Array([1, 2, 3]))
+		const head = await exports.default.fetch(`${ORIGIN}/unityasset/plain.assetbundle`, {
+			method: 'HEAD',
+		})
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('3')
+		expect(head.headers.get('x-content-type-options')).toBe('nosniff')
+		expect(head.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox")
+	})
+
 	test('GET /config/LoadingScreenTipData returns the tip array', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/config/LoadingScreenTipData`)
 		expect(res.status).toBe(200)

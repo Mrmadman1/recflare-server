@@ -9,6 +9,9 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** The PNG signature — what an Image (FileType 3) upload must at least begin with. */
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
@@ -96,7 +99,8 @@ it('POST /upload folders each FileType under its own subfolder', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/upload`, {
 			method: 'POST',
 			headers,
-			body: uploadForm(fileType, new Uint8Array([1, 2, 3])),
+			// An image has to look like one; the other types take any bytes.
+			body: uploadForm(fileType, subfolder === 'image' ? PNG_BYTES : new Uint8Array([1, 2, 3])),
 		})
 		expect(res.status).toBe(200)
 		const { filename } = (await res.json()) as { filename: string }
@@ -161,15 +165,60 @@ it('POST /upload lets staff upload past the size limit', async () => {
 			const res = await SELF.fetch(`${ORIGIN}/upload`, {
 				method: 'POST',
 				headers: await bearer('42', ['gameClient', role]),
-				body: uploadForm('3', new Uint8Array([1, 2, 3, 4])),
+				body: uploadForm('3', PNG_BYTES),
 			})
 			expect(res.status).toBe(200)
 			const { filename } = (await res.json()) as { filename: string }
-			expect((await env.CDN_ASSETS.get(`image/${filename}`))?.size).toBe(4)
+			expect((await env.CDN_ASSETS.get(`image/${filename}`))?.size).toBe(PNG_BYTES.length)
 		}
 	} finally {
 		env.MAX_UPLOAD_BYTES = original
 	}
+})
+
+// An Image (3) is served back by the `img` worker under the stored content-type, so the
+// type comes from the bytes rather than the part's claim, and a non-image is refused —
+// otherwise an HTML body would be a page on the image origin.
+it('POST /upload refuses an Image (FileType 3) whose bytes are not an image', async () => {
+	const form = new FormData()
+	form.set('FileType', '3')
+	form.set('File', new File(['<script>alert(1)</script>'], 'photo.jpg', { type: 'image/jpeg' }))
+	const res = await SELF.fetch(`${ORIGIN}/upload`, {
+		method: 'POST',
+		headers: await bearer(),
+		body: form,
+	})
+	expect(res.status).toBe(400)
+	expect(await res.json()).toEqual({ error: 'file is not a PNG, JPEG, GIF, WebP or BMP image' })
+})
+
+it('POST /upload stores an Image (FileType 3) under the type its bytes say, not the claim', async () => {
+	const form = new FormData()
+	form.set('FileType', '3')
+	form.set('File', new File([PNG_BYTES], 'photo.html', { type: 'text/html' }))
+	const res = await SELF.fetch(`${ORIGIN}/upload`, {
+		method: 'POST',
+		headers: await bearer(),
+		body: form,
+	})
+	expect(res.status).toBe(200)
+	const { filename } = (await res.json()) as { filename: string }
+	const stored = await env.CDN_ASSETS.get(`image/${filename}`)
+	expect(stored?.httpMetadata?.contentType).toBe('image/png')
+
+	// Other types keep the claimed content-type: they are not served as images.
+	const blob = new FormData()
+	blob.set('FileType', '2')
+	blob.set(
+		'File',
+		new File([new Uint8Array([1, 2, 3])], 'file.bin', { type: 'application/octet-stream' })
+	)
+	const other = await SELF.fetch(`${ORIGIN}/upload`, {
+		method: 'POST',
+		headers: await bearer(),
+		body: blob,
+	})
+	expect(other.status).toBe(200)
 })
 
 it('POST /upload echoes an explicit name when no binary is posted', async () => {

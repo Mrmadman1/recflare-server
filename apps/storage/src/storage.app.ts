@@ -4,6 +4,8 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	intVar,
+	SNIFFED_IMAGE_FORMATS,
+	sniffImage,
 	withCleanSpec,
 	withDefaultCors,
 	withNotFound,
@@ -309,7 +311,10 @@ const app = new Hono<App>()
 				'`<upload-date>/<random-name>` part the client references it by (the same name the',
 				'`cdn` worker serves back). The subfolder comes from `FileType`; RoomSave (1) lands',
 				'under `room/` so the cdn worker’s `GET /room/:dataBlob` finds it, and an Invention',
-				'(5) keeps a `.inv` extension on both the key and the returned name. Auth-gated —',
+				'(5) keeps a `.inv` extension on both the key and the returned name. An Image (3) is',
+				'identified by its bytes — it must be a PNG, JPEG, GIF, WebP or BMP, and is stored under',
+				'that content-type rather than the part’s claimed one — because the `img` worker serves',
+				'it back under the stored type; anything else is refused with a 400. Auth-gated —',
 				'any valid account token is allowed, no role check; staff (developer/moderator) skip the size limit. A post with no binary part but',
 				'an explicit `imageName` / `filename` / `name` just echoes that name back. Mirrors',
 				'the reference server’s `Upload`.',
@@ -318,7 +323,10 @@ const app = new Hono<App>()
 			requestBody: UPLOAD_REQUEST_BODY,
 			responses: {
 				200: json(UploadResponse, 'The stored (or echoed) file name'),
-				400: json(ErrorResponse, 'Unknown/missing FileType, or neither a file nor a name'),
+				400: json(
+					ErrorResponse,
+					'Unknown/missing FileType, an Image (3) that is not an image, or neither a file nor a name'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				413: json(
 					ErrorResponse,
@@ -360,8 +368,19 @@ const app = new Hono<App>()
 				const datePrefix = new Date().toISOString().slice(0, 10)
 				const filename = `${datePrefix}/${crypto.randomUUID()}${extensionForFileType(fileType)}`
 				const bytes = await file.arrayBuffer()
+				// An image is served back by the `img` worker under the stored content-type, so
+				// the type comes from the bytes, not the part's claim — and a body that is not
+				// an image is refused rather than stored as a document on the image origin.
+				let contentType = file.type || 'application/octet-stream'
+				if (subfolder === 'image') {
+					const image = sniffImage(new Uint8Array(bytes))
+					if (!image) {
+						return c.json({ error: `file is not a ${SNIFFED_IMAGE_FORMATS} image` }, 400)
+					}
+					contentType = image.contentType
+				}
 				await c.env.CDN_ASSETS.put(`${subfolder}/${filename}`, bytes, {
-					httpMetadata: { contentType: file.type || 'application/octet-stream' },
+					httpMetadata: { contentType },
 					// Record the SHA-256 on the object. R2 stores an md5 on its own, but the
 					// hashes the client is served (an invention's `BlobHash`) are SHA-256, and
 					// only a checksum given at put time is readable later — this lets the `api`

@@ -3,7 +3,13 @@ import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { withCleanSpec, withNotFound, withOnError, writeContentRange } from '@repo/hono-helpers'
+import {
+	withCleanSpec,
+	withNoExecute,
+	withNotFound,
+	withOnError,
+	writeContentRange,
+} from '@repo/hono-helpers'
 
 import { imageBytes, json, ServiceStatus } from './openapi'
 
@@ -303,20 +309,6 @@ async function serveStaticAsset(
 	return new Response(asset.body, { headers })
 }
 
-/**
- * Headers that keep a stored object from running as a document. An upload reaches R2
- * with whatever content-type the uploader claimed (`api` writes `file.type` through),
- * so a `text/html` body with a `.jpg` name is served back as HTML on this origin.
- * `nosniff` stops the browser upgrading an image type to HTML on its own, and the
- * `sandbox` CSP denies scripts, plugins and same-origin access even when the stored
- * type really is HTML or SVG — the page renders inert. Applied to every response, the
- * status JSON and 304s included; there is no response here that should ever execute.
- */
-const NO_EXECUTE_HEADERS = {
-	'x-content-type-options': 'nosniff',
-	'content-security-policy': "default-src 'none'; sandbox",
-} as const
-
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -327,12 +319,10 @@ const app = new Hono<App>()
 				release: c.env.SENTRY_RELEASE,
 			})(c, next)
 	)
-	.use('*', async (c, next) => {
-		await next()
-		for (const [name, value] of Object.entries(NO_EXECUTE_HEADERS)) {
-			c.res.headers.set(name, value)
-		}
-	})
+	// An upload reaches R2 with whatever content-type the uploader claimed — `api` and
+	// `storage` now sniff image uploads, but the bucket holds older objects — so every
+	// response says it must not run as a document. See `withNoExecute`.
+	.use('*', withNoExecute())
 
 	.onError(withOnError())
 	.notFound(withNotFound())

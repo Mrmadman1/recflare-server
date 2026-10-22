@@ -95,6 +95,9 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** The PNG signature — the least an upload route accepts as an image. */
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
 // `/api/rooms/v1/verifyRole` reads room roles from the shared recflare D1. Set
 // up the schema (matching the rooms worker's migration) + a couple of rooms.
 const TEST_ROOMS = [
@@ -1788,8 +1791,8 @@ describe('public endpoints', () => {
 				...metadata,
 			})
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'f.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'f.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer(creator),
@@ -4966,11 +4969,8 @@ describe('custom avatar items', () => {
 				Accessibility: 0,
 			})
 		)
-		form.set(
-			'thumbnailImage',
-			new File([new Uint8Array([1, 2, 3])], 'file.bin', { type: 'image/png' })
-		)
-		form.set('design', new File([new Uint8Array([4, 5, 6])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer('205'),
@@ -5113,8 +5113,8 @@ describe('custom avatar items', () => {
 				'metadata',
 				JSON.stringify({ Name: 'Pricey', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff', Price })
 			)
-			form.set('thumbnailImage', new File([new Uint8Array([1])], 't.png', { type: 'image/png' }))
-			form.set('design', new File([new Uint8Array([2])], 'd.png', { type: 'image/png' }))
+			form.set('thumbnailImage', new File([PNG_BYTES], 't.png', { type: 'image/png' }))
+			form.set('design', new File([PNG_BYTES], 'd.png', { type: 'image/png' }))
 			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
 				headers: await bearer('205'),
@@ -5253,8 +5253,8 @@ describe('custom avatar items', () => {
 			'metadata',
 			JSON.stringify({ Name: 'Gone', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'file.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const created = (await (
 			await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
@@ -5357,6 +5357,48 @@ describe('custom avatar items', () => {
 		} finally {
 			env.RECFLARE_MAX_API_UPLOAD_BYTES = previous
 		}
+	})
+
+	// Both files are identified by their bytes — the client posts them as `.bin` under
+	// `image/png` — and the `img` worker serves each under its stored type, so a non-image
+	// is refused before either file or the row is written.
+	test('POST refuses a file whose bytes are not an image, writing nothing', async () => {
+		const objectsBefore = (await env.IMAGES.list({ prefix: 'avatar-item/' })).objects.length
+		const upload = async (thumbnail: string | Uint8Array, design: string | Uint8Array) => {
+			const form = new FormData()
+			form.set(
+				'metadata',
+				JSON.stringify({ Name: 'not-image', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
+			)
+			form.set('thumbnailImage', new File([thumbnail], 'f.bin', { type: 'image/png' }))
+			form.set('design', new File([design], 'f.bin', { type: 'image/png' }))
+			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+				method: 'POST',
+				headers: await bearer('205'),
+				body: form,
+			})
+		}
+		const html = '<script>alert(1)</script>'
+
+		const badThumbnail = await upload(html, PNG_BYTES)
+		expect(badThumbnail.status).toBe(400)
+		expect(await badThumbnail.json()).toMatchObject({
+			Success: false,
+			Error: 'thumbnailImage is not a PNG, JPEG, GIF, WebP or BMP image',
+		})
+
+		const badDesign = await upload(PNG_BYTES, html)
+		expect(badDesign.status).toBe(400)
+		expect(await badDesign.json()).toMatchObject({
+			Success: false,
+			Error: 'design is not a PNG, JPEG, GIF, WebP or BMP image',
+		})
+
+		const row = await env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM custom_avatar_item WHERE json_extract(data, '$.Name') = 'not-image'"
+		).first<{ n: number }>()
+		expect(row?.n).toBe(0)
+		expect((await env.IMAGES.list({ prefix: 'avatar-item/' })).objects).toHaveLength(objectsBefore)
 	})
 
 	test('POST 401s without a token', async () => {
@@ -6884,7 +6926,7 @@ describe('rooms', () => {
 
 describe('images', () => {
 	test('POST /api/images/v4/uploadsaved stores the file in R2 and returns its name', async () => {
-		const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4])
+		const bytes = new Uint8Array([...PNG_BYTES, 1, 2, 3, 4])
 		const fd = new FormData()
 		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 })) // ShareCamera
 		fd.append('image', new File([bytes], 'avatar.png', { type: 'image/png' }))
@@ -6915,6 +6957,42 @@ describe('images', () => {
 		// `Id`, not `SavedImageId` — v6 serves the raw record, unlike the player lists.
 		expect(typeof meta.Id).toBe('number')
 		expect(meta.CheerCount).toBe(0)
+	})
+
+	// The part's filename and content-type are the uploader's claims, and the `img`
+	// worker serves the object under whatever type is stored — so an HTML body under an
+	// image name would be a page on the image origin. The bytes decide, and only images
+	// get in.
+	test('POST /api/images/v4/uploadsaved refuses a file whose bytes are not an image', async () => {
+		const objectsBefore = (await env.IMAGES.list()).objects.length
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		fd.append('image', new File(['<script>alert(1)</script>'], 'photo.jpg', { type: 'image/jpeg' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ error: 'image is not a PNG, JPEG, GIF, WebP or BMP image' })
+		expect((await env.IMAGES.list()).objects).toHaveLength(objectsBefore)
+	})
+
+	test('POST /api/images/v4/uploadsaved stores the type and extension the bytes say, not the claim', async () => {
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		// A real PNG posted as a JPEG under an HTML name.
+		fd.append('image', new File([PNG_BYTES], 'photo.html', { type: 'text/html' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(200)
+		const { ImageName } = (await res.json()) as { ImageName: string }
+		expect(ImageName).toMatch(/\.png$/)
+		const stored = await env.IMAGES.get(ImageName)
+		expect(stored?.httpMetadata?.contentType).toBe('image/png')
 	})
 
 	test('GET /api/images/v1/slideshow is public and joins username + room name', async () => {
@@ -7378,7 +7456,7 @@ describe('images', () => {
 				accessibility: 2,
 			})
 		)
-		fd.append('image', new File([new Uint8Array([1, 2, 3])], 'pic.png', { type: 'image/png' }))
+		fd.append('image', new File([PNG_BYTES], 'pic.png', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
 			method: 'POST',
 			headers: await bearer('42'),

@@ -3,8 +3,10 @@ import { describeRoute, openAPIRouteHandler, resolver } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
+	applyNoExecuteHeaders,
 	withCleanSpec,
 	withDefaultCors,
+	withNoExecute,
 	withNotFound,
 	withOnError,
 	writeContentRange,
@@ -166,6 +168,13 @@ const app = new Hono<App>()
 	// ambient credential for `*` to expose. The keys are unguessable UUIDs, and that is
 	// unchanged by who may read a response they already had to name exactly.
 	.use('*', withDefaultCors())
+
+	// The blob routes force `application/octet-stream` over whatever type an upload was
+	// stored with, which is what keeps a stored HTML body from rendering; `nosniff` makes
+	// that type binding on the browser, and the sandboxing CSP covers the config files,
+	// which go out under their own types. The hand-rolled HEAD below is outside this chain
+	// and stamps the same headers itself.
+	.use('*', withNoExecute())
 
 	.onError(withOnError())
 	.notFound(withNotFound())
@@ -458,6 +467,7 @@ async function studioUnityAssetHead(env: StudioAssetEnv, name: string): Promise<
 	headers.set('accept-ranges', 'bytes')
 	headers.set('cache-control', CACHE_CONTROL)
 	headers.set('access-control-allow-origin', '*')
+	applyNoExecuteHeaders(headers)
 	const response = new Response(null, { status: 200, headers, encodeBody: 'manual' })
 	response.headers.set('content-length', String(head.size))
 	return response

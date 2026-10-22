@@ -13,6 +13,7 @@ import {
 	MAX_BULK_OUTFIT_ACCOUNTS,
 	setOutfit,
 } from '@repo/domain'
+import { SNIFFED_IMAGE_FORMATS, sniffImage } from '@repo/hono-helpers'
 
 import {
 	createCustomAvatarItem,
@@ -473,13 +474,17 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			summary: 'Create a custom avatar item',
 			description:
 				'Multipart: a `metadata` JSON text field plus two file parts, `thumbnailImage` ' +
-				'(PNG) and `design` (the design blob). Inserts a `custom_avatar_item` row owned ' +
+				'(PNG) and `design` (the design PNG). Inserts a `custom_avatar_item` row owned ' +
 				'by the caller and answers with it in the PascalCase `{ Value, Success, Error, ' +
 				'error_id }` envelope. The item is filed under `OutfitType` 105, the custom shirt, ' +
 				'which is what the store’s user-generated-content tab searches for.\n\n' +
 				'The two files go to the shared image bucket (`recflare-img`) under ' +
 				'`avatar-item/<date>/<id>-thumb.png` and `avatar-item/<date>/<id>-design.png`; those ' +
-				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row.\n\n' +
+				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row. Each file is ' +
+				'identified by its bytes — the client posts them under `.bin` names — and must be a ' +
+				'PNG, JPEG, GIF, WebP or BMP; the key’s extension and the stored content-type come ' +
+				'from that signature, and anything else is refused with a 400 before either file is ' +
+				'written.\n\n' +
 				'`Price` is capped at 1000 tokens (`MAX_PLAYER_ITEM_PRICE`); one above it, or below ' +
 				'0, is refused with a 400 rather than clamped.',
 			security: AUTHED,
@@ -488,7 +493,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				200: json(CustomAvatarItemResponse, 'The created item'),
 				400: json(
 					CustomAvatarItemResponse,
-					'Missing or malformed metadata / files, or a `Price` outside 0–1000'
+					'Missing or malformed metadata / files, a file that is not an image, or a `Price` outside 0–1000'
 				),
 				401: UNAUTHORIZED_RESPONSE,
 				413: json(CustomAvatarItemResponse, 'Either file exceeds the configured per-file limit'),
@@ -550,19 +555,30 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				)
 			}
 
+			// The parts' filenames and content-types are the uploader's claims (the client
+			// posts both as `.bin`); the `img` worker serves each back under whatever type is
+			// stored, so the extension and the stored type come from the bytes. Both are
+			// checked before either is written, so a refusal leaves nothing in R2.
+			const thumbnailBytes = new Uint8Array(await body.thumbnailImage.arrayBuffer())
+			const thumbnail = sniffImage(thumbnailBytes)
+			if (!thumbnail) return fail(`thumbnailImage is not a ${SNIFFED_IMAGE_FORMATS} image`)
+			const designBytes = new Uint8Array(await body.design.arrayBuffer())
+			const design = sniffImage(designBytes)
+			if (!design) return fail(`design is not a ${SNIFFED_IMAGE_FORMATS} image`)
+
 			// Both files go to the shared image bucket, foldered by upload date and keyed by
 			// the item's id (chosen here so the keys can carry it). The `img` worker serves
 			// them back by key.
 			const customAvatarItemId = crypto.randomUUID()
 			const prefix = `avatar-item/${new Date().toISOString().slice(0, 10)}/${customAvatarItemId}`
-			const thumbnailImageFilename = `${prefix}-thumb.png`
-			const designFilename = `${prefix}-design.png`
+			const thumbnailImageFilename = `${prefix}-thumb${thumbnail.extension}`
+			const designFilename = `${prefix}-design${design.extension}`
 			await Promise.all([
-				c.env.IMAGES.put(thumbnailImageFilename, await body.thumbnailImage.arrayBuffer(), {
-					httpMetadata: { contentType: body.thumbnailImage.type || 'image/png' },
+				c.env.IMAGES.put(thumbnailImageFilename, thumbnailBytes, {
+					httpMetadata: { contentType: thumbnail.contentType },
 				}),
-				c.env.IMAGES.put(designFilename, await body.design.arrayBuffer(), {
-					httpMetadata: { contentType: body.design.type || 'image/png' },
+				c.env.IMAGES.put(designFilename, designBytes, {
+					httpMetadata: { contentType: design.contentType },
 				}),
 			])
 

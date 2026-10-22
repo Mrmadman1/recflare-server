@@ -22,6 +22,7 @@ import {
 	SLIDESHOW_MAX_LIMIT,
 	toImagesPlayer,
 } from '@repo/domain'
+import { SNIFFED_IMAGE_FORMATS, sniffImage } from '@repo/hono-helpers'
 
 import { authedId, unauthorized } from '../http'
 import {
@@ -217,12 +218,17 @@ export const imageRoutes = new Hono<App>({ strict: false })
 				'The `imgMeta` multipart field is a JSON `SavedImageMetaDTO` describing the upload; ' +
 				'malformed JSON is tolerated and the image is still stored, just untyped. A ' +
 				'`savedImageType` of 4 (profile thumbnail) additionally becomes the account’s ' +
-				'avatar, persisted on the account row.',
+				'avatar, persisted on the account row.\n\n' +
+				'The file is identified by its bytes, not by the part’s filename or content-type: ' +
+				'it must be a PNG, JPEG, GIF, WebP or BMP, and the stored key’s extension and ' +
+				'content-type come from that signature. Anything else is refused with a 400 — the ' +
+				'`img` worker serves the object back under its stored type, so an HTML body under ' +
+				'an image name would otherwise be a page on the image origin.',
 			security: AUTHED,
 			requestBody: form(UploadImageRequest, 'The image file plus its metadata'),
 			responses: {
 				200: json(UploadImageResponse, 'The stored bucket key'),
-				400: json(ErrorResponse, 'No file in the request'),
+				400: json(ErrorResponse, 'No file in the request, or the file is not an image'),
 				401: UNAUTHORIZED_RESPONSE,
 				413: json(ErrorResponse, 'The image exceeds the configured per-file limit'),
 			},
@@ -262,10 +268,12 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const roomId = num(meta.roomId)
 			const playerEventId = num(meta.playerEventId)
 
-			const valid = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']
-			const dot = file.name.lastIndexOf('.')
-			const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : ''
-			const extension = valid.includes(ext) ? ext : '.jpg'
+			// The part's filename and content-type are the uploader's claims; the `img` worker
+			// serves the object back under whatever type is stored, so both the extension and
+			// the stored type come from the bytes. A body that is not an image is refused.
+			const bytes = new Uint8Array(await file.arrayBuffer())
+			const image = sniffImage(bytes)
+			if (!image) return c.json({ error: `image is not a ${SNIFFED_IMAGE_FORMATS} image` }, 400)
 
 			// Store the upload in the shared image bucket under a random key, foldered by
 			// the image type and then the upload date (e.g. `sharecamera/2026-06-15/`) so
@@ -273,10 +281,8 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			// key (slashes and all), which is the returned ImageName.
 			const typePrefix = (typeFolder[savedImageType] ?? typeFolder[SavedImageType.None]) + '/'
 			const datePrefix = new Date().toISOString().slice(0, 10) + '/'
-			const name = typePrefix + datePrefix + crypto.randomUUID() + extension
-			await c.env.IMAGES.put(name, await file.arrayBuffer(), {
-				httpMetadata: { contentType: file.type || 'image/jpeg' },
-			})
+			const name = typePrefix + datePrefix + crypto.randomUUID() + image.extension
+			await c.env.IMAGES.put(name, bytes, { httpMetadata: { contentType: image.contentType } })
 
 			// A profile thumbnail becomes the account's avatar — persist it on the
 			// account row (a JSON blob in the shared accounts table) so it sticks.
