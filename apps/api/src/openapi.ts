@@ -1664,6 +1664,14 @@ export const ImagesPlayerDto = z.object({
 	RoomId: z.int().nullable(),
 })
 
+/**
+ * The bulk lookup's projection (`GET /api/images/v5/bulk`): {@link ImagesPlayerDto} plus a
+ * `ClubId`, always null.
+ */
+export const ImagesBulkDto = ImagesPlayerDto.extend({
+	ClubId: z.int().nullable().describe('Always null — images are not filed under clubs'),
+})
+
 /** One entry in the anonymous slideshow feed, joined to its creator and room. */
 export const SlideshowImageDto = z.object({
 	SavedImageId: z.int(),

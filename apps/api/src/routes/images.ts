@@ -20,6 +20,7 @@ import {
 	setImageDescription,
 	SLIDESHOW_LIMIT,
 	SLIDESHOW_MAX_LIMIT,
+	toImagesBulk,
 	toImagesPlayer,
 } from '@repo/domain'
 import { SNIFFED_IMAGE_FORMATS, sniffImage } from '@repo/hono-helpers'
@@ -34,6 +35,7 @@ import {
 	ErrorResponse,
 	form,
 	idParam,
+	ImagesBulkDto,
 	ImagesPlayerDto,
 	intQuery,
 	json,
@@ -615,9 +617,9 @@ export const imageRoutes = new Hono<App>({ strict: false })
 	// with what it asked for; an id with no record (or one that isn't public) is simply
 	// absent, which is why this answers 200 with a short list rather than 404ing the lot.
 	//
-	// Serves the RAW `SavedImage`, like `v6` (metadata by filename) and the room feed — NOT
-	// the `ImagesPlayer` projection the player photo LISTS use. Those are a rendered grid,
-	// where the raw record comes up blank; this is a metadata lookup.
+	// Serves the `ImagesBulk` projection: the player lists' `ImagesPlayer` shape
+	// (`SavedImageId`/`SavedImageType`, no `TaggedPlayerIds`) plus a `ClubId`, always null.
+	// NOT the raw `SavedImage` that `v6` and the room feed serve.
 	//
 	// Public-only, as every image read here is: ids are sequential, so honouring whatever
 	// id is named would hand out private photos to anyone who counts.
@@ -630,12 +632,13 @@ export const imageRoutes = new Hono<App>({ strict: false })
 				'The stored `SavedImage` records for the given ids (`?ids=207&ids=106`), as a bare ' +
 				'array in request order. An id with no record, or one that is not public, is absent ' +
 				'from the answer rather than an error — the list can be shorter than the request. ' +
-				'Serves the raw `SavedImage` (as `v6` does), not the `ImagesPlayer` projection the ' +
-				'player photo lists use.',
+				'Serves the `ImagesPlayer` projection (`SavedImageId`/`SavedImageType`, no ' +
+				'`TaggedPlayerIds`) plus a `ClubId` that is always null — not the raw `SavedImage` ' +
+				'that `v6` serves.',
 			parameters: [
 				intQuery('ids', 'Repeatable; each value may also be a comma-separated list of image ids'),
 			],
-			responses: { 200: json(SavedImageDto.array(), 'The matching records, in request order') },
+			responses: { 200: json(ImagesBulkDto.array(), 'The matching records, in request order') },
 		}),
 		async (c) => {
 			const ids =
@@ -644,7 +647,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 					?.flatMap((raw) => raw.split(','))
 					.map((raw) => Number.parseInt(raw.trim(), 10))
 					.filter((imageId) => !Number.isNaN(imageId)) ?? []
-			return c.json(await getImagesByIds(c.env.DB, ids))
+			return c.json((await getImagesByIds(c.env.DB, ids)).map(toImagesBulk))
 		}
 	)
 
@@ -661,7 +664,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			summary: 'Image metadata by filename',
 			description:
 				'An image’s stored `SavedImage` record for a bucket key — the raw record, as ' +
-				'`v6/{id}` and `v5/bulk` serve, with `Description`, `RoomId` and `PlayerEventId` ' +
+				'`v6/{id}` serves, with `Description`, `RoomId` and `PlayerEventId` ' +
 				'null where the row holds null. 404s when the object exists but has no metadata row.',
 			parameters: [stringQuery('name', 'The image name (bucket key); required')],
 			responses: {
@@ -682,7 +685,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 	//
 	// Serves the RAW 13-key `SavedImage` (`Id`/`Type`, `TaggedPlayerIds`, nulls left null),
 	// which is the type the client decodes this route into — the same record `v6?name=`
-	// serves, and `v5/bulk` a list of. NOT the `ImagesPlayer` projection of the player lists.
+	// serves. NOT the `ImagesPlayer` projection of the player lists.
 	//
 	// Public, or the caller's own: ids are sequential, so anyone else's private photo is a
 	// 404 here, the same as an id that doesn't exist.
@@ -692,7 +695,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			tags: ['Images'],
 			summary: 'One image by id',
 			description:
-				'The stored `SavedImage` record for an image id — the raw record, as `v5/bulk` ' +
+				'The stored `SavedImage` record for an image id — the raw record, as `v6?name=` ' +
 				'serves, with `Description`, `RoomId` and `PlayerEventId` null where the row holds ' +
 				'null. A private image is served only to the player who took it; to anyone else ' +
 				'it is a 404, like an unknown id.',
