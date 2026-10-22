@@ -2852,6 +2852,49 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id IN (2, 3)').run()
 	})
 
+	it('POST/DELETE /rooms/:id/leaderboards/:lid refuse with an HTTP status for 2026', async () => {
+		// 20260323 never reads these bodies, so a 200 `Success: false` would read as success.
+		const as2026 = async (sub: string) => ({
+			...(await bearer(sub, undefined, '20260323.14')),
+		})
+		const body = { leaderboardTitle: 'full name', statFormat: '1', sortAscending: 'False' }
+		const form = new URLSearchParams(body).toString()
+		const send = async (method: string, path: string, headers: Record<string, string>) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method,
+				headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+				...(method === 'POST' && { body: form }),
+			})
+
+		// Unknown room: 404 for 2026, both verbs, never 200 + Success:false.
+		const create = await send('POST', '/rooms/99999/leaderboards/1', await as2026('1'))
+		expect(create.status).toBe(404)
+		expect((await send('DELETE', '/rooms/99999/leaderboards/1', await as2026('1'))).status).toBe(
+			404
+		)
+
+		// 2025 keeps the 200 failure envelope it parses.
+		const legacy = await send(
+			'POST',
+			'/rooms/99999/leaderboards/1',
+			await bearer('1', undefined, '20250718.01')
+		)
+		expect(legacy.status).toBe(200)
+		expect(await legacy.json()).toEqual({
+			Success: false,
+			Error: 'This room does not exist!',
+			error_id: null,
+		})
+
+		// A real create still succeeds for 2026, and the denial paths stay 401/403.
+		expect((await send('POST', '/rooms/2/leaderboards/1', await as2026('1'))).status).toBe(200)
+		expect((await send('POST', '/rooms/2/leaderboards/1', await as2026('999'))).status).toBe(403)
+		// An unconfigured slot is already gone, which is what the delete asked for.
+		expect((await send('DELETE', '/rooms/2/leaderboards/7', await as2026('1'))).status).toBe(200)
+
+		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id = 2').run()
+	})
+
 	it('POST /rooms/:id/experience sets a room’s progression, which the GETs read back', async () => {
 		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
 		const getXp = async (roomId: number, sub?: string) =>

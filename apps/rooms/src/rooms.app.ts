@@ -1128,6 +1128,27 @@ function leaderboardEnvelope(c: Context<App>, error: string | null = null) {
 	return c.json({ Success: error === null, Error: error, error_id: null })
 }
 
+/**
+ * From this build on, the leaderboard slot writes (`POST`/`DELETE
+ * /rooms/:id/leaderboards/:lid`) go through the client's non-generic send and never read the
+ * body. A `200 { Success: false }` therefore reads as SUCCESS, so a refusal has to be an
+ * HTTP status. Older builds parse the envelope and keep getting it on a 200.
+ */
+const STATUS_ONLY_LEADERBOARD_BUILD = '20260323'
+
+/**
+ * A refusal from a leaderboard slot write: `status` for a build at or past
+ * {@link STATUS_ONLY_LEADERBOARD_BUILD}, a 200 failure envelope for the builds before it.
+ * The same envelope rides along as the body either way. Nothing reads it in 2026, but it
+ * costs nothing and shows up in a capture.
+ */
+async function leaderboardRefusal(c: Context<App>, status: 404, error: string) {
+	const build = await authedGameVersion(c)
+	if (build !== null && build >= STATUS_ONLY_LEADERBOARD_BUILD)
+		return c.json({ Success: false, Error: error, error_id: null }, status)
+	return leaderboardEnvelope(c, error)
+}
+
 /** The same bare envelope for the room progression write (`POST /rooms/:id/experience`). */
 const experienceEnvelope = leaderboardEnvelope
 
@@ -3374,14 +3395,22 @@ const app = new Hono<App>()
 				'Answers a bare `{ Success, Error, error_id }` — PascalCase with a lowercase',
 				'`error_id`, like the unprefixed isBanned route, carrying no entity. NOT the room',
 				'mutations’ lowercase `{ success, error, value }`.',
+				'',
+				'From build 20260323 the client never reads the body, so a `200` with `Success: false`',
+				'would read as success: a token for that build or later gets an unknown room as a 404',
+				'instead. Earlier builds still get the 200 failure envelope.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, leaderboardIdParam],
 			requestBody: form(LeaderboardRequest, 'The leaderboard configuration'),
 			responses: {
-				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				200: json(
+					LeaderboardResultEnvelope,
+					'Stored, or (before 20260323) a rejection with `Success: false`'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
@@ -3390,7 +3419,7 @@ const app = new Hono<App>()
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) return leaderboardEnvelope(c, 'This room does not exist!')
+			if (!room) return leaderboardRefusal(c, 404, 'This room does not exist!')
 			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
@@ -3431,7 +3460,10 @@ const app = new Hono<App>()
 				'silent success — the caller asked to undo something that was not there. The client',
 				'deletes slots blindly when tearing boards down and tolerates the refusal.',
 				'',
-				'Answers the same bare `{ Success, Error, error_id }` as the leaderboard write.',
+				'Answers the same bare `{ Success, Error, error_id }` as the leaderboard write. An',
+				'unknown room is a 404 for build 20260323 and later, which never read the body. An',
+				'unconfigured slot stays a 200 for them: the slot is already gone, which is what',
+				'they asked for.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, leaderboardIdParam],
@@ -3439,6 +3471,7 @@ const app = new Hono<App>()
 				200: json(LeaderboardResultEnvelope, 'Removed, or a rejection with `Success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
@@ -3447,11 +3480,15 @@ const app = new Hono<App>()
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) return leaderboardEnvelope(c, 'This room does not exist!')
+			if (!room) return leaderboardRefusal(c, 404, 'This room does not exist!')
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const leaderboardId = Number.parseInt(c.req.param('leaderboardId'), 10)
 			const removed = await deleteRoomLeaderboard(c.env.DB, roomId, leaderboardId)
+			// Deliberately NOT a 404 for 2026: the client tears boards down by deleting every
+			// slot blindly, and an unconfigured slot is already in the state it asked for. The
+			// 2026 client reads this 200 as success, which is the truth. Older builds get the
+			// envelope's refusal, which they tolerate.
 			if (!removed) return leaderboardEnvelope(c, 'This room has no such leaderboard!')
 			return leaderboardEnvelope(c)
 		}
@@ -4949,9 +4986,13 @@ const app = new Hono<App>()
 			parameters: [roomIdParam],
 			requestBody: form(ExperienceRequest, 'The room’s XP settings'),
 			responses: {
-				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				200: json(
+					LeaderboardResultEnvelope,
+					'Stored, or (before 20260323) a rejection with `Success: false`'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
