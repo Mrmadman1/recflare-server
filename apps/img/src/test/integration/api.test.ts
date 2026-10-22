@@ -70,6 +70,43 @@ describe('img endpoints', () => {
 		expect(await res.json()).toEqual({ service: 'img', status: 'ok' })
 	})
 
+	// An upload keeps whatever content-type the uploader claimed, so a stored HTML
+	// document would otherwise render — and run — on this origin. Every response says
+	// `nosniff` and carries a sandboxing CSP so the body is inert whatever it is.
+	it('serves every response with headers that stop a stored HTML upload executing', async () => {
+		const HTML_KEY = 'not-an-image.jpg'
+		await env.IMAGES.put(HTML_KEY, '<script>alert(1)</script>', {
+			httpMetadata: { contentType: 'text/html' },
+		})
+
+		const html = await SELF.fetch(`${ORIGIN}/${HTML_KEY}`)
+		expect(html.status).toBe(200)
+		expect(html.headers.get('x-content-type-options')).toBe('nosniff')
+		expect(html.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox")
+
+		// The stored object, the static asset, the fallback, a resize, and a 304.
+		const paths = [
+			`/${R2_KEY}`,
+			`/${CDN_NAME}`,
+			'/does-not-exist-anywhere.jpg',
+			'/3DCharades.jpg?width=128',
+			'/',
+		]
+		for (const path of paths) {
+			const res = await SELF.fetch(`${ORIGIN}${path}`)
+			expect(res.status, path).toBe(200)
+			expect(res.headers.get('x-content-type-options'), path).toBe('nosniff')
+			expect(res.headers.get('content-security-policy'), path).toBe("default-src 'none'; sandbox")
+		}
+
+		const etag = (await SELF.fetch(`${ORIGIN}/${R2_KEY}`)).headers.get('etag')
+		const notModified = await SELF.fetch(`${ORIGIN}/${R2_KEY}`, {
+			headers: { 'if-none-match': etag! },
+		})
+		expect(notModified.status).toBe(304)
+		expect(notModified.headers.get('x-content-type-options')).toBe('nosniff')
+	})
+
 	it('streams an image stored in R2 with its content type', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/${R2_KEY}`)
 		expect(res.status).toBe(200)
