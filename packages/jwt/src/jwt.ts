@@ -18,7 +18,7 @@ import { GAME_VERSION, gameBuild } from '@repo/domain'
 // last a day so the client doesn't have to refresh it.
 export const TOKEN_TTL_SECONDS = 86400
 
-/** A build host can check component text, but cannot act as an account. */
+/** A build host can validate content and its job's grants, but cannot act as an account. */
 export async function generateStudioBuildValidationToken(
 	buildId: string,
 	secret: string
@@ -39,19 +39,27 @@ export async function validateStudioBuildValidationToken(
 	request: Request,
 	secret: string
 ): Promise<boolean> {
+	return (await studioBuildValidationId(request, secret)) !== null
+}
+
+/** Signed job identity for read-only, job-scoped validation routes. */
+export async function studioBuildValidationId(
+	request: Request,
+	secret: string
+): Promise<string | null> {
 	const header = request.headers.get('Authorization') ?? ''
-	if (!header.startsWith('Bearer ')) return false
+	if (!header.startsWith('Bearer ')) return null
 	try {
 		const payload = await verify(header.slice(7), secret, 'HS256')
-		return (
-			payload.sub === undefined &&
+		return payload.sub === undefined &&
 			payload.aud === 'studio-build-validation' &&
 			payload.scope === 'studio.build.validate' &&
 			typeof payload.buildId === 'string' &&
 			/^[1-9]\d*$/.test(payload.buildId)
-		)
+			? (payload.buildId as string)
+			: null
 	} catch {
-		return false
+		return null
 	}
 }
 

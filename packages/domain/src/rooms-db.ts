@@ -2450,7 +2450,7 @@ const serializeSubRoom = (sub: SubRoom, roomId: number): string => {
  * it.
  */
 const serializeRoom = (room: Room): string => {
-	const { SubRooms: _subRooms, Tags: _tags, Stats: stats, ...rest } = room
+	const { SubRooms: _subRooms, Tags: _tags, Badges: _badges, Stats: stats, ...rest } = room
 	return JSON.stringify({ ...rest, Stats: storedStats(stats) })
 }
 
@@ -2842,8 +2842,31 @@ async function hydrateRooms(db: D1Database, rooms: Room[]): Promise<Room[]> {
 		// game's Nullable<DateTime> decoder and discards the entire owned-room list.
 		if (room.PublishedAt === '') room.PublishedAt = null
 	}
-	await Promise.all([attachSubRooms(db, rooms), attachTags(db, rooms)])
+	await Promise.all([attachSubRooms(db, rooms), attachTags(db, rooms), attachBadges(db, rooms)])
 	return rooms
+}
+
+/** Published room-linked image badges; drafts remain on the creator's Studio shelf. */
+async function attachBadges(db: D1Database, rooms: Room[]): Promise<void> {
+	if (!rooms.length) return
+	// API owns this table's migration; room deployments can precede that migration.
+	const exists = await db
+		.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='custom_avatar_item'")
+		.first()
+	if (!exists) {
+		for (const room of rooms) room.Badges = []
+		return
+	}
+	const rows = await db
+		.prepare(
+			"SELECT data,json_extract(data,'$.CustomBadgeMetadata.RoomId') AS room_id FROM custom_avatar_item WHERE outfit_type=1000 AND accessibility<>0 AND json_array_length(json_extract(data,'$.CurrentSaves'))>0 AND json_extract(data,'$.CustomBadgeMetadata.RoomId') IN (SELECT value FROM json_each(?))"
+		)
+		.bind(JSON.stringify(rooms.map(roomIdOf)))
+		.all<{ data: string; room_id: number }>()
+	for (const room of rooms)
+		room.Badges = rows.results
+			.filter((r) => r.room_id === roomIdOf(room))
+			.map((r) => JSON.parse(r.data))
 }
 
 /** A single subroom of a room (columns authoritative), or null if it doesn't exist. */

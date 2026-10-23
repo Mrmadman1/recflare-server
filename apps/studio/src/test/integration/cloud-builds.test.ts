@@ -8,7 +8,7 @@ import {
 	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
 
-import { CLOUD_JOB_SCHEMA } from '../../cloud-builds'
+import cloudBuilds, { CLOUD_JOB_SCHEMA } from '../../cloud-builds'
 
 import type { Env } from '../../context'
 
@@ -468,3 +468,138 @@ it('does not complete a build whose submitted save was deleted during compilatio
 			.run()
 	}
 })
+
+function builtArtifacts(lease: Awaited<ReturnType<typeof claim>>) {
+	const form = new FormData()
+	form.set('leaseToken', lease.leaseToken)
+	form.set('bundle', new File(['UnityFS\0regression'], 'bundle.assetbundle'))
+	form.set(
+		'artifacts',
+		JSON.stringify([
+			{
+				field: 'bundle',
+				unityAssetId: lease.job.unityAssetId,
+				target: 0,
+				kind: 'main',
+				version: 5,
+			},
+		])
+	)
+	return form
+}
+function finishBuild(
+	lease: Awaited<ReturnType<typeof claim>>,
+	form = builtArtifacts(lease),
+	bindings = env
+) {
+	return cloudBuilds.request(
+		origin + `/internal/cloud-builds/${lease.job.buildId}/finish`,
+		{ method: 'POST', headers: worker, body: form },
+		bindings
+	)
+}
+it.each(['before finish', 'before transaction'])(
+	'rejects removed room co-owner authority %s without linking or publishing',
+	async (timing) => {
+		const prior = await env.DB.prepare('SELECT data FROM room WHERE room_id=3000').first<{
+			data: string
+		}>()
+		const originalSave = await env.DB.prepare(
+			'SELECT data FROM subroom_save WHERE sub_room_data_save_id=3002'
+		).first<{ data: string }>()
+		await env.DB.prepare("UPDATE room SET data=json_set(data,'$.Roles',json(?)) WHERE room_id=3000")
+			.bind(JSON.stringify([{ AccountId: 43, Role: 30 }]))
+			.run()
+		await create(43, true, { autoPublish: 'true' })
+		const lease = await claim()
+		const revoke = () =>
+			env.DB.prepare(
+				"UPDATE room SET data=json_set(data,'$.Roles',json('[]')) WHERE room_id=3000"
+			).run()
+		if (timing === 'before finish') await revoke()
+		const DB = new Proxy(env.DB, {
+			get(target, key) {
+				if (key === 'batch')
+					return async (statements: D1PreparedStatement[]) => {
+						await revoke()
+						return target.batch(statements)
+					}
+				const value = Reflect.get(target, key)
+				return typeof value === 'function' ? value.bind(target) : value
+			},
+		})
+		try {
+			expect((await finishBuild(lease, builtArtifacts(lease), { ...env, DB })).status).toBe(409)
+			expect(
+				await env.DB.prepare(
+					'SELECT data FROM subroom_save WHERE sub_room_data_save_id=3002'
+				).first()
+			).toEqual(originalSave)
+			expect(
+				await env.DB.prepare('SELECT unity_asset_id FROM unity_asset WHERE unity_asset_id=?')
+					.bind(lease.job.unityAssetId)
+					.first()
+			).toBeNull()
+			expect(
+				await env.DB.prepare('SELECT status FROM studio_cloud_build_job WHERE cloud_build_id=?')
+					.bind(lease.job.buildId)
+					.first()
+			).toEqual({ status: 'failed' })
+			expect(
+				await env.CDN_ASSETS.get(
+					`roomunityasset/studio-builds/${lease.job.buildId}/server-data.json`
+				)
+			).toBeNull()
+			expect(
+				(await env.CDN_ASSETS.list({ prefix: `room/studio/3000/${lease.job.unityAssetId}` }))
+					.objects
+			).toEqual([])
+		} finally {
+			await env.DB.prepare('UPDATE room SET data=? WHERE room_id=3000').bind(prior!.data).run()
+		}
+	}
+)
+it.each(['expired lease', 'deleted save'])(
+	'cleans uploaded artifacts when final publication finds %s',
+	async (condition) => {
+		await create()
+		const lease = await claim()
+		const save = await env.DB.prepare(
+			'SELECT data FROM subroom_save WHERE sub_room_data_save_id=3002'
+		).first<{ data: string }>()
+		const DB = new Proxy(env.DB, {
+			get(target, key) {
+				if (key === 'batch')
+					return async (statements: D1PreparedStatement[]) => {
+						if (condition === 'expired lease')
+							await target
+								.prepare("UPDATE studio_cloud_build_job SET lease_until='2000-01-01'")
+								.run()
+						else
+							await target
+								.prepare('DELETE FROM subroom_save WHERE sub_room_data_save_id=3002')
+								.run()
+						return target.batch(statements)
+					}
+				const value = Reflect.get(target, key)
+				return typeof value === 'function' ? value.bind(target) : value
+			},
+		})
+		try {
+			expect((await finishBuild(lease, builtArtifacts(lease), { ...env, DB })).status).toBe(409)
+			expect(
+				await env.DB.prepare('SELECT unity_asset_id FROM unity_asset WHERE unity_asset_id=?')
+					.bind(lease.job.unityAssetId)
+					.first()
+			).toBeNull()
+			expect(
+				await env.CDN_ASSETS.get(
+					`roomunityasset/studio-builds/${lease.job.buildId}/server-data.json`
+				)
+			).toBeNull()
+		} finally {
+			if (condition === 'deleted save')
+				await env.DB.prepare('INSERT INTO subroom_save VALUES (3002,3001,?)').bind(save!.data).run()
+		}
+	}
+)

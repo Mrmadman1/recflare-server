@@ -7,6 +7,7 @@ export {
 	generateToken,
 	generateStudioBuildValidationToken,
 	validateStudioBuildValidationToken,
+	studioBuildValidationId,
 	generatePhotonAuthToken,
 	TOKEN_TTL_SECONDS,
 } from './jwt'

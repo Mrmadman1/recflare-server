@@ -96,5 +96,20 @@ allocated asset IDs and requested platforms are accepted. SDK bundle version 5
 is retained. Completion links the submitted save; auto-publish does not replace
 a newer draft. Failed, cancelled, or expired jobs never become successful builds.
 Claims include a signed, short-lived SDK validation token with no account subject
-or roles. Deploy the paired API support: only bulk component-text validation
-accepts this credential. It cannot authenticate as an account or publish a room.
+or roles. Bulk component-text validation and job-scoped grant reads accept this
+credential. It cannot authenticate as an account or publish a room.
+
+## Avatar Studio and consumable validation
+
+Avatar authoring uses per-account Studio grants, source revisions, and the managed
+cloud queue. Apply `migrations/0004_avatar_studio.sql` to the shared database before
+enabling these routes. The API owns creator saves and explicit publication; the
+Studio service queues prefab builds and returns per-platform main/stripped bundles
+at version 5 and material bundles at version 6. Image badges publish directly.
+Changed body/configuration inputs receive distinct output IDs, and automatic
+publication cannot replace a newer revision. Deploy the paired cloud-building
+worker for prefab support; restricted validation credentials grant no account role.
+
+The SDK's access override reads the target account's entitlement. Build-validation
+credentials can inspect only the current owners of their active job's room; peers
+can inspect grants only while they currently manage the same room.

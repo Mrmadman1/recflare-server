@@ -21,6 +21,27 @@ beforeAll(async () => {
 // storage worker's validation accepts it.
 const TEST_SECRET = 'test-signing-key'
 
+it('stores avatar source and baked uploads with immutable account ownership metadata', async () => {
+	for (const [type, prefix] of [
+		[13, 'avatar'],
+		[14, 'avatarunityasset'],
+	] as const) {
+		const form = new FormData()
+		form.set('fileType', String(type))
+		form.set('file', new File(['avatar source'], 'source.bin'))
+		const r = await SELF.fetch(ORIGIN + '/upload', {
+			method: 'POST',
+			headers: { ...(await bearer()), 'User-Agent': 'RRStudio' },
+			body: form,
+		})
+		expect(r.status).toBe(200)
+		const body = await r.json<{ Filename: string; Hash: string }>()
+		expect(body.Hash).toBeTruthy()
+		const object = await env.CDN_ASSETS.head(prefix + '/' + body.Filename)
+		expect(object?.customMetadata?.ownerId).toBe('42')
+	}
+})
+
 function b64url(input: ArrayBuffer | string): string {
 	const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : new Uint8Array(input)
 	let binary = ''

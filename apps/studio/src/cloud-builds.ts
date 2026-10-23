@@ -1,11 +1,18 @@
 import { Hono } from 'hono'
 
 import {
+	AVATAR_STUDIO_SLOTS,
+	avatarItemAccessBit,
+	avatarStudioFlags,
+	avatarStudioItem,
+	avatarStudioSave,
+	canManageRoom,
 	canManageRoomById,
 	getRoomById,
 	getSubRoom,
 	getSubRoomSaveById,
 	publicStudioBundleFilename,
+	publishAvatarSave,
 	studioBundleR2Key,
 } from '@repo/domain'
 import {
@@ -16,6 +23,7 @@ import {
 
 import { parseMultipart } from './multipart'
 
+import type { Context } from 'hono'
 import type { App } from './context'
 
 export const CLOUD_JOB_SCHEMA = `CREATE TABLE IF NOT EXISTS studio_cloud_build_job (
@@ -23,6 +31,20 @@ export const CLOUD_JOB_SCHEMA = `CREATE TABLE IF NOT EXISTS studio_cloud_build_j
  lease_token TEXT, lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
 )`
 interface Job {
+	kind?: 'avatar'
+	avatarItemId?: string
+	avatar?: {
+		itemId: string
+		outfitType: number
+		bodyType: number
+		configuration: string
+		name: string
+		createdAt: string
+		price: number
+		creatorAccountId: number
+		canCreateRoomieEquipment: boolean
+		permittedItemTypes: number[]
+	}
 	buildId: string
 	roomId: number
 	subRoomId: number
@@ -34,7 +56,8 @@ interface Job {
 	targets: number[]
 	manifest: {
 		Version: number
-		MainSceneProjectRelativePath: string
+		MainSceneProjectRelativePath?: string
+		MainPrefabProjectRelativePath?: string
 		ExportPartitionVersion: number
 		Files: Array<{ n: string; p: string; g?: string }>
 		Exports?: Array<{ e: string; d?: string[] }>
@@ -51,6 +74,7 @@ const ok = (value: unknown) => ({ success: true, error: null, value })
 const fail = (error: string) => ({ success: false, error, value: null })
 const ID = /^[1-9]\d*$/
 const guid = () => crypto.randomUUID()
+const textField = (value: unknown, fallback = '') => (typeof value === 'string' ? value : fallback)
 interface Artifact {
 	field: string
 	unityAssetId: string
@@ -84,7 +108,6 @@ interface CloudBuildRecord {
 	unity_asset_id: string
 	created_by_account_id: number
 }
-const textField = (value: unknown, fallback = '') => (typeof value === 'string' ? value : fallback)
 function wire(row: CloudBuildRecord) {
 	return {
 		cloudBuildId: row.cloud_build_id,
@@ -116,7 +139,48 @@ async function pendingBuild(db: D1Database, roomId: number, subRoomId: number, s
 		.bind(roomId, subRoomId, saveId)
 		.first<CloudBuildRecord>()
 }
+async function pendingAvatarBuild(db: D1Database, itemId: string, saveId: number) {
+	return db
+		.prepare(
+			"SELECT b.* FROM studio_cloud_build b JOIN studio_avatar_build a USING(cloud_build_id) JOIN studio_cloud_build_job j USING(cloud_build_id) WHERE a.item_id=? AND a.save_id=? AND j.status IN ('queued','building','publishing') LIMIT 1"
+		)
+		.bind(itemId, saveId)
+		.first<CloudBuildRecord>()
+}
 const app = new Hono<App>()
+	.get('/cloud-builds/custom-avatar-item/:itemId{[0-9a-fA-F-]{36}}', async (c) => {
+		const id = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+		if (id === null) return c.body(null, 401)
+		const item = await avatarStudioItem(c.env.DB, c.req.param('itemId'))
+		if (!item || item.CreatorAccountId !== id) return c.body(null, 403)
+		const skip = Math.max(0, Number(c.req.query('skip')) || 0),
+			take = Math.min(10000, Math.max(1, Number(c.req.query('take')) || 100))
+		const { results } = await c.env.DB.prepare(
+			'SELECT b.* FROM studio_cloud_build b JOIN studio_avatar_build a USING(cloud_build_id) WHERE a.item_id=? ORDER BY b.started_at DESC'
+		)
+			.bind(item.CustomAvatarItemId)
+			.all<CloudBuildRecord>()
+		return c.json({
+			results: results.slice(skip, skip + take).map(wire),
+			totalResults: results.length,
+		})
+	})
+	.post(
+		'/cloud-builds/custom-avatar-item/:itemId{[0-9a-fA-F-]{36}}/save/:saveId{[1-9][0-9]*}',
+		(c) => enqueueAvatar(c, c.req.param('itemId'), Number(c.req.param('saveId')))
+	)
+	.post('/cloud-builds/custom-avatar-item/create-for-new-build-version', async (c) => {
+		const form = await c.req.parseBody()
+		const itemId = String(form.customAvatarItemId ?? ''),
+			assetId = String(form.unityAssetId ?? '')
+		const row = await c.env.DB.prepare(
+			'SELECT id FROM avatar_studio_save WHERE item_id=? AND unity_asset_id=? ORDER BY id DESC LIMIT 1'
+		)
+			.bind(itemId, assetId)
+			.first<{ id: number }>()
+		if (!row) return c.notFound()
+		return enqueueAvatar(c, itemId, row.id, form)
+	})
 	.post('/cloud-builds/create', async (c) => {
 		const secret = await c.env.JWT_SECRET.get()
 		const accountId = await validateAndGetAccountId(c.req.raw, secret)
@@ -272,11 +336,16 @@ const app = new Hono<App>()
 		const form = await c.req.parseBody()
 		const id = textField(form.cloudBuildId)
 		const row = await c.env.DB.prepare(
-			'SELECT room_id FROM studio_cloud_build WHERE cloud_build_id = ?'
+			'SELECT room_id,created_by_account_id FROM studio_cloud_build WHERE cloud_build_id = ?'
 		)
 			.bind(id)
-			.first<{ room_id: number }>()
-		if (!row || !(await canManageRoomById(c.env.DB, row.room_id, accountId)))
+			.first<{ room_id: number; created_by_account_id: number }>()
+		if (
+			!row ||
+			!(row.room_id === 0
+				? row.created_by_account_id === accountId
+				: await canManageRoomById(c.env.DB, row.room_id, accountId))
+		)
 			return c.json(fail('No accessible build.'), 404)
 		await c.env.DB.batch([
 			c.env.DB.prepare(
@@ -325,17 +394,13 @@ const app = new Hono<App>()
 	})
 	.post('/internal/cloud-builds/:id/heartbeat', async (c) => {
 		const { leaseToken } = await c.req.json<{ leaseToken: string }>()
+		const leaseUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString()
 		const result = await c.env.DB.prepare(
 			"UPDATE studio_cloud_build_job SET lease_until=? WHERE cloud_build_id=? AND lease_token=? AND status IN ('building','publishing') AND lease_until>?"
 		)
-			.bind(
-				new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-				c.req.param('id'),
-				leaseToken,
-				new Date().toISOString()
-			)
+			.bind(leaseUntil, c.req.param('id'), leaseToken, new Date().toISOString())
 			.run()
-		return c.json({ active: result.meta.changes > 0 })
+		return c.json(result.meta.changes > 0 ? { active: true, leaseUntil } : { active: false })
 	})
 	.post('/internal/cloud-builds/:id/finish', async (c) => {
 		const form = await parseMultipart(c.req.raw)
@@ -359,6 +424,26 @@ const app = new Hono<App>()
 			])
 			return c.json(ok(null))
 		}
+		if (job.kind === 'avatar') {
+			const item = await avatarStudioItem(c.env.DB, job.avatarItemId!)
+			const save = await avatarStudioSave(c.env.DB, job.avatarItemId!, job.saveId)
+			if (
+				!item ||
+				!save ||
+				item.CreatorAccountId !== job.accountId ||
+				!((await avatarStudioFlags(c.env.DB, job.accountId)) & avatarItemAccessBit(item.OutfitType))
+			) {
+				await c.env.DB.batch([
+					c.env.DB.prepare(
+						"UPDATE studio_cloud_build_job SET status='failed',lease_token=NULL WHERE cloud_build_id=? AND lease_token=? AND status='building'"
+					).bind(id, lease.lease_token),
+					c.env.DB.prepare(
+						"UPDATE studio_cloud_build SET completed_at=?,error='Avatar source or authorization was removed.' WHERE cloud_build_id=? AND completed_at=''"
+					).bind(new Date().toISOString(), id),
+				])
+				return c.json(fail('Avatar source or authorization was removed.'), 409)
+			}
+		}
 		const assets = new Set([job.unityAssetId, ...job.exports.map((item) => item.u)])
 		let entries: unknown
 		try {
@@ -368,7 +453,10 @@ const app = new Hono<App>()
 		}
 		if (!Array.isArray(entries) || !entries.every(isArtifact))
 			return c.json(fail('Invalid build artifact metadata.'), 400)
-		if (!entries.length || entries.length > assets.size * job.targets.length * 2)
+		if (
+			!entries.length ||
+			entries.length > assets.size * job.targets.length * (job.kind === 'avatar' ? 3 : 2)
+		)
 			return c.json(fail('Missing build artifacts.'), 400)
 		const seen = new Set<string>()
 		for (const entry of entries) {
@@ -377,8 +465,10 @@ const app = new Hono<App>()
 			if (
 				!assets.has(entry.unityAssetId) ||
 				!job.targets.includes(entry.target) ||
-				!['main', 'stripped'].includes(entry.kind) ||
-				entry.version !== 5 ||
+				!(job.kind === 'avatar' ? ['main', 'stripped', 'material'] : ['main', 'stripped']).includes(
+					entry.kind
+				) ||
+				entry.version !== (job.kind === 'avatar' && entry.kind === 'material' ? 6 : 5) ||
 				!(file instanceof File) ||
 				file.size === 0 ||
 				seen.has(key)
@@ -390,6 +480,11 @@ const app = new Hono<App>()
 			for (const target of job.targets)
 				if (!seen.has(`${asset}:${target}:main`))
 					return c.json(fail('A required asset bundle is missing.'), 400)
+		if (
+			job.kind === 'avatar' &&
+			job.targets.some((target) => !seen.has(`${job.unityAssetId}:${target}:material`))
+		)
+			return c.json(fail('An avatar material bundle is missing.'), 400)
 		const writes: D1PreparedStatement[] = []
 		for (const entry of entries) {
 			const file = form[entry.field] as File
@@ -416,8 +511,11 @@ const app = new Hono<App>()
 					entry.target === 2 ? 'android' : 'windows',
 					entry.kind
 				)
-				const filename = baseFilename.replace('.assetbundle', `.${lease.lease_token}.assetbundle`)
-				const key = studioBundleR2Key(filename)
+				const filename =
+					job.kind === 'avatar'
+						? `${entry.target === 2 ? 'quest/' : ''}studio-avatar/${job.avatarItemId}/${entry.unityAssetId}/${lease.lease_token}.${entry.kind}.assetbundle`
+						: baseFilename.replace('.assetbundle', `.${lease.lease_token}.assetbundle`)
+				const key = job.kind === 'avatar' ? `avatar/${filename}` : studioBundleR2Key(filename)
 				await c.env.CDN_ASSETS.put(key, bytes)
 				keys.push(key)
 				writes.push(
@@ -439,48 +537,52 @@ const app = new Hono<App>()
 			await c.env.CDN_ASSETS.put(serverDataKey, JSON.stringify({ Exports: job.exports }))
 			keys.push(serverDataKey)
 			// The exact submitted save is linked; a newer draft must never be replaced.
-			writes.push(
-				c.env.DB.prepare(
-					"UPDATE subroom_save SET data=json_set(data,'$.UnityAssetId',?,'$.ServerData',json(?)) WHERE sub_room_data_save_id=? AND sub_room_id=? AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')"
-				).bind(
-					job.unityAssetId,
-					JSON.stringify({ Exports: job.exports }),
-					job.saveId,
-					job.subRoomId,
-					id,
-					lease.lease_token
-				)
-			)
-			writes.push(
-				c.env.DB.prepare(
-					`UPDATE room SET data=json_set(data,'$.BecameRRStudioRoomAt',?)
-					 WHERE room_id=? AND json_type(data,'$.BecameRRStudioRoomAt') IS NOT 'text'
-					 AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')`
-				).bind(new Date().toISOString(), job.roomId, id, lease.lease_token)
-			)
-			if (job.autoPublish) {
-				// Test and update the staging slot in the same statement. A draft saved
-				// during compilation must not be replaced by this build's older save.
+			if (job.kind !== 'avatar')
 				writes.push(
 					c.env.DB.prepare(
-						`UPDATE subroom SET current_save_id=?,
-						 staged_save_id=CASE WHEN staged_save_id=? THEN NULL ELSE staged_save_id END
-						 WHERE room_id=? AND sub_room_id=? AND COALESCE(staged_save_id,current_save_id)=?
-						 AND EXISTS (SELECT 1 FROM subroom_save WHERE sub_room_data_save_id=? AND sub_room_id=?)
-						 AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')`
+						"UPDATE subroom_save SET data=json_set(data,'$.UnityAssetId',?,'$.ServerData',json(?)) WHERE sub_room_data_save_id=? AND sub_room_id=? AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')"
 					).bind(
-						job.saveId,
-						job.saveId,
-						job.roomId,
-						job.subRoomId,
-						job.saveId,
+						job.unityAssetId,
+						JSON.stringify({ Exports: job.exports }),
 						job.saveId,
 						job.subRoomId,
 						id,
 						lease.lease_token
 					)
 				)
+			if (job.kind !== 'avatar') {
+				writes.push(
+					c.env.DB.prepare(
+						`UPDATE room SET data=json_set(data,'$.BecameRRStudioRoomAt',?)
+					 WHERE room_id=? AND json_type(data,'$.BecameRRStudioRoomAt') IS NOT 'text'
+					 AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')`
+					).bind(new Date().toISOString(), job.roomId, id, lease.lease_token)
+				)
+				if (job.autoPublish) {
+					// Test and update the staging slot in the same statement. A draft saved
+					// during compilation must not be replaced by this build's older save.
+					writes.push(
+						c.env.DB.prepare(
+							`UPDATE subroom SET current_save_id=?,
+						 staged_save_id=CASE WHEN staged_save_id=? THEN NULL ELSE staged_save_id END
+						 WHERE room_id=? AND sub_room_id=? AND COALESCE(staged_save_id,current_save_id)=?
+						 AND EXISTS (SELECT 1 FROM subroom_save WHERE sub_room_data_save_id=? AND sub_room_id=?)
+						 AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')`
+						).bind(
+							job.saveId,
+							job.saveId,
+							job.roomId,
+							job.subRoomId,
+							job.saveId,
+							job.saveId,
+							job.subRoomId,
+							id,
+							lease.lease_token
+						)
+					)
+				}
 			}
+
 			writes.push(
 				c.env.DB.prepare(
 					"UPDATE studio_cloud_build SET completed_at=?,error=NULL WHERE cloud_build_id=? AND EXISTS (SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND lease_token=? AND status='publishing')"
@@ -491,20 +593,42 @@ const app = new Hono<App>()
 					"UPDATE studio_cloud_build_job SET status='completed',lease_token=NULL WHERE cloud_build_id=? AND lease_token=? AND status='publishing'"
 				).bind(id, lease.lease_token)
 			)
-			// Recheck the lease and target inside the publication transaction. R2
-			// uploads can outlast a lease, and a room can be deleted while compiling.
+			// Recheck authority, lease and target inside the final publication transaction.
 			const publicationTime = new Date().toISOString()
+			const roomRow =
+				job.kind !== 'avatar'
+					? await c.env.DB.prepare('SELECT data FROM room WHERE room_id=?')
+							.bind(job.roomId)
+							.first<{ data: string }>()
+					: null
+			const authorizedRoom =
+				roomRow && canManageRoom(JSON.parse(roomRow.data), job.accountId) ? roomRow.data : null
+			const targetExists =
+				job.kind === 'avatar'
+					? `SELECT 1 FROM avatar_studio_save s JOIN custom_avatar_item i ON i.custom_avatar_item_id=s.item_id
+				 JOIN avatar_studio_access a ON a.account_id=json_extract(i.data,'$.CreatorAccountId')
+				 WHERE s.id=? AND s.item_id=? AND s.unity_asset_id=? AND a.account_id=? AND (a.flags & ?)<>0`
+					: `SELECT 1 FROM subroom_save s JOIN subroom r ON r.sub_room_id=s.sub_room_id
+				 JOIN room ON room.room_id=r.room_id
+				 WHERE s.sub_room_data_save_id=? AND s.sub_room_id=? AND r.room_id=? AND room.data=?`
+			const targetBindings =
+				job.kind === 'avatar'
+					? [
+							job.saveId,
+							job.avatarItemId!,
+							job.unityAssetId,
+							job.accountId,
+							avatarItemAccessBit(job.avatar!.outfitType),
+						]
+					: [job.saveId, job.subRoomId, job.roomId, authorizedRoom]
 			const results = await c.env.DB.batch([
 				c.env.DB.prepare(
 					`UPDATE studio_cloud_build_job SET status='failed',lease_token=NULL
 					 WHERE cloud_build_id=? AND lease_token=? AND status='publishing'
-					 AND (lease_until<=? OR NOT EXISTS (
-					 SELECT 1 FROM subroom_save s JOIN subroom r ON r.sub_room_id=s.sub_room_id
-					 JOIN room ON room.room_id=r.room_id
-					 WHERE s.sub_room_data_save_id=? AND s.sub_room_id=? AND r.room_id=?))`
-				).bind(id, lease.lease_token, publicationTime, job.saveId, job.subRoomId, job.roomId),
+					 AND (lease_until<=? OR NOT EXISTS (${targetExists}))`
+				).bind(id, lease.lease_token, publicationTime, ...targetBindings),
 				c.env.DB.prepare(
-					`UPDATE studio_cloud_build SET completed_at=?,error='Build lease expired or target save removed.'
+					`UPDATE studio_cloud_build SET completed_at=?,error='Build lease expired or target authorization/save removed.'
 					 WHERE cloud_build_id=? AND completed_at='' AND EXISTS (
 					 SELECT 1 FROM studio_cloud_build_job WHERE cloud_build_id=? AND status='failed')`
 				).bind(publicationTime, id, id),
@@ -512,7 +636,7 @@ const app = new Hono<App>()
 			])
 			if (!results[results.length - 1].meta.changes) {
 				await Promise.all(keys.map((key) => c.env.CDN_ASSETS.delete(key)))
-				return c.json(fail('Build lease expired or target save removed.'), 409)
+				return c.json(fail('Build lease expired or target authorization/save removed.'), 409)
 			}
 		} catch (error) {
 			await Promise.all(keys.map((key) => c.env.CDN_ASSETS.delete(key)))
@@ -523,6 +647,156 @@ const app = new Hono<App>()
 				.run()
 			throw error
 		}
+		if (job.kind === 'avatar') {
+			const item = await avatarStudioItem(c.env.DB, job.avatarItemId!)
+			const save = await avatarStudioSave(c.env.DB, job.avatarItemId!, job.saveId)
+			if (
+				item &&
+				save &&
+				(job.autoPublish || (item.Accessibility === 0 && save.update_current === 1))
+			) {
+				await publishAvatarSave(c.env.DB, item.CustomAvatarItemId, save.id, true)
+			}
+			return c.json(ok(null))
+		}
+
 		return c.json(ok(null))
 	})
 export default app
+
+async function enqueueAvatar(
+	c: Context<App>,
+	itemId: string,
+	saveId: number,
+	supplied?: Record<string, unknown>
+) {
+	const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+	if (accountId === null) return c.body(null, 401)
+	const item = await avatarStudioItem(c.env.DB, itemId),
+		save = await avatarStudioSave(c.env.DB, itemId, saveId)
+	if (!item || !save) return c.notFound()
+	if (item.OutfitType === 1000)
+		return c.json(fail('Badge images publish directly and do not require a Unity build.'), 400)
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	if (
+		item.CreatorAccountId !== accountId ||
+		!roles?.includes('betastudio') ||
+		!((await avatarStudioFlags(c.env.DB, accountId)) & avatarItemAccessBit(item.OutfitType))
+	)
+		return c.body(null, 403)
+	if (!c.env.CLOUD_BUILD_KEY) return c.json(fail('Cloud building is not configured.'), 503)
+	const pending = await pendingAvatarBuild(c.env.DB, itemId, saveId)
+	if (pending) return c.json(ok(wire(pending)))
+	const object = await c.env.CDN_ASSETS.get('avatarunityasset/' + save.source_filename)
+	if (!object || object.size > 8 * 1024 * 1024)
+		return c.json(fail('Missing or oversized avatar source manifest.'), 400)
+	let manifest: Job['manifest']
+	try {
+		manifest = await object.json<Job['manifest']>()
+	} catch {
+		return c.json(fail('Invalid source manifest JSON.'), 400)
+	}
+	const main = manifest?.MainPrefabProjectRelativePath
+	if (
+		!manifest ||
+		manifest.Version !== 3 ||
+		typeof main !== 'string' ||
+		!main.startsWith('Assets/') ||
+		!main.endsWith('.prefab') ||
+		!Array.isArray(manifest.Files) ||
+		!manifest.Files.length ||
+		manifest.Files.length > 100000 ||
+		!manifest.Files.some((f) => f?.p === main) ||
+		manifest.Files.some(
+			(f) =>
+				!f ||
+				typeof f.p !== 'string' ||
+				!/^(Assets|Packages)\//.test(f.p) ||
+				f.p.includes('\\') ||
+				f.p.includes(':') ||
+				f.p
+					.split('/')
+					.some(
+						(p) => p === '..' || p === '.' || p === '' || p.toLowerCase().endsWith('.bundle')
+					) ||
+				/\.(cs|dll|exe|so|dylib|rsp|asmdef|asmref)$/i.test(f.p) ||
+				!/^[a-z0-9]{40}$/.test(f.n)
+		) ||
+		new Set(manifest.Files.map((f) => f.p.toLowerCase())).size !== manifest.Files.length
+	)
+		return c.json(fail('Invalid avatar source file manifest.'), 400)
+	const form = supplied ?? (await c.req.parseBody())
+	if (form.pipelineVersion !== undefined && String(form.pipelineVersion) !== '2')
+		return c.json(fail('Unsupported avatar build pipeline.'), 400)
+	const targets = (c.env.CLOUD_BUILD_TARGETS ?? '0,2').split(',').map(Number)
+	if (!targets.length || targets.some((t) => t !== 0 && t !== 2))
+		return c.json(fail('Invalid build targets.'), 503)
+	const access = await avatarStudioFlags(c.env.DB, accountId)
+	const permittedItemTypes = AVATAR_STUDIO_SLOTS.filter(
+		(slot) =>
+			(access & avatarItemAccessBit(slot)) !== 0 &&
+			(![104, 203].includes(slot) || roles.includes('developer'))
+	)
+	const job: Job = {
+		kind: 'avatar',
+		avatarItemId: itemId,
+		avatar: {
+			itemId,
+			outfitType: item.OutfitType,
+			bodyType: save.body_type,
+			configuration: save.configuration,
+			name: String(item.Name ?? ''),
+			createdAt: save.created_at,
+			price: Number(item.Price ?? 0),
+			creatorAccountId: accountId,
+			canCreateRoomieEquipment: roles.includes('developer'),
+			permittedItemTypes,
+		},
+		buildId: numericId(),
+		roomId: 0,
+		subRoomId: 0,
+		saveId,
+		accountId,
+		unityAssetId: save.unity_asset_id,
+		autoPublish: textField(form.autoPublish).toLowerCase() === 'true',
+		templateVersion: Number(c.env.CLOUD_BUILD_TEMPLATE_VERSION ?? 169),
+		targets,
+		manifest,
+		room: null,
+		exports: [],
+	}
+	const now = new Date().toISOString()
+	// As for rooms, reserve the build and its queue/link rows in one transaction.
+	const created = await c.env.DB.batch([
+		c.env.DB.prepare(
+			`INSERT INTO studio_cloud_build(cloud_build_id,room_id,sub_room_id,sub_room_data_save_id,unity_asset_id,created_by_account_id,started_at,completed_at,error)
+			 SELECT ?,0,0,?,?,?,?,'',NULL WHERE NOT EXISTS (
+			 SELECT 1 FROM studio_avatar_build a JOIN studio_cloud_build_job j USING(cloud_build_id)
+			 WHERE a.item_id=? AND a.save_id=? AND j.status IN ('queued','building','publishing'))`
+		).bind(job.buildId, saveId, job.unityAssetId, accountId, now, itemId, saveId),
+		c.env.DB.prepare(
+			'INSERT INTO studio_avatar_build(cloud_build_id,item_id,save_id) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM studio_cloud_build WHERE cloud_build_id=?)'
+		).bind(job.buildId, itemId, saveId, job.buildId),
+		c.env.DB.prepare(
+			'INSERT INTO studio_cloud_build_job(cloud_build_id,payload,created_at) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM studio_cloud_build WHERE cloud_build_id=?)'
+		).bind(job.buildId, JSON.stringify(job), now, job.buildId),
+	])
+	if (!created[0].meta.changes) {
+		const existing = await pendingAvatarBuild(c.env.DB, itemId, saveId)
+		return existing
+			? c.json(ok(wire(existing)))
+			: c.json(fail('Build state changed; retry creation.'), 409)
+	}
+	return c.json(
+		ok(
+			wire({
+				cloud_build_id: job.buildId,
+				started_at: now,
+				completed_at: null,
+				unity_asset_id: job.unityAssetId,
+				created_by_account_id: accountId,
+				error: null,
+			})
+		)
+	)
+}

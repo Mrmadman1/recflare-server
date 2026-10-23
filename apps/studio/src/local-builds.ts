@@ -109,22 +109,29 @@ export async function getUserBuildCount(
 	const end = new Date(start.getTime() + 60 * 60 * 1000)
 	const row = await db
 		.prepare(
-			`SELECT COUNT(*) AS total,
-			        SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS failed
+			`SELECT SUM(CASE WHEN room_id!=0 THEN 1 ELSE 0 END) AS total,
+			        SUM(CASE WHEN room_id!=0 AND error IS NOT NULL THEN 1 ELSE 0 END) AS failed,
+			        SUM(CASE WHEN room_id=0 THEN 1 ELSE 0 END) AS avatar_total,
+			        SUM(CASE WHEN room_id=0 AND error IS NOT NULL THEN 1 ELSE 0 END) AS avatar_failed
 			 FROM studio_cloud_build
 			 WHERE created_by_account_id = ?1
 			   AND started_at >= ?2 AND started_at < ?3`
 		)
 		.bind(accountId, start.toISOString(), end.toISOString())
-		.first<{ total: number | string; failed: number | string | null }>()
+		.first<{
+			total: number | string
+			failed: number | string | null
+			avatar_total: number | null
+			avatar_failed: number | null
+		}>()
 	return {
 		accountId,
 		startTime: start.toISOString(),
 		endTime: end.toISOString(),
 		subRoomTotalBuildCount: Number(row?.total ?? 0),
 		subRoomFailedBuildCount: Number(row?.failed ?? 0),
-		avatarItemTotalBuildCount: 0,
-		avatarItemFailedBuildCount: 0,
+		avatarItemTotalBuildCount: Number(row?.avatar_total ?? 0),
+		avatarItemFailedBuildCount: Number(row?.avatar_failed ?? 0),
 	}
 }
 

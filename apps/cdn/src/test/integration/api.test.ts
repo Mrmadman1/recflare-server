@@ -12,6 +12,32 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+test('serves opaque avatar source manifests and SDK avatar bundle GET/HEAD/ranges', async () => {
+	const source = '2026-10-18/11111111-1111-1111-1111-111111111111'
+	await env.CDN_ASSETS.put('avatarunityasset/' + source, '{"Version":3}')
+	expect(await (await exports.default.fetch(ORIGIN + '/avatarunityasset/' + source)).text()).toBe(
+		'{"Version":3}'
+	)
+	await env.DB.prepare(
+		'CREATE TABLE IF NOT EXISTS unity_asset(unity_asset_id TEXT NOT NULL,target INTEGER NOT NULL,version INTEGER NOT NULL,kind TEXT NOT NULL,filename TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(unity_asset_id,target,version,kind))'
+	).run()
+	const name = 'quest/studio-avatar/test/item/lease.material.assetbundle'
+	await env.DB.prepare(
+		'INSERT INTO unity_asset(unity_asset_id,target,version,kind,filename,hash) VALUES (?,2,6,?,?,?)'
+	)
+		.bind('avatar-fixture', 'material', name, 'hash')
+		.run()
+	await env.CDN_ASSETS.put('avatar/' + name, 'UnityFS\0avatar')
+	expect(
+		(await exports.default.fetch(ORIGIN + '/unityasset/' + name, { method: 'HEAD' })).status
+	).toBe(200)
+	const response = await exports.default.fetch(ORIGIN + '/unityasset/' + name, {
+		headers: { Range: 'bytes=0-7' },
+	})
+	expect(response.status).toBe(206)
+	expect(await response.text()).toBe('UnityFS\0')
+})
+
 describe('cdn endpoints', () => {
 	test('GET / reports service status', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/`)
@@ -357,6 +383,18 @@ describe('cdn endpoints', () => {
 		expect(head.status).toBe(200)
 		expect(head.headers.get('content-length')).toBe('4')
 		expect(await head.arrayBuffer()).toEqual(new ArrayBuffer(0))
+		// Current room/consumable builds live in the game's room namespace.
+		await env.CDN_ASSETS.put('room/' + filename, new Uint8Array([5, 6, 7, 8, 9]))
+		const current = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`, {
+			headers: { Range: 'bytes=1-2' },
+		})
+		expect(current.status).toBe(206)
+		expect(new Uint8Array(await current.arrayBuffer())).toEqual(new Uint8Array([6, 7]))
+		const currentHead = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`, {
+			method: 'HEAD',
+		})
+		expect(currentHead.status).toBe(200)
+		expect(currentHead.headers.get('content-length')).toBe('5')
 
 		expect((await exports.default.fetch(`${ORIGIN}/unityasset/other.assetbundle`)).status).toBe(404)
 		expect(

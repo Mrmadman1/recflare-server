@@ -7185,3 +7185,27 @@ describe('Studio source revision permissions', () => {
 		expect(await source.json()).toMatchObject({ filename: 'first-draft.json' })
 	})
 })
+
+it('omits hydrated Badges when persisting a room settings edit', async () => {
+	await seedRoomWithSubRooms(env.DB, {
+		RoomId: 987670,
+		Name: 'BadgeSerialization',
+		CreatorAccountId: 987670,
+		SubRooms: [],
+	})
+	await env.DB.prepare(
+		"UPDATE room SET data=json_set(data,'$.Badges',json(?)) WHERE room_id=987670"
+	)
+		.bind(JSON.stringify([{ Name: 'derived badge' }]))
+		.run()
+	const response = await SELF.fetch(`${ORIGIN}/rooms/987670/warning`, {
+		method: 'PUT',
+		headers: await bearer('987670'),
+		body: new URLSearchParams({ warningMask: '1' }),
+	})
+	expect(response.status).toBe(200)
+	const stored = await env.DB.prepare('SELECT data FROM room WHERE room_id=987670').first<{
+		data: string
+	}>()
+	expect(JSON.parse(stored!.data)).not.toHaveProperty('Badges')
+})

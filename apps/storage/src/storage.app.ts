@@ -56,6 +56,8 @@ const UPLOAD_SUBFOLDER: Record<number, string> = {
 	8: 'room',
 	9: 'roomunityasset',
 	10: 'unityasset',
+	13: 'avatar',
+	14: 'avatarunityasset',
 }
 
 /** Resolve the storage subfolder for a posted FileType, or `undefined` when unknown. */
@@ -380,6 +382,7 @@ const app = new Hono<App>()
 					contentType = image.contentType
 				}
 				await c.env.CDN_ASSETS.put(`${subfolder}/${filename}`, bytes, {
+					customMetadata: { ownerId: String(id) },
 					httpMetadata: { contentType },
 					// Record the SHA-256 on the object. R2 stores an md5 on its own, but the
 					// hashes the client is served (an invention's `BlobHash`) are SHA-256, and

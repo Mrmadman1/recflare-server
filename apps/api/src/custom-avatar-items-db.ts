@@ -72,6 +72,9 @@ export interface CustomAvatarItemSave {
 	UnityAssetHash: string
 	UnityAsset2: string | null
 	UnityAsset2Hash: string | null
+	/** Studio builds persist separate target hashes; legacy imports omit these. */
+	QuestUnityAssetHash?: string | null
+	QuestUnityAsset2Hash?: string | null
 }
 
 /** A tag on an item (`{ TagType: 0, Value: "export" }` on the imported first-party items). */
@@ -356,6 +359,8 @@ export function toQuestCustomAvatarItem(item: CustomAvatarItem): CustomAvatarIte
 			...save,
 			UnityAsset: questAsset(save.UnityAsset),
 			UnityAsset2: questAsset(save.UnityAsset2),
+			UnityAssetHash: save.QuestUnityAssetHash ?? save.UnityAssetHash,
+			UnityAsset2Hash: save.QuestUnityAsset2Hash ?? save.UnityAsset2Hash,
 		})),
 	}
 }

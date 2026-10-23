@@ -362,6 +362,13 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `avatar/${c.req.param('asset')}`)
 	)
 
+	// SDK source downloads use an opaque upload capability (no bearer on this
+	// request). Only creator-authenticated save history exposes these filenames.
+	.get('/avatarunityasset/:filename{.+}', (c) => {
+		const name = c.req.param('filename')
+		if (!/^\d{4}-\d{2}-\d{2}\/[0-9a-f-]{36}$/.test(name)) return c.notFound()
+		return serveAsset(c, `avatarunityasset/${name}`)
+	})
 	// Editable Unity source manifests. Baked bundles are served separately.
 	.get(
 		'/roomunityasset/:filename{.+}',
@@ -430,15 +437,22 @@ const app = new Hono<App>()
  * a build is stored under it. Null when no build is, or the table has not been migrated
  * yet (the rooms worker owns it).
  */
-async function unityAssetR2Key(db: D1Database, filename: string): Promise<string | null> {
+async function unityAssetR2Key(env: StudioAssetEnv, filename: string): Promise<string | null> {
 	try {
 		// Inlined rather than imported so this worker does not take a dependency on the
 		// domain package.
-		const row = await db
-			.prepare(`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`)
+		const row = await env.DB.prepare(
+			`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`
+		)
 			.bind(filename)
 			.first<{ stored: number }>()
-		return row ? filename : null
+		if (!row) return null
+		if (/^(quest\/)?studio-avatar\//.test(filename)) return `avatar/${filename}`
+		// Room builds and consumable exports use the game's /room namespace.
+		// Retain older installations that stored the same filename at the bucket root.
+		if (filename.startsWith('studio/') && (await env.CDN_ASSETS.head(`room/${filename}`)))
+			return `room/${filename}`
+		return filename
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
 		if (message.toLowerCase().includes('no such table')) return null
@@ -450,14 +464,14 @@ async function unityAssetR2Key(db: D1Database, filename: string): Promise<string
 async function serveUnityAsset(c: Context<App>) {
 	const name = c.req.param('filename') ?? ''
 	if (name.includes('..')) return c.body(null, 400)
-	const key = await unityAssetR2Key(c.env.DB, name)
+	const key = await unityAssetR2Key(c.env, name)
 	return serveAsset(c, key ?? `unityasset/${name}`)
 }
 
 /** Build the Studio bundle HEAD response outside Hono's HEAD-to-GET fallback. */
 async function studioUnityAssetHead(env: StudioAssetEnv, name: string): Promise<Response> {
 	if (name.includes('..')) return new Response(null, { status: 400 })
-	const key = await unityAssetR2Key(env.DB, name)
+	const key = await unityAssetR2Key(env, name)
 	const head = await env.CDN_ASSETS.head(key ?? `unityasset/${name}`)
 	if (!head) return new Response(null, { status: 404 })
 
