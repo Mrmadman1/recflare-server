@@ -25,7 +25,7 @@ import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progres
 import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
-import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
+import { getOrCreateDormRoom, ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
 import { recordStat, STAT_SCHEMA_DDL } from '@repo/domain/src/stats-db'
 import { generateToken } from '@repo/jwt'
 
@@ -863,6 +863,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
 		'/api/staff/studio-access',
+		'/api/staff/sandbox',
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
@@ -870,6 +871,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/players/1/clear-dorm',
 		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
@@ -877,7 +879,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/rooms/1/gift-tokens',
 		'/api/staff/online/gift-tokens',
 		'/api/staff/discord-roles/1/gift-tokens',
-		'/api/staff/discord-roles/sync'
+		'/api/staff/discord-roles/sync',
+		'/api/staff/discord-roles/supporter-gift'
 	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
@@ -888,10 +891,14 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		expect(res.status).toBe(403)
 	}
 
-	// The gifts, the Plus grant and the role sweep are narrower: a moderator is staff, but
-	// not a developer.
+	// The gifts, the Plus grant, the role sweep and the supporter gift are narrower: a
+	// moderator is staff, but not a developer.
 	for (const path of writes.filter(
-		(p) => p.includes('/gift-') || p.includes('/grant-plus') || p.endsWith('/sync')
+		(p) =>
+			p.includes('/gift-') ||
+			p.includes('/grant-plus') ||
+			p.endsWith('/sync') ||
+			p.endsWith('/supporter-gift')
 	)) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
@@ -929,6 +936,22 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
 	})
 	expect(playerRemove.status).toBe(403)
+	// The sandbox toggle is a PUT, so the loop over POSTs above doesn't cover it.
+	const sandboxUnauthed = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxUnauthed.status).toBe(401)
+	const sandboxPlayer = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: {
+			authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}`,
+			'content-type': 'application/json',
+		},
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxPlayer.status).toBe(403)
 })
 
 // The reporter is the CALLER, never a body field — that is the record of who raised a
@@ -1457,6 +1480,41 @@ it('previews which other accounts a ban would reach', async () => {
 	})
 	// Never the account asked about: the question is who ELSE.
 	expect(preview.linked.map((l) => l.accountId)).not.toContain(8220)
+})
+
+// A ban evader's new account has no ban of its own, but `auth`/`match` lock it out through
+// the linked arms — so the history must say so rather than read "Not banned".
+it('reports a linked account’s ban as what blocks a player', async () => {
+	const seedAccount = (data: Record<string, unknown>) =>
+		env.DB.prepare('INSERT OR REPLACE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify(data))
+			.run()
+	await seedAccount({ accountId: 8230, username: 'Banned', lastLoginIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8231, username: 'Alt', signupIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8232, username: 'Stranger', signupIp: '203.0.113.31' })
+	const report = await createReport(env.DB, { reporterPlayerId: 8233, reportedPlayerId: 8230 })
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+
+	type History = {
+		activeBan: { id: number } | null
+		blockedBy: { via: string; bannedAccountId: number; ban: { id: number } } | null
+	}
+	const history = async (id: number) =>
+		(await (await staffGet(`/api/staff/players/${id}`, 8110)).json()) as History
+
+	// The banned account itself: its own ban, matched directly.
+	expect(await history(8230)).toMatchObject({
+		activeBan: { id: report.id },
+		blockedBy: { via: 'account', bannedAccountId: 8230 },
+	})
+	// The alt: no ban of its own, blocked through the shared IP — naming whose ban it is.
+	expect(await history(8231)).toMatchObject({
+		activeBan: null,
+		blockedBy: { via: 'ip', bannedAccountId: 8230, ban: { id: report.id } },
+	})
+	expect(await history(8232)).toMatchObject({ activeBan: null, blockedBy: null })
 })
 
 // The panel's own URLs must reach the SPA, not the worker's API surface. `requireStaff`
@@ -2118,6 +2176,87 @@ it('clears a player’s password so they can set a new one in game', async () =>
 	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
 })
 
+it('clears a player’s dorm by publishing an empty save over the newest one', async () => {
+	await updateAccount(env.DB, 8340, { username: 'Timetraveler' })
+	expect((await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})).status).toBe(404)
+
+	const dorm = await getOrCreateDormRoom(env.DB, 8340)
+	const roomId = Number(dorm.RoomId)
+	const { sub_room_id: subRoomId } = (await env.DB.prepare(
+		'SELECT sub_room_id FROM subroom WHERE room_id = ?1 LIMIT 1'
+	)
+		.bind(roomId)
+		.first<{ sub_room_id: number }>())!
+
+	// A dorm that has never been saved: nothing to clear, still a success.
+	let res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: null, saveId: null })
+
+	const insertSave = (blob: string) =>
+		env.DB.prepare(
+			'INSERT INTO subroom_save (sub_room_id, data) VALUES (?1, ?2) RETURNING sub_room_data_save_id AS id'
+		)
+			.bind(
+				subRoomId,
+				JSON.stringify({
+					DataBlob: blob,
+					DataBlobHash: 'hash',
+					Description: blob,
+					PersistenceVersion: 7,
+					CreatedAt: '2025-08-01T00:00:00.000Z',
+				})
+			)
+			.first<{ id: number }>()
+	const older = (await insertSave('old.blob'))!.id
+	const newer = (await insertSave('new.blob'))!.id
+	await env.DB.prepare(
+		'UPDATE subroom SET current_save_id = ?2, staged_save_id = ?2 WHERE sub_room_id = ?1'
+	)
+		.bind(subRoomId, newer)
+		.run()
+	const saveData = async (id: number) =>
+		JSON.parse(
+			(await env.DB.prepare('SELECT data FROM subroom_save WHERE sub_room_data_save_id = ?1')
+				.bind(id)
+				.first<{ data: string }>())!.data
+		)
+	const pointers = () =>
+		env.DB.prepare('SELECT current_save_id, staged_save_id FROM subroom WHERE sub_room_id = ?1')
+			.bind(subRoomId)
+			.first<{ current_save_id: number; staged_save_id: number | null }>()
+
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(res.status).toBe(200)
+	const { saveId } = (await res.json()) as { saveId: number }
+	expect(saveId).toBeGreaterThan(newer)
+
+	// The blank save copies the newest one but for the blob, and goes live.
+	const blank = await saveData(saveId)
+	expect(blank).toEqual({
+		DataBlob: '',
+		DataBlobHash: null,
+		Description: 'Cleared by staff',
+		PersistenceVersion: 7,
+		CreatedAt: expect.any(String),
+	})
+	expect(blank.CreatedAt).not.toBe('2025-08-01T00:00:00.000Z')
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+	// Nothing is erased: both earlier saves are as they were.
+	expect((await saveData(newer)).DataBlob).toBe('new.blob')
+	expect((await saveData(older)).DataBlob).toBe('old.blob')
+
+	// Clearing an already-empty dorm writes nothing more.
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: saveId, saveId: null })
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+
+	expect((await auditRows('clear_dorm', 8340)).map((r) => r.data)).toEqual([
+		{ playerId: 8340, roomId, previousSaveId: null, saveId: null },
+		{ playerId: 8340, roomId, previousSaveId: newer, saveId },
+		{ playerId: 8340, roomId, previousSaveId: saveId, saveId: null },
+	])
+})
+
 it('grants a player Plus, developers only', async () => {
 	await updateAccount(env.DB, 8330, { username: 'Plusless' })
 	const hasPlus = async () =>
@@ -2661,6 +2800,41 @@ it('runs the sweep on demand for a developer and answers with the summary', asyn
 	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true })
 })
 
+// The supporter gift on a button: econ's cron run (`grantDiscordRoleGifts`, covered in econ's
+// own tests) with www's bindings, answered with its summary and written to the audit log.
+// The test bindings map no role, so the run is a `skipped` one and pays nothing — which is
+// also what the panel must be able to tell the developer.
+it('runs the supporter gift on demand for a developer and answers with the summary', async () => {
+	await onlyDiscordLinks([[9100, '900000000000000100', [ROLE_A]]])
+	const before = await getBalance(
+		env.DB,
+		9100,
+		CurrencyType.RecCenterTokens,
+		DEFAULT_STARTING_TOKENS
+	)
+
+	const res = await devPost('/api/staff/discord-roles/supporter-gift', 8110, {})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		skipped: true,
+		roles: 0,
+		links: 0,
+		granted: 0,
+		tokens: 0,
+		failed: 0,
+	})
+	expect(
+		await getBalance(env.DB, 9100, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).toBe(before)
+
+	const row = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'run_discord_role_gift'
+		 ORDER BY audit_log_id DESC LIMIT 1`
+	).first<{ player_id: number; data: string }>()
+	expect(row?.player_id).toBe(8110)
+	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true, granted: 0 })
+})
+
 it('re-reads every discord link and writes the roles back', async () => {
 	await onlyDiscordLinks([
 		[9111, '900000000000000111', [ROLE_A]],
@@ -2923,5 +3097,64 @@ it('lets staff add, list, and remove studio upload access', async () => {
 	expect(await auditRows('revoke_studio_access', 8601)).toEqual([
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: true } },
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: false } },
+	])
+})
+
+// ---- Sandbox opt-in ---------------------------------------------------------
+// `match` picks the Tachyon pool off the account's `isSandbox` flag. Staff flip their OWN
+// flag from the account page; the route never takes a player id, so nobody can be moved by
+// someone else here.
+
+it('lets staff opt themselves in and out of the sandbox pool, and only themselves', async () => {
+	await updateAccount(env.DB, 8120, { username: 'SandboxMod' })
+
+	const staffPut = (accountId: number, body: unknown, roles = ['moderator']) =>
+		tokenFor(accountId, roles).then((token) =>
+			SELF.fetch('https://example.com/api/staff/sandbox', {
+				method: 'PUT',
+				headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		)
+
+	// Off until opted in, for a moderator and a developer alike.
+	let res = await staffGet('/api/staff/sandbox', 8120)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: false })
+	expect((await staffGet('/api/staff/sandbox', 8120, ['developer'])).status).toBe(200)
+
+	// Not a boolean, not a body.
+	expect((await staffPut(8120, { sandbox: 'yes' })).status).toBe(400)
+	expect((await staffPut(8120, {})).status).toBe(400)
+
+	res = await staffPut(8120, { sandbox: true })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(true)
+	expect(await (await staffGet('/api/staff/sandbox', 8120)).json()).toEqual({ sandbox: true })
+
+	// Idempotent: opting in again changes nothing and says so.
+	res = await staffPut(8120, { sandbox: true })
+	expect(await res.json()).toEqual({ sandbox: true, changed: false })
+
+	// A developer's token works the same, and the flag is theirs, not the moderator's.
+	res = await staffPut(8121, { sandbox: true }, ['developer'])
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	res = await staffPut(8120, { sandbox: false })
+	expect(await res.json()).toEqual({ sandbox: false, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(false)
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	// Each flip is on the audit log against the staff member who made it.
+	const rows = await env.DB.prepare(
+		"SELECT player_id, data FROM audit_log WHERE action = 'set_sandbox' ORDER BY audit_log_id"
+	).all<{ player_id: number; data: string }>()
+	expect(rows.results.map((r) => [r.player_id, JSON.parse(r.data).sandbox])).toEqual([
+		[8120, true],
+		[8120, true],
+		[8121, true],
+		[8120, false],
 	])
 })

@@ -72,6 +72,9 @@ export interface CustomAvatarItemSave {
 	UnityAssetHash: string
 	UnityAsset2: string | null
 	UnityAsset2Hash: string | null
+	/** Studio builds persist separate target hashes; legacy imports omit these. */
+	QuestUnityAssetHash?: string | null
+	QuestUnityAsset2Hash?: string | null
 }
 
 /** A tag on an item (`{ TagType: 0, Value: "export" }` on the imported first-party items). */
@@ -297,10 +300,11 @@ export async function getCustomAvatarItems(
 	ids: string[]
 ): Promise<CustomAvatarItem[]> {
 	if (ids.length === 0) return []
-	const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (${placeholders})`)
-		.bind(...ids)
+		.prepare(
+			`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (SELECT value FROM json_each(?1))`
+		)
+		.bind(JSON.stringify(ids))
 		.all<Row>()
 	const byId = new Map(results.map(toDto).map((item) => [item.CustomAvatarItemId, item]))
 	return ids.flatMap((id) => byId.get(id) ?? [])
@@ -355,6 +359,8 @@ export function toQuestCustomAvatarItem(item: CustomAvatarItem): CustomAvatarIte
 			...save,
 			UnityAsset: questAsset(save.UnityAsset),
 			UnityAsset2: questAsset(save.UnityAsset2),
+			UnityAssetHash: save.QuestUnityAssetHash ?? save.UnityAssetHash,
+			UnityAsset2Hash: save.QuestUnityAsset2Hash ?? save.UnityAsset2Hash,
 		})),
 	}
 }

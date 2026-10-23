@@ -895,6 +895,29 @@ describe('auth worker routes', () => {
 		expect(payload.scope).not.toContain('rn.privilege')
 	})
 
+	test('POST /connect/token stamps the influencer role for an isInfluencer account', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 95,
+					username: 'InfluencerPlayer',
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					isInfluencer: true,
+				})
+			)
+			.run()
+		const payload = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(payload.role).toEqual(
+			expect.arrayContaining(['gameClient', 'screenshare', 'influencer'])
+		)
+		expect(payload.role).not.toContain('developer')
+
+		// Off the flag, off the token — no other flag implies it.
+		await updateAccount(env.DB, 95, { isInfluencer: false })
+		const revoked = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(revoked.role).not.toContain('influencer')
+	})
+
 	test('POST /connect/token 400s when no account_id is posted (never defaults to 1)', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/connect/token`, { method: 'POST' })
 		expect(res.status).toBe(400)
@@ -1221,6 +1244,311 @@ describe('auth worker routes', () => {
 		} finally {
 			env.PASSWORD_SIGNUP = original
 		}
+	})
+
+	// The rollout gate: build 20260323.14 is for Discord supporters only. A login posting it
+	// as `ver` is refused unless the account's Discord link holds a role named in
+	// DISCORD_ROLLOUT_ROLE_IDS; every other build, and a grant posting no `ver`, is untouched.
+	describe('rollout gate on build 20260323.14', () => {
+		const GATED = '20260323.14'
+		const REFUSED =
+			'this build is limited to Discord supporters; link your Discord on the website first'
+		const supporter = '1077000000000000001'
+		const booster = '1077000000000000002'
+		const outsider = '1077000000000000009'
+
+		async function seedAccount(id: number, username: string) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId: id,
+						username,
+						passwordHash: await hashPassword(LOGIN_PASSWORD),
+					})
+				)
+				.run()
+		}
+
+		const login = (username: string, ver?: string) =>
+			postToken(
+				`grant_type=password&username=${username}&password=${LOGIN_PASSWORD}` +
+					(ver === undefined ? '' : `&ver=${ver}`)
+			)
+
+		async function withRoleIds<T>(value: string | undefined, run: () => Promise<T>): Promise<T> {
+			// `env` is shared by every test in this file, so the override is restored in
+			// `finally` rather than leaking a configured gate into the tests around this one.
+			const original = env.DISCORD_ROLLOUT_ROLE_IDS
+			if (value === undefined) delete env.DISCORD_ROLLOUT_ROLE_IDS
+			else env.DISCORD_ROLLOUT_ROLE_IDS = value
+			try {
+				return await run()
+			} finally {
+				if (original === undefined) delete env.DISCORD_ROLLOUT_ROLE_IDS
+				else env.DISCORD_ROLLOUT_ROLE_IDS = original
+			}
+		}
+
+		beforeAll(async () => {
+			await seedAccount(9301, 'gate_supporter')
+			await linkPlatformIdentity(env.DB, 9301, PlatformType.Discord, '500000000000000001', [
+				supporter,
+			])
+			await seedAccount(9302, 'gate_outsider')
+			await linkPlatformIdentity(env.DB, 9302, PlatformType.Discord, '500000000000000002', [
+				outsider,
+			])
+			await seedAccount(9303, 'gate_unlinked')
+			// A Steam link is not a Discord link — it carries no roles to hold.
+			await linkPlatformIdentity(env.DB, 9303, PlatformType.Steam, '76561198000009303')
+			// Staff, with no Discord link at all.
+			for (const [id, username, flag] of [
+				[9304, 'gate_developer', 'isDeveloper'],
+				[9305, 'gate_moderator', 'isModerator'],
+			] as const) {
+				await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+					.bind(
+						JSON.stringify({
+							accountId: id,
+							username,
+							passwordHash: await hashPassword(LOGIN_PASSWORD),
+							[flag]: true,
+						})
+					)
+					.run()
+			}
+		})
+
+		test('staff are let in with no Discord link, even with the gate closed', async () => {
+			for (const roleIds of [undefined, supporter]) {
+				await withRoleIds(roleIds, async () => {
+					expect((await login('gate_developer', GATED)).status).toBe(200)
+					expect((await login('gate_moderator', GATED)).status).toBe(200)
+				})
+			}
+		})
+
+		test('with no roles configured the gate is closed to every non-staff account', async () => {
+			await withRoleIds(undefined, async () => {
+				const res = await login('gate_supporter', GATED)
+				expect(res.status).toBe(400)
+				expect(res.json).toEqual({ error: 'invalid_grant', error_description: REFUSED })
+			})
+			// A value that parses to no ids is the same as unset.
+			await withRoleIds(' , ', async () => {
+				expect((await login('gate_supporter', GATED)).status).toBe(400)
+			})
+		})
+
+		test('a configured role lets its holder in, and the token carries the build', async () => {
+			await withRoleIds(`${booster},${supporter}`, async () => {
+				const res = await login('gate_supporter', GATED)
+				expect(res.status).toBe(200)
+				const payload = decodePayload(res.json.access_token as string)
+				expect(payload.sub).toBe('9301')
+				expect(payload['rn.ver']).toBe(GATED)
+			})
+		})
+
+		test('the list is split on commas and/or whitespace, like DISCORD_BENEFITS_ROLE_IDS', async () => {
+			await withRoleIds(` ${booster} ,\n${supporter} `, async () => {
+				expect((await login('gate_supporter', GATED)).status).toBe(200)
+			})
+		})
+
+		test('a Discord link holding only other roles, or no Discord link at all, is refused', async () => {
+			await withRoleIds(`${supporter},${booster}`, async () => {
+				const other = await login('gate_outsider', GATED)
+				expect(other.status).toBe(400)
+				expect(other.json.error_description).toBe(REFUSED)
+
+				const unlinked = await login('gate_unlinked', GATED)
+				expect(unlinked.status).toBe(400)
+				expect(unlinked.json.error_description).toBe(REFUSED)
+			})
+		})
+
+		test('other builds, and grants posting no ver, are never gated', async () => {
+			await withRoleIds(undefined, async () => {
+				expect((await login('gate_outsider')).status).toBe(200)
+				expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+				expect((await login('gate_outsider', '20250718.01')).status).toBe(200)
+				expect((await login('gate_unlinked', '20230414')).status).toBe(200)
+			})
+		})
+
+		test('every point release of the gated build is gated', async () => {
+			// The gate is on the BUILD (the bare date): the client's `.NN` is a same-day
+			// rebuild, so `.14`, `.2` and the date alone are all the rollout build.
+			await withRoleIds(undefined, async () => {
+				for (const version of ['20260323', '20260323.2', '20260323.14']) {
+					const res = await login('gate_outsider', version)
+					expect(res.status, version).toBe(400)
+					expect(res.json.error_description, version).toBe(REFUSED)
+				}
+			})
+		})
+
+		test('the credential is checked first, so the gate cannot probe for accounts', async () => {
+			await withRoleIds(undefined, async () => {
+				const res = await postToken(
+					`grant_type=password&username=gate_outsider&password=wrong&ver=${GATED}`
+				)
+				expect(res.status).toBe(400)
+				expect(res.json.error_description).toBe('invalid account_id or password')
+			})
+		})
+
+		test('create_account on the build is refused before anything is minted', async () => {
+			await withRoleIds(`${supporter}`, async () => {
+				const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+					n: number
+				}>()
+				const res = await postToken(
+					`grant_type=create_account&platform_id=steam-gated&password=hunter2&ver=${GATED}`
+				)
+				expect(res.status).toBe(400)
+				expect(res.json).toEqual({ error: 'invalid_grant', error_description: REFUSED })
+				const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+					n: number
+				}>()
+				expect(after?.n).toBe(before?.n)
+			})
+		})
+
+		// The two lists behind the gates are vars (`SUPPORTED_GAME_VERSIONS`,
+		// `ROLLOUT_GAME_VERSIONS`), so an operator can end the rollout or drop a build without
+		// a deploy of new code. Same env-override discipline as withRoleIds.
+		describe('the lists come from vars', () => {
+			const UNSUPPORTED = 'this game version is not supported by this server; update your game'
+
+			async function withVars<T>(
+				vars: { SUPPORTED_GAME_VERSIONS?: string; ROLLOUT_GAME_VERSIONS?: string },
+				run: () => Promise<T>
+			): Promise<T> {
+				const originals = {
+					SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+					ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+				}
+				const apply = (values: typeof originals) => {
+					for (const key of ['SUPPORTED_GAME_VERSIONS', 'ROLLOUT_GAME_VERSIONS'] as const) {
+						if (values[key] === undefined) delete env[key]
+						else env[key] = values[key]
+					}
+				}
+				apply({ ...originals, ...vars })
+				try {
+					return await run()
+				} finally {
+					apply(originals)
+				}
+			}
+
+			test('a build dropped from SUPPORTED_GAME_VERSIONS is refused a token, staff included', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414,20260323' }, async () => {
+					await withRoleIds(undefined, async () => {
+						// The 2025 build, every point release of it: this is the forced upgrade.
+						for (const version of ['20250718', '20250718.01', '20250718.2']) {
+							const res = await login('gate_outsider', version)
+							expect(res.status, version).toBe(400)
+							expect(res.json, version).toEqual({
+								error: 'invalid_grant',
+								error_description: UNSUPPORTED,
+							})
+						}
+						// Staff get no exception here — the build is not served, full stop.
+						expect((await login('gate_developer', '20250718.01')).status).toBe(400)
+						// The builds that ARE listed, and a grant posting no `ver`, are untouched;
+						// the rollout gate still applies to the one under rollout.
+						expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+						expect((await login('gate_outsider')).status).toBe(200)
+						expect((await login('gate_developer', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+			})
+
+			test('create_account on an unsupported build is refused before anything is minted', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					const res = await postToken(
+						'grant_type=create_account&platform_id=steam-unsupported&password=hunter2&ver=20250718.01'
+					)
+					expect(res.status).toBe(400)
+					expect(res.json).toEqual({ error: 'invalid_grant', error_description: UNSUPPORTED })
+					const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					expect(after?.n).toBe(before?.n)
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS=off ends the rollout: the build opens to everyone', async () => {
+				await withVars({ ROLLOUT_GAME_VERSIONS: 'off' }, async () => {
+					await withRoleIds(undefined, async () => {
+						const res = await login('gate_outsider', GATED)
+						expect(res.status).toBe(200)
+						expect(decodePayload(res.json.access_token as string)['rn.ver']).toBe(GATED)
+						expect((await login('gate_unlinked', GATED)).status).toBe(200)
+						// ...and accounts can be created on it, since nothing needs a Discord link.
+						const created = await postToken(
+							`grant_type=create_account&platform_id=steam-rollout-over&password=hunter2&ver=${GATED}`
+						)
+						expect(created.status).toBe(200)
+					})
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS names which builds are gated', async () => {
+				// Move the gate onto the beta build: it is now supporters-only and the 2026
+				// build is open. Both stay served.
+				await withVars({ ROLLOUT_GAME_VERSIONS: '20250718' }, async () => {
+					await withRoleIds(supporter, async () => {
+						const outsider = await login('gate_outsider', '20250718.01')
+						expect(outsider.status).toBe(400)
+						expect(outsider.json.error_description).toBe(REFUSED)
+						expect((await login('gate_supporter', '20250718.01')).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).status).toBe(200)
+					})
+				})
+			})
+
+			test('a build under rollout is served even when SUPPORTED_GAME_VERSIONS omits it', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					await withRoleIds(supporter, async () => {
+						// Rolling out, so the ROLLOUT gate answers, not the support one.
+						expect((await login('gate_supporter', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+				// In neither list, nobody reaches it — a rollout pulled back entirely.
+				await withVars(
+					{ SUPPORTED_GAME_VERSIONS: '20230414', ROLLOUT_GAME_VERSIONS: 'off' },
+					async () => {
+						await withRoleIds(supporter, async () => {
+							for (const username of ['gate_supporter', 'gate_developer']) {
+								const res = await login(username, GATED)
+								expect(res.status, username).toBe(400)
+								expect(res.json.error_description, username).toBe(UNSUPPORTED)
+							}
+						})
+					}
+				)
+			})
+
+			test('entries are read as builds, so a copied point release still matches', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: ' 20230414, 20250718.01 ' }, async () => {
+					expect((await login('gate_outsider', '20250718.2')).status).toBe(200)
+					expect((await login('gate_outsider', '20250718')).status).toBe(200)
+				})
+				// Blank is unset: the default list applies, including the alpha builds.
+				await withVars({ SUPPORTED_GAME_VERSIONS: '  ' }, async () => {
+					expect((await login('gate_outsider', '20231207')).status).toBe(200)
+				})
+			})
+		})
 	})
 
 	test('the signup caps come from vars, and 0 disables an arm', async () => {
@@ -1627,6 +1955,22 @@ describe('auth worker routes', () => {
 		expect(await res.text()).toBe('')
 	})
 
+	test('GET /role/screenshare/:id matches the token feature gate for existing accounts', async () => {
+		for (const id of [42, 77]) {
+			const res = await exports.default.fetch(`${ORIGIN}/role/screenshare/${id}`)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toBe(true)
+		}
+	})
+
+	test('GET /role/screenshare/:id does not grant a role to unknown accounts', async () => {
+		for (const id of ['999999', 'nonsense']) {
+			const res = await exports.default.fetch(`${ORIGIN}/role/screenshare/${id}`)
+			expect(res.status).toBe(404)
+			expect(await res.text()).toBe('')
+		}
+	})
+
 	test('GET /role/developer/:id returns a bare false for an un-flagged account', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/role/developer/42`)
 		expect(res.status).toBe(200)
@@ -1838,6 +2182,7 @@ describe('auth worker routes', () => {
 			'GET /role/developer/{id}',
 			'GET /role/moderator',
 			'GET /role/moderator/{id}',
+			'GET /role/screenshare/{id}',
 			'POST /account/me/changepassword',
 			'POST /cachedlogin/forplatformid/{platform}/{id}',
 			'POST /cachedlogin/forplatformids',

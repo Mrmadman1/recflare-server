@@ -18,7 +18,11 @@
  * into the caller's own list, and to rank the "top today" feed by what players actually
  * picked up today. See @repo/domain's inventory-invention-db.ts.
  */
-import { getInventionAcquisitionCounts, getOwnedInventionIds } from '@repo/domain'
+import {
+	getAccountByUsername,
+	getInventionAcquisitionCounts,
+	getOwnedInventionIds,
+} from '@repo/domain'
 
 /**
  * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql +
@@ -727,6 +731,14 @@ export async function ownsAllInventions(
  * and a tag appears in no name or description, so those searches find nothing. Matching tags
  * needs them out of the JSON blob and into something indexable first; until then this stays a
  * text search rather than one that scans every row to look at its tags.
+ *
+ * A value starting with `@` IS special: `@djdevin` is a search for that player's inventions —
+ * the public ones, the same set `v1/fromcreators` lists for their portfolio — resolved by
+ * username, case-insensitively, through the indexed `username_lower`. Any terms after the
+ * `@name` narrow that player's inventions as text, so `@djdevin sofa` works. A username nobody
+ * has matches nothing rather than falling back to a text search for "@djdevin": a player who
+ * typed an `@` meant a person, and a list of inventions whose descriptions mention them is not
+ * what they asked for.
  */
 export async function searchInventions(
 	db: D1Database,
@@ -743,11 +755,20 @@ export async function searchInventions(
 	/** Bind a value and get its placeholder, so the numbering can't drift as terms are added. */
 	const bind = (v: string | number): string => `?${binds.push(v)}`
 
-	for (const term of value
+	const terms = value
 		.trim()
 		.toLowerCase()
 		.split(/[\s+]+/)
-		.filter(Boolean)) {
+		.filter(Boolean)
+
+	if (terms[0]?.startsWith('@')) {
+		const username = terms.shift()!.slice(1)
+		const creator = username ? await getAccountByUsername(db, username) : null
+		if (!creator) return []
+		where.push(`creator_player_id = ${bind(creator.accountId)}`)
+	}
+
+	for (const term of terms) {
 		const escaped = term.replace(/[\\%_]/g, (ch) => `\\${ch}`)
 		const pattern = bind(`%${escaped}%`)
 		where.push(
@@ -1257,10 +1278,11 @@ export async function getInventionsByIds(
 	inventionIds: number[]
 ): Promise<SavedInvention[]> {
 	if (inventionIds.length === 0) return []
-	const placeholders = inventionIds.map((_, i) => `?${i + 1}`).join(', ')
+	// One bound JSON array rather than a placeholder per id: D1 caps a statement at 100
+	// bound variables, and the top-today window or a big collection easily passes that.
 	const { results } = await db
-		.prepare(`SELECT data FROM invention WHERE id IN (${placeholders})`)
-		.bind(...inventionIds)
+		.prepare(`SELECT data FROM invention WHERE id IN (SELECT value FROM json_each(?1))`)
+		.bind(JSON.stringify(inventionIds))
 		.all<InventionRow>()
 
 	const byId = new Map<number, SavedInvention>()

@@ -143,7 +143,7 @@ export const BacktraceConfig = z.object({
 	SampleRate: z.int(),
 	LogLineCount: z.int(),
 	CaptureNativeCrashes: z.int(),
-	AMRThresholdMS: z.int(),
+	ANRThresholdMs: z.int(),
 	MessageCount: z.int(),
 	MessageRegex: z.string(),
 	VersionRegex: z.string(),
@@ -308,6 +308,40 @@ export const ProgressionDto = z.object({
 	PlayerId: z.int(),
 	Level: z.int(),
 	XP: z.int(),
+})
+
+/**
+ * The caller's progress through one progression event (`/api/progressionEvents/record/:id`).
+ * A stub for now: every counter is 0 and nothing is collected.
+ */
+export const ProgressionEventRecordDto = z.object({
+	AccountId: z.int().describe('The caller'),
+	ProgressionEventId: z.int().describe('The event requested'),
+	Xp: z.int(),
+	GameMinutesToday: z.int(),
+	RewardsCollected: z.int(),
+	BonusRewardsCollected: z.int(),
+	XpBoostLastPurchasedAt: z.string().nullable().describe('ISO-8601 UTC; null when never bought'),
+	PremiumRewardsCollected: z.int(),
+	LimitedRewardCollectionState: z.int(),
+})
+
+/**
+ * One XP boost a player bought and has running, as `GET /api/purchasableXpBoosts/activations`
+ * lists it. Documented from the reference shape; nothing here sells or stores boosts yet.
+ */
+export const XpBoostActivationDto = z.object({
+	PurchasableXpBoostLedgerEntryId: z.int().describe('The purchase this activation came from'),
+	PurchasableXpBoostId: z.string().describe('GUID of the boost product bought'),
+	XpMultiplier: z.number().describe('XP is multiplied by this while the boost runs, e.g. 2.0'),
+	StartTime: z.string().describe('ISO-8601 UTC'),
+	EndTime: z.string().describe('ISO-8601 UTC'),
+})
+
+/** `GET /api/purchasableXpBoosts/activations` — a paged list of the caller's active boosts. */
+export const XpBoostActivationsResponse = z.object({
+	Results: XpBoostActivationDto.array(),
+	TotalResults: z.int().describe('The number of entries in `Results`'),
 })
 
 /**
@@ -567,7 +601,9 @@ export const InventionV9Dto = z.object({
 	Name: z.string(),
 	Description: z.string(),
 	ImageName: z.string(),
-	UgcVersion: z.int().describe('The UGC format the blob was written in; 1 when the save named none'),
+	UgcVersion: z
+		.int()
+		.describe('The UGC format the blob was written in; 1 when the save named none'),
 	CurrentVersionNumber: z.int(),
 	LatestVersionNumber: z.int().describe('The same as CurrentVersionNumber on a fresh save'),
 	Accessibility: z.int(),
@@ -760,7 +796,9 @@ export const PublishInventionRequest = z.object({
 		.int()
 		.nullable()
 		.optional()
-		.describe('Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'),
+		.describe(
+			'Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'
+		),
 	Price: z
 		.int()
 		.nullable()
@@ -1073,6 +1111,14 @@ export const SanitizeRequest = z.object({
 /** `POST /api/sanitize/v1/isPure` — whether the text is free of profanity. */
 export const IsPureResponse = z.object({ IsPure: z.boolean() })
 
+/** Studio sends repeated Values form fields and consumes this result envelope. */
+export const BulkAllowedRequest = z.object({ Values: z.array(z.string()) })
+export const BulkAllowedResponse = z.object({
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	Value: z.object({ ArePure: z.array(z.boolean()) }).nullable(),
+})
+
 /** `GET /api/keepsakes/globalconfig` — the keepsake feature switches. */
 export const KeepsakeConfig = z.object({
 	KeepsakeFeatureEnabled: z.boolean(),
@@ -1359,7 +1405,9 @@ export const PlayerEventsAll = z.object({
 export const PlayerPublicEvents = z.object({
 	Created: z.array(PlayerEventBaseDto).describe('Public events the player created'),
 	Responses: z
-		.array(z.object({ PlayerEvent: PlayerEventBaseDto, PlayerEventResponse: PlayerEventResponseDto }))
+		.array(
+			z.object({ PlayerEvent: PlayerEventBaseDto, PlayerEventResponse: PlayerEventResponseDto })
+		)
 		.describe('Public events the player is attending, each beside their Going RSVP'),
 })
 
@@ -1614,6 +1662,14 @@ export const ImagesPlayerDto = z.object({
 	PlayerEventId: z.int().nullable(),
 	PlayerId: z.int(),
 	RoomId: z.int().nullable(),
+})
+
+/**
+ * The bulk lookup's projection (`GET /api/images/v5/bulk`): {@link ImagesPlayerDto} plus a
+ * `ClubId`, always null.
+ */
+export const ImagesBulkDto = ImagesPlayerDto.extend({
+	ClubId: z.int().nullable().describe('Always null — images are not filed under clubs'),
 })
 
 /** One entry in the anonymous slideshow feed, joined to its creator and room. */

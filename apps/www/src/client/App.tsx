@@ -28,8 +28,8 @@ import {
 	where,
 } from './api'
 import { DeviceLinkPage } from './DeviceLink'
-import { customAvatarItemIdFromPath, ItemPage } from './Item'
-import { ModerationPage } from './Moderation'
+import { customAvatarItemIdFromPath, inventionIdFromPath, InventionPage, ItemPage } from './Item'
+import { ModerationPage, PlayerBanStatus } from './Moderation'
 import { PumpleBossFight } from './PumpleBossFight'
 import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
@@ -136,6 +136,13 @@ interface OwnedRoom {
 	MaxPlayers: number
 	/** False blocks `POST /rooms/{id}/clone` — nobody can take a copy of the room. */
 	CloningAllowed: boolean
+	/**
+	 * The staff listing flags: out of the browse feeds, and out of search. Set together
+	 * through the website (`PUT /rooms/{id}/exclude`); absent on a room nobody has touched,
+	 * which reads as listed.
+	 */
+	ExcludeFromLists?: boolean
+	ExcludeFromSearch?: boolean
 	SupportsScreens: boolean
 	SupportsWalkVR: boolean
 	SupportsTeleportVR: boolean
@@ -501,6 +508,24 @@ async function changeUsername(username: string): Promise<SelfAccount> {
 }
 
 /**
+ * Set the display name — the name other players read, as opposed to the username the
+ * account signs in with. Unrationed, unlike a username change.
+ *
+ * Not checked here first, for the reason the email below isn't: `accounts` owns the rule
+ * (`displayNameRejection` in `@repo/domain`, the game client's own charset), and that
+ * module can't come into the browser — it imports `isemail`. The route refuses with an
+ * empty 400, so the rule is spelled out in the refusal instead.
+ */
+const saveDisplayName = (displayName: string): Promise<unknown> =>
+	call(`${where().accounts}/account/me/displayname`, {
+		method: 'PUT',
+		form: { displayName },
+		authed: true,
+		refusal:
+			"That display name can't be used. Use up to 15 letters, numbers, spaces and .,'!?_&()#@:+- — and no profanity.",
+	})
+
+/**
  * Set the account's email.
  *
  * The address is NOT checked here first. `accounts` validates it with `isemail`, which
@@ -539,6 +564,12 @@ const fetchBenefitsStatus = (): Promise<BenefitsStatus> =>
 
 /** What a successful claim answers. */
 interface ClaimResult {
+	/**
+	 * Where the account stands after this claim. The Discord is linked and its roles saved
+	 * either way; this is false when none of them is a qualifying role (and the account had
+	 * no Plus from before).
+	 */
+	hasPlus: boolean
 	discordUsername?: string
 	/**
 	 * The supporter gift paid on this claim — the tokens the server hands a linked role once,
@@ -749,17 +780,23 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 		setPending(true)
 		claimBenefits(code)
 			.then((result) => {
-				setStatus({ hasPlus: true, linked: true })
-				const verified = result.discordUsername
-					? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
-					: 'Verified — Rec Room Plus is now on your account.'
+				setStatus({ hasPlus: result.hasPlus, linked: true })
+				const who = result.discordUsername ? ` as ${result.discordUsername}` : ''
+				// Linked either way; whether Plus came with it depends on the roles. Without a
+				// qualifying role the roles are still saved for the game, and that is said
+				// plainly rather than reading as a failure.
+				const verified = result.hasPlus
+					? `Verified${who} — Rec Room Plus is now on your account.`
+					: `Linked${who} — your Discord roles are saved to your account, but none of them currently grants Rec Room Plus.`
 				// The first-link gift, when one was paid: it's sitting in a box in the game, and
 				// the player would otherwise only find it by opening their gifts.
 				const gift = result.tokensAwarded
 					? ` A welcome gift of ${result.tokensAwarded.toLocaleString()} tokens is waiting in your gift boxes.`
 					: ''
 				setDone(verified + gift)
-				setRelogin(true)
+				// The re-login hint is about Plus riding on the game token; without Plus there
+				// is nothing a sign-in would pick up.
+				setRelogin(result.hasPlus)
 			})
 			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
 			.finally(() => setPending(false))
@@ -777,14 +814,15 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 	}
 
 	const claimed = status?.hasPlus === true
+	const linked = status?.linked === true
 
 	return (
 		<section className="card">
-			<h2>Rec Room Plus</h2>
+			<h2>Link your Discord</h2>
 			<p className="muted">
-				Members of our Discord with a supporter role get Rec Room Plus on their account. Verify with
-				Discord and we’ll check your roles — we only ever read your username and which roles you
-				hold in our server.
+				Link your Discord to carry the roles you hold in our server into the game. Members with a
+				supporter role also get Rec Room Plus on their account. We only ever read your username and
+				which roles you hold in our server.
 			</p>
 			<p className="muted">
 				Claiming as <strong>@{account.username}</strong> (#{account.accountId}). A Discord account
@@ -815,6 +853,21 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 								session your game signed in with.
 							</p>
 						</>
+					)}
+					<button className="linkish" onClick={() => startDiscordAuth(authorizeUrl)}>
+						Re-verify with Discord
+					</button>
+				</>
+			) : linked ? (
+				// Linked, no Plus: a member without a qualifying role, or one who lost it. Their
+				// roles are on the account; re-verifying refreshes them (and grants Plus if a
+				// qualifying role has since been added).
+				<>
+					{!done && (
+						<p className="muted">
+							Your Discord is linked and its roles are saved to this account. None of them currently
+							grants Rec Room Plus.
+						</p>
 					)}
 					<button className="linkish" onClick={() => startDiscordAuth(authorizeUrl)}>
 						Re-verify with Discord
@@ -992,8 +1045,8 @@ const fetchRoomPhotos = (roomId: number): Promise<PublicPhoto[]> =>
 	)
 
 /**
- * Delete a room outright — the staff takedown. `rooms` lets the owner or a developer /
- * moderator through and refuses everyone else; it answers a refusal as a 200 carrying
+ * Delete a room outright — the developer takedown. `rooms` lets the owner or a developer
+ * through and refuses everyone else, moderators included; it answers a refusal as a 200 carrying
  * `Success: false` (the game's envelope), so the check is on the body, not the status.
  */
 async function deleteRoom(roomId: number): Promise<void> {
@@ -1002,6 +1055,23 @@ async function deleteRoom(roomId: number): Promise<void> {
 		{ method: 'DELETE', authed: true }
 	)
 	if (!result.Success) throw new Error(result.Error || 'The room couldn’t be deleted.')
+}
+
+/**
+ * Hide a room from the feeds and search, or list it again — the staff toggle. Not a game
+ * endpoint (the real service set these flags from an admin tool), so it is recflare's own
+ * on `rooms`, staff-only: the owner is refused like anyone else. Both flags move together.
+ * Answers the lowercase `{ success, error, value }` envelope with the updated room.
+ */
+async function setRoomExcluded(roomId: number, excluded: boolean): Promise<OwnedRoom> {
+	const result = await call<{ success: boolean; error: string; value: OwnedRoom | null }>(
+		`${where().rooms}/rooms/${roomId}/exclude`,
+		{ method: 'PUT', authed: true, form: { excluded: String(excluded) } }
+	)
+	if (!result.success || result.value === null) {
+		throw new Error(result.error || 'The room’s listing couldn’t be changed.')
+	}
+	return result.value
 }
 
 /** The `/u/<username>` path, or null for any other path. */
@@ -1155,6 +1225,62 @@ function PhotoGrid({ photos }: { photos: PublicPhoto[] }) {
 				</dialog>
 			)}
 		</>
+	)
+}
+
+/** The `/image/<id>` path's numeric image id, or null for any other path. */
+function imageIdFromPath(path: string): number | null {
+	const match = /^\/image\/(\d+)\/?$/.exec(path)
+	return match ? Number(match[1]) : null
+}
+
+/**
+ * One photo on its own page (`/image/<id>`) — just the image.
+ *
+ * Read through `api`'s `GET /api/images/v6/:id` WITHOUT the session token, deliberately:
+ * that route serves a private image to the player who took it, and this page is a public
+ * link, so it must show only what anyone could see. Signed out or not, a private image is
+ * the same 404 as an unknown id.
+ */
+async function fetchPublicImage(imageId: number): Promise<{ ImageName: string } | null> {
+	const res = await fetch(`${where().api}/api/images/v6/${imageId}`)
+	if (res.status === 404) return null
+	if (!res.ok) throw new Error(`Couldn’t load the image (${res.status}).`)
+	const image = (await res.json()) as { ImageName: string; Accessibility: number }
+	// The route already refuses a private image to an anonymous caller; checked again so
+	// this page can't show one if that ever changes.
+	return image.Accessibility === Accessibility.Public ? image : null
+}
+
+function ImagePage({ imageId, config }: { imageId: number; config: SiteConfig | undefined }) {
+	// undefined = not fetched yet; null = no public image with this id.
+	const [image, setImage] = useState<{ ImageName: string } | null | undefined>(undefined)
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		// Waits for the config for the hostnames, as PlayerPage does.
+		if (config === undefined) return
+		setImage(undefined)
+		setError('')
+		void fetchPublicImage(imageId)
+			.then(setImage)
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [imageId, config])
+
+	return (
+		<main className="shell wide image-page">
+			{error ? (
+				<p className="error">{error}</p>
+			) : image === undefined ? (
+				<p className="muted">Loading…</p>
+			) : image === null ? (
+				<p className="muted">
+					There&apos;s no image here — it&apos;s private, or it doesn&apos;t exist.
+				</p>
+			) : (
+				<img src={`${where().img}/${image.ImageName}`} alt="" />
+			)}
+		</main>
 	)
 }
 
@@ -1328,6 +1454,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	// One message for every box sent from this card; it stays put between sends.
 	const [message, setMessage] = useState('')
 	const [confirmingClear, setConfirmingClear] = useState(false)
+	const [confirmingDorm, setConfirmingDorm] = useState(false)
 	const [itemId, setItemId] = useState('')
 	const [xp, setXp] = useState('')
 	const gift = useAction()
@@ -1335,12 +1462,14 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	const itemGift = useAction()
 	const usernameChange = useAction()
 	const clearPassword = useAction()
+	const clearDorm = useAction()
 	const grantPlus = useAction()
 	const base = `/api/staff/players/${account.accountId}`
 
 	return (
 		<section className="card">
 			<h2>Staff</h2>
+			<PlayerBanStatus playerId={account.accountId} navigate={navigate} />
 			{/* The gifts are developer-only; www refuses them to moderators. */}
 			{isDeveloper() && (
 				<>
@@ -1557,6 +1686,41 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 						Clear password
 					</button>
 				)}
+				{confirmingDorm ? (
+					<>
+						<button
+							type="submit"
+							disabled={clearDorm.pending}
+							onClick={() =>
+								void clearDorm.run(async () => {
+									const res = await call<{ previousSaveId: number | null; saveId: number | null }>(
+										`${base}/clear-dorm`,
+										{ authed: true, method: 'POST' }
+									)
+									setConfirmingDorm(false)
+									if (res.previousSaveId === null)
+										return `@${account.username}'s dorm has never been saved.`
+									if (res.saveId === null) return `@${account.username}'s dorm is already empty.`
+									return `Dorm cleared: @${account.username}'s dorm loads empty now (save ${res.saveId}). Their old dorm is kept as save ${res.previousSaveId}.`
+								})
+							}
+						>
+							{clearDorm.pending ? 'Clearing…' : 'Confirm clear dorm'}
+						</button>
+						<button
+							type="button"
+							className="linkish"
+							disabled={clearDorm.pending}
+							onClick={() => setConfirmingDorm(false)}
+						>
+							Cancel
+						</button>
+					</>
+				) : (
+					<button type="submit" onClick={() => setConfirmingDorm(true)}>
+						Clear dorm
+					</button>
+				)}
 				<button
 					type="submit"
 					onClick={() =>
@@ -1570,10 +1734,17 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 				<strong>Clear password:</strong> Only use if the player has requested a password clear and
 				they can still login via Steam or Meta.
 			</p>
+			<p className="hint">
+				<strong>Clear dorm:</strong> Empties the player&apos;s dorm so it loads in the 2023 client
+				again — a dorm saved in a newer client won&apos;t. It publishes a new, empty save; the old
+				one stays in the dorm&apos;s save history and can be restored.
+			</p>
 			{usernameChange.error && <p className="error">{usernameChange.error}</p>}
 			{usernameChange.done && <p className="ok">{usernameChange.done}</p>}
 			{clearPassword.error && <p className="error">{clearPassword.error}</p>}
 			{clearPassword.done && <p className="ok">{clearPassword.done}</p>}
+			{clearDorm.error && <p className="error">{clearDorm.error}</p>}
+			{clearDorm.done && <p className="ok">{clearDorm.done}</p>}
 			{grantPlus.error && <p className="error">{grantPlus.error}</p>}
 			{grantPlus.done && <p className="ok">{grantPlus.done}</p>}
 		</section>
@@ -1922,8 +2093,12 @@ function HalloweenOverlay() {
 			<style>{HALLOWEEN_CSS}</style>
 			{!off && (
 				<div className="rf-halloween" aria-hidden="true">
-					<span className="rf-halloween-web" style={{ left: 0 }}>🕸️</span>
-					<span className="rf-halloween-web" style={{ right: 0, transform: 'scaleX(-1)' }}>🕸️</span>
+					<span className="rf-halloween-web" style={{ left: 0 }}>
+						🕸️
+					</span>
+					<span className="rf-halloween-web" style={{ right: 0, transform: 'scaleX(-1)' }}>
+						🕸️
+					</span>
 					<LilPumpkin />
 					{HALLOWEEN_SPRITES.map((emoji, i) => (
 						<span
@@ -1965,6 +2140,8 @@ export function App() {
 	const roomId = roomIdFromPath(path)
 	const lookupUsername = usernameFromPath(path)
 	const customAvatarItemId = customAvatarItemIdFromPath(path)
+	const imageId = imageIdFromPath(path)
+	const inventionId = inventionIdFromPath(path)
 
 	useEffect(() => {
 		// Config first, and everything else after it: it carries the hostnames every other
@@ -2060,6 +2237,14 @@ export function App() {
 					signedIn={account === undefined ? undefined : account !== null}
 					navigate={navigate}
 				/>
+			) : inventionId !== null ? (
+				// The store share link for an invention. Public, published inventions only (see
+				// InventionPage); a client-side route like the item page above.
+				<InventionPage inventionId={inventionId} ready={config !== undefined} navigate={navigate} />
+			) : imageId !== null ? (
+				// A photo's own link. Public images only, read without the session (see
+				// ImagePage); a client-side route, so a cold load falls through to the SPA shell.
+				<ImagePage imageId={imageId} config={config} />
 			) : lookupUsername !== null ? (
 				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
 			) : roomId !== null ? (
@@ -2676,6 +2861,7 @@ function RoomPage({
 					room={room}
 					navigate={navigate}
 					onTakenDown={() => setTakenDown(room.Name)}
+					onRoomChange={setRoom}
 				/>
 			) : (
 				<p className="muted">
@@ -2697,10 +2883,13 @@ function PublicRoomView({
 	room,
 	navigate,
 	onTakenDown,
+	onRoomChange,
 }: {
 	room: OwnedRoom
 	navigate: Navigate
 	onTakenDown: () => void
+	/** A staff edit answers with the updated room; the page re-renders from it. */
+	onRoomChange: (room: OwnedRoom) => void
 }) {
 	const [creator, setCreator] = useState<{ username: string; displayName: string } | null>(null)
 	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
@@ -2775,11 +2964,12 @@ function PublicRoomView({
 			</section>
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but `rooms` checks the token's
-			    role itself on the DELETE. */}
+			    role itself on the DELETE (developers only) and the listing PUT. */}
 			{isAdmin() && (
 				<>
 					{isDeveloper() && <StaffRoomTokens room={room} />}
-					<StaffTakedown room={room} onTakenDown={onTakenDown} />
+					<StaffListing room={room} onRoomChange={onRoomChange} />
+					{isDeveloper() && <StaffTakedown room={room} onTakenDown={onTakenDown} />}
 				</>
 			)}
 		</>
@@ -2858,6 +3048,61 @@ function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 				{error && <p className="error">{error}</p>}
 				{done && <p className="ok">{done}</p>}
 			</form>
+		</section>
+	)
+}
+
+/**
+ * The staff listing toggle: one checkbox that sets `ExcludeFromLists` and `ExcludeFromSearch`
+ * together, so a room moderation pulls is gone from the feeds AND unfindable by name, not one
+ * without the other. The lighter hand next to the takedown — the room, its saves and its
+ * link all survive, it just stops being advertised. Writes on change; the room on screen is
+ * swapped for the one the worker answers with, so the box reflects what was stored.
+ */
+function StaffListing({
+	room,
+	onRoomChange,
+}: {
+	room: OwnedRoom
+	onRoomChange: (room: OwnedRoom) => void
+}) {
+	const { pending, error, done, run } = useAction()
+	const hidden = room.ExcludeFromLists === true && room.ExcludeFromSearch === true
+
+	return (
+		<section className="card">
+			<h2>Listing</h2>
+			<label className="check">
+				<input
+					type="checkbox"
+					checked={hidden}
+					disabled={pending}
+					onChange={(e) => {
+						const excluded = e.target.checked
+						void run(async () => {
+							const updated = await setRoomExcluded(room.RoomId, excluded)
+							// Only the flags are taken: the envelope's room is the stored record,
+							// without the live counters the public lookup folds in.
+							onRoomChange({
+								...room,
+								ExcludeFromLists: updated.ExcludeFromLists === true,
+								ExcludeFromSearch: updated.ExcludeFromSearch === true,
+							})
+							return excluded
+								? `^${room.Name} is hidden from the listings and search.`
+								: `^${room.Name} is listed again.`
+						})
+					}}
+				/>
+				Hide from listings and search
+			</label>
+			<p className="hint">
+				Keeps the room out of every browse feed, search and autocomplete. It stays reachable by link
+				and by invite, and its creator keeps everything. Sets both the lists and search exclusions
+				at once.
+			</p>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
 		</section>
 	)
 }
@@ -3775,6 +4020,11 @@ function Dashboard({
 			render: () => <UsernameForm account={account} onChange={onChange} />,
 		},
 		{
+			id: 'displayname',
+			label: 'Display name',
+			render: () => <DisplayNameForm account={account} onChange={onChange} />,
+		},
+		{
 			id: 'email',
 			label: 'Email',
 			render: () => <EmailForm account={account} onChange={onChange} />,
@@ -3796,6 +4046,8 @@ function Dashboard({
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
 					{ id: 'coach', label: 'Coach message', render: () => <CoachMessageForm /> },
+					// The staff member's OWN voice-server pool, not a thing done to anyone else.
+					{ id: 'sandbox', label: 'Sandbox', render: () => <SandboxForm /> },
 				]
 			: []),
 		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
@@ -3809,6 +4061,7 @@ function Dashboard({
 							<>
 								<TokenDropForm />
 								<RoleTokenDropForm />
+								<SupporterBonusCard />
 								<DiscordRoleSyncCard />
 							</>
 						),
@@ -4112,6 +4365,69 @@ function MaintenanceForm() {
 }
 
 /**
+ * Staff only: opt the signed-in account in to or out of the SANDBOX — the separate Tachyon
+ * (voice) server pool `match` hands a sandbox account on every connection-info read. It is
+ * the account's `isSandbox` flag, and www's route only ever sets the caller's own, so this
+ * lives on the account page rather than the staff card on a profile. The current state is
+ * read on mount; one button flips it. `match` reads the flag per room join, so the switch
+ * lands the next time they join a room, not in the instance they are standing in.
+ */
+function SandboxForm() {
+	// undefined = not fetched yet.
+	const [sandbox, setSandbox] = useState<boolean | undefined>(undefined)
+	const [loadError, setLoadError] = useState('')
+	const { pending, error, done, run } = useAction()
+
+	useEffect(() => {
+		void call<{ sandbox: boolean }>('/api/staff/sandbox', { authed: true })
+			.then((res) => setSandbox(res.sandbox))
+			.catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
+	}, [])
+
+	return (
+		<section className="card">
+			<h2>Sandbox</h2>
+			<p className="muted">
+				A sandbox account is put on the sandbox voice servers instead of the live ones, for testing
+				a Tachyon build before players get it. This only changes your own account. It takes effect
+				the next time you join a room.
+			</p>
+			{loadError && <p className="error">{loadError}</p>}
+			{sandbox === undefined && !loadError ? (
+				<p className="muted">Loading…</p>
+			) : sandbox !== undefined ? (
+				<>
+					<p>
+						You are currently {sandbox ? <strong>in</strong> : <strong>out of</strong>} the sandbox.
+					</p>
+					{error && <p className="error">{error}</p>}
+					{done && <p className="ok">{done}</p>}
+					<button
+						type="button"
+						disabled={pending}
+						onClick={() =>
+							void run(async () => {
+								const next = !sandbox
+								const res = await call<{ sandbox: boolean; changed: boolean }>(
+									'/api/staff/sandbox',
+									{ authed: true, method: 'PUT', json: { sandbox: next } }
+								)
+								setSandbox(res.sandbox)
+								return res.sandbox
+									? 'You are in the sandbox. Join a room to land on the sandbox servers.'
+									: 'You are out of the sandbox. Join a room to land back on the live servers.'
+							})
+						}
+					>
+						{pending ? 'Saving…' : sandbox ? 'Leave sandbox' : 'Join sandbox'}
+					</button>
+				</>
+			) : null}
+		</section>
+	)
+}
+
+/**
  * The most a token drop carries per player — a mirror of www's `MAX_TOKEN_DROP`, which is
  * the one that decides. Not imported: the staff module pulls hono and the JWT code into the
  * page bundle for one number.
@@ -4284,6 +4600,88 @@ function RoleTokenDropForm() {
 	)
 }
 
+/** What one run of the supporter gift did — econ's `RoleGiftSummary`, as the route answers. */
+interface RoleGiftSummary {
+	skipped: boolean
+	roles: number
+	links: number
+	granted: number
+	tokens: number
+	failed: number
+}
+
+/**
+ * Developer-only: pay econ's scheduled supporter gift again, right now — a bonus round. Every
+ * player whose linked Discord holds a role in the server's role→tokens map is boxed that
+ * role's tokens, exactly as the weekly cron does it; the amounts and the box message are the
+ * server's, not typed here, which is what tells this apart from the role drop above.
+ *
+ * The gift keeps no ledger, so pressing this pays everyone again on top of whatever the
+ * schedule paid — that is the point, and why the button asks first. A `skipped` run means
+ * no role is mapped on the server, shown as the error it is; a run that went through is
+ * summed up in a sentence.
+ */
+function SupporterBonusCard() {
+	const [confirming, setConfirming] = useState(false)
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Bonus reward</h2>
+			<p className="muted">
+				Run the scheduled supporter reward again now. Everyone whose linked Discord holds a rewarded
+				role gets their role&apos;s tokens in a gift box, online or not, using the amounts and
+				message the server is configured with. It pays on top of the scheduled run, every time it is
+				pressed.
+			</p>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+			{confirming ? (
+				<>
+					<button
+						type="button"
+						disabled={pending}
+						onClick={() =>
+							void run(async () => {
+								const s = await call<RoleGiftSummary>('/api/staff/discord-roles/supporter-gift', {
+									authed: true,
+									method: 'POST',
+								})
+								setConfirming(false)
+								if (s.skipped) {
+									throw new Error(
+										'The supporter reward is off: no Discord role is mapped to tokens on the server.'
+									)
+								}
+								const parts = [
+									`Sent ${s.granted} gift box${s.granted === 1 ? '' : 'es'} for ${s.tokens.toLocaleString()} tokens`,
+									`${s.roles} rewarded role${s.roles === 1 ? '' : 's'} over ${s.links} linked Discord${s.links === 1 ? '' : 's'}`,
+								]
+								if (s.failed > 0) parts.push(`${s.failed} failed — see the worker log`)
+								return `${parts.join(', ')}.`
+							})
+						}
+					>
+						{pending ? 'Sending…' : 'Confirm: pay every supporter again'}
+					</button>
+					<button
+						type="button"
+						className="linkish"
+						disabled={pending}
+						onClick={() => setConfirming(false)}
+					>
+						Cancel
+					</button>
+				</>
+			) : (
+				<button type="button" onClick={() => setConfirming(true)}>
+					Bonus reward!
+				</button>
+			)}
+		</section>
+	)
+}
+
 /** What one run of the Discord role sweep did — www's `SweepSummary`, as the sync answers. */
 interface SweepSummary {
 	skipped: boolean
@@ -4419,6 +4817,61 @@ function UsernameForm({
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending || spent || unchanged}>
 					{pending ? 'Changing…' : 'Change username'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+function DisplayNameForm({
+	account,
+	onChange,
+}: {
+	account: SelfAccount
+	onChange: (a: SelfAccount) => void
+}) {
+	const [displayName, setDisplayName] = useState(account.displayName)
+	const { pending, error, done, run } = useAction()
+
+	const unchanged = displayName.trim() === account.displayName
+
+	return (
+		<section className="card">
+			<h2>Display name</h2>
+			<p className="muted">
+				The name other players see in the game. Changing it doesn&apos;t change what you sign in
+				with.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const saved = displayName.trim()
+						await saveDisplayName(saved)
+						onChange({ ...account, displayName: saved })
+						setDisplayName(saved)
+						return 'Display name saved.'
+					})
+				}}
+			>
+				<label>
+					Display name
+					<input
+						type="text"
+						value={displayName}
+						autoComplete="nickname"
+						maxLength={15}
+						onChange={(e) => setDisplayName(e.target.value)}
+						required
+					/>
+					<span className="hint">
+						Up to 15 characters: letters, numbers, spaces and .,&apos;!?_&amp;()#@:+-
+					</span>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+				<button type="submit" disabled={pending || unchanged}>
+					{pending ? 'Saving…' : 'Save display name'}
 				</button>
 			</form>
 		</section>

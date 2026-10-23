@@ -28,6 +28,7 @@ import type { D1ExecResult } from '../d1'
  *   runx admin clear-password  --username alice [--remote]
  *   runx admin lookup          --username alice [--remote]
  *   runx admin grant-developer --account 1 [--revoke] [--remote]
+ *   runx admin grant-influencer --account 1 [--revoke] [--remote]
  *   runx admin grant-plus      --username alice [--revoke] [--remote]
  *   runx admin reload-plus     <amount> [--dry-run] [--remote]
  *   runx admin cai-load        [--file <export.json>] [--dry-run] [--remote]
@@ -169,6 +170,11 @@ function grantRoleCommand(name: string, jsonKey: string, roleLabel: string, noun
 
 const grantDeveloper = grantRoleCommand('grant-developer', 'isDeveloper', 'developer')
 const grantModerator = grantRoleCommand('grant-moderator', 'isModerator', 'moderator')
+/**
+ * The influencer role, the account's `isInfluencer` flag. `auth` stamps it into the token's
+ * `role` claim as `influencer` on the next login; nothing else reads the flag.
+ */
+const grantInfluencer = grantRoleCommand('grant-influencer', 'isInfluencer', 'influencer')
 
 /**
  * Rec Room Plus, the account's `hasPlus` flag. Players normally get it themselves by
@@ -270,8 +276,14 @@ const reloadPlus = new Command('reload-plus')
 		console.log(chalk.green(`✓ ${amount} tokens added to ${credited.length} account(s)`))
 	})
 
-/** The export `cai-load` reads when no `--file` is given. */
-const CUSTOM_AVATAR_ITEM_EXPORT = 'apps/econ/static/db/2025-1-cai.json'
+/**
+ * The exports `cai-load` reads when no `--file` is given, in PRECEDENCE order: each only adds
+ * ids the ones before it lack, so the studio87 extras never overwrite a 2025 item.
+ */
+const CUSTOM_AVATAR_ITEM_EXPORTS = [
+	'apps/econ/static/db/2025-1-cai.json',
+	'apps/econ/static/db/studio87-extras.json',
+]
 
 /**
  * Load the first-party custom avatar items into `custom_avatar_item` (owned by the `api`
@@ -287,9 +299,9 @@ const CUSTOM_AVATAR_ITEM_EXPORT = 'apps/econ/static/db/2025-1-cai.json'
 const caiLoad = new Command('cai-load')
 	.description('Load first-party custom avatar items from an export JSON (merges; never deletes)')
 	.option(
-		'--file <path>',
-		'The export to load, relative to the repo root',
-		CUSTOM_AVATAR_ITEM_EXPORT
+		'--file <paths...>',
+		'The export(s) to load, relative to the repo root (default: every committed export)',
+		CUSTOM_AVATAR_ITEM_EXPORTS
 	)
 	.option(
 		'--dry-run',
@@ -300,18 +312,35 @@ const caiLoad = new Command('cai-load')
 	.option('--remote', 'Target the deployed database instead of the local dev database.', false)
 	.action(async (opts) => {
 		const remote = resolveRemote(opts)
-		const full = path.isAbsolute(opts.file) ? opts.file : path.join(getRepoRoot(), opts.file)
-		if (!(await fs.pathExists(full))) throw new Error(`no export at ${opts.file}`)
-		// Tolerate the BOM a .NET export carries (`JSON.parse` rejects U+FEFF).
-		const text = (await fs.readFile(full, 'utf8')).replace(/^\uFEFF/, '')
-		const records = readCustomAvatarItemExport(JSON.parse(text) as unknown)
+		// A later export only ADDS: an id an earlier one already holds is skipped, never replaced.
+		// (A duplicate within one export is still refused.)
+		const records: ReturnType<typeof readCustomAvatarItemExport> = []
+		const seen = new Set<string>()
+		for (const file of opts.file) {
+			const full = path.isAbsolute(file) ? file : path.join(getRepoRoot(), file)
+			if (!(await fs.pathExists(full))) throw new Error(`no export at ${file}`)
+			// Tolerate the BOM a .NET export carries (`JSON.parse` rejects U+FEFF).
+			const text = (await fs.readFile(full, 'utf8')).replace(/^\uFEFF/, '')
+			let skipped = 0
+			for (const record of readCustomAvatarItemExport(JSON.parse(text) as unknown)) {
+				if (seen.has(record.CustomAvatarItemId)) {
+					skipped++
+					continue
+				}
+				seen.add(record.CustomAvatarItemId)
+				records.push(record)
+			}
+			if (skipped > 0) {
+				console.log(chalk.yellow(`${file}: skipped ${skipped} id(s) an earlier export holds`))
+			}
+		}
 		if (records.length === 0)
 			throw new Error('the export holds no records — refusing to call that a load')
 		const statements = customAvatarItemUpsertStatements(records)
 		const sql = statements.join('\n')
 
 		console.log(
-			`Merging ${records.length} custom avatar items from ${opts.file} into ${target(remote)}`
+			`Merging ${records.length} custom avatar items from ${opts.file.join(', ')} into ${target(remote)}`
 		)
 		if (opts.dryRun) {
 			console.log(
@@ -394,6 +423,7 @@ const lookup = new Command('lookup')
 			(json_extract(data, '$.passwordHash') IS NOT NULL) AS hasPassword,
 			(json_extract(data, '$.isDeveloper') = 1) AS isDeveloper,
 			(json_extract(data, '$.isModerator') = 1) AS isModerator,
+			(json_extract(data, '$.isInfluencer') = 1) AS isInfluencer,
 			(json_extract(data, '$.hasStudio') = 1) AS hasStudio
 			FROM account WHERE ${where}`
 		const res = await execSql(sql, remote)
@@ -408,7 +438,13 @@ const lookup = new Command('lookup')
 				: typeof v === 'object'
 					? JSON.stringify(v)
 					: String(v as number | string | boolean)
-		const boolKeys = new Set(['hasPassword', 'isDeveloper', 'isModerator', 'hasStudio'])
+		const boolKeys = new Set([
+			'hasPassword',
+			'isDeveloper',
+			'isModerator',
+			'isInfluencer',
+			'hasStudio',
+		])
 		const table = new Table()
 		for (const [key, value] of Object.entries(row)) {
 			const shown = boolKeys.has(key) ? (value === 1 ? 'yes' : 'no') : asText(value)
@@ -426,6 +462,7 @@ export const adminCmd = new Command('admin')
 	.addCommand(clearPassword)
 	.addCommand(grantDeveloper)
 	.addCommand(grantModerator)
+	.addCommand(grantInfluencer)
 	.addCommand(grantPlus)
 	.addCommand(grantStudio)
 	.addCommand(reloadPlus)
@@ -447,7 +484,7 @@ Examples:
   $ runx admin grant-plus --username alice          # Rec Room Plus; takes effect next login
   $ runx admin reload-plus 1000 --remote            # +1000 tokens to every Plus subscriber
   $ runx admin reload-plus 1000 --dry-run           # just list them
-  $ runx admin cai-load                             # merge the first-party custom items (local)
+  $ runx admin cai-load                             # merge every committed first-party export (local)
   $ runx admin cai-load --remote --file path/to/export.json
   $ runx admin lookup --username alice --remote`
 	)

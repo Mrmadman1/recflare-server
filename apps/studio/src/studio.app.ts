@@ -3,17 +3,22 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	canManageRoomById,
+	getAccount,
 	getPlayerIdsInRoomSubRoom,
 	getRoomCoOwnerIds,
 	getSubRoom,
 } from '@repo/domain'
 import { withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
+import { studioBuildValidationId, validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
-import { listCloudBuilds, storeLocalCloudBuild } from './local-builds'
+import cloudBuilds from './cloud-builds'
+import distribution from './distribution'
+import { getUserBuildCount, listCloudBuilds, storeLocalCloudBuild } from './local-builds'
+import { parseMultipart } from './multipart'
 
 import type { Context } from 'hono'
 import type { App } from './context'
+import type { FormFields } from './multipart'
 
 /**
  * A query id the editor already validated as a positive integer. Anything else is
@@ -24,6 +29,13 @@ function positiveId(raw: string | undefined): number | null {
 	if (raw == null || !/^[1-9]\d*$/.test(raw)) return null
 	const id = Number(raw)
 	return Number.isSafeInteger(id) ? id : null
+}
+
+/** SQLite datetime() is UTC, but its space-separated output is not a .NET JSON DateTime. */
+function accessTimestamp(value: string | undefined, fallback: string): string {
+	const normalized = value?.replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/, '$1T$2Z')
+	const time = normalized ? Date.parse(normalized) : NaN
+	return Number.isFinite(time) ? new Date(time).toISOString() : fallback
 }
 
 const BUNDLE_REQUIRED = 'Both a Windows bundle and an Android bundle are required.'
@@ -55,7 +67,7 @@ function rejected(c: Context<App>, status: 400 | 403 | 404, error: string) {
 	return c.json({ success: false, error, value: null }, status)
 }
 
-function formText(form: Record<string, unknown>, name: string): string | undefined {
+function formText(form: FormFields, name: string): string | undefined {
 	const value = form[name]
 	return typeof value === 'string' ? value : undefined
 }
@@ -68,7 +80,7 @@ function bundleFilename(name: string): string {
 }
 
 async function bundlePart(
-	form: Record<string, unknown>,
+	form: FormFields,
 	field: string,
 	platform: 'windows' | 'android',
 	kind: 'main' | 'stripped'
@@ -97,7 +109,9 @@ async function postLocalCloudBuild(c: Context<App>) {
 	// Same claim the editor treats as Full Studio access. Developer does not confer it.
 	if (!roles.includes('betastudio')) return rejected(c, 403, NOT_AUTHORIZED)
 
-	const form = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+	// Not `c.req.parseBody()`: the editor leaves its form-data names unquoted, which the
+	// runtime's parser rejects outright. See multipart.ts.
+	const form = await parseMultipart(c.req.raw)
 
 	const roomId = positiveId(formText(form, 'roomId'))
 	if (roomId == null) return rejected(c, 404, 'No such room.')
@@ -156,10 +170,78 @@ const app = new Hono<App>()
 
 	.onError(withOnError())
 	.notFound(withNotFound())
+	.route('/', cloudBuilds)
+	.route('/', distribution)
 
 	.get('/', async (c) => {
 		return c.text('hello, world!')
 	})
+	.get('/access/override/:accountId{[1-9][0-9]*}', async (c) => {
+		const secret = await c.env.JWT_SECRET.get()
+		const caller = await validateAndGetAccountId(c.req.raw, secret)
+		const id = Number(c.req.param('accountId'))
+		if (!Number.isSafeInteger(id)) return c.body(null, 400)
+		let roles = await validateAndGetRoles(c.req.raw, secret)
+		if (caller === null) {
+			const buildId = await studioBuildValidationId(c.req.raw, secret)
+			if (!buildId) return c.body(null, 401)
+			const job = await c.env.DB.prepare(
+				"SELECT payload FROM studio_cloud_build_job WHERE cloud_build_id=? AND status='building' AND lease_until>?"
+			)
+				.bind(buildId, new Date().toISOString())
+				.first<{ payload: string }>()
+			if (!job) return c.body(null, 403)
+			const payload = JSON.parse(job.payload) as {
+				roomId: number
+				room?: { Roles?: Array<{ AccountId: number; Role: number }> }
+			}
+			if (
+				!payload.roomId ||
+				!payload.room?.Roles?.some((r) => r.AccountId === id && [30, 255].includes(r.Role))
+			)
+				return c.body(null, 403)
+			if (!(await getRoomCoOwnerIds(c.env.DB, payload.roomId))?.includes(id))
+				return c.body(null, 403)
+			const account = await getAccount(c.env.DB, id)
+			roles = account?.hasStudio ? ['betastudio'] : []
+		}
+		if (
+			caller !== null &&
+			caller !== id &&
+			!roles?.some((r) => r === 'developer' || r === 'moderator')
+		) {
+			// The SDK validates a registry against every owner of its room. Allow
+			// peers to inspect grants only when both currently manage the same room.
+			const shared = await c.env.DB.prepare(
+				`SELECT 1 FROM room r WHERE
+			 (r.creator_account_id=?1 OR EXISTS (SELECT 1 FROM json_each(r.data,'$.Roles') role WHERE json_extract(role.value,'$.AccountId')=?1 AND json_extract(role.value,'$.Role') IN (30,255))) AND
+			 (r.creator_account_id=?2 OR EXISTS (SELECT 1 FROM json_each(r.data,'$.Roles') role WHERE json_extract(role.value,'$.AccountId')=?2 AND json_extract(role.value,'$.Role') IN (30,255))) LIMIT 1`
+			)
+				.bind(caller, id)
+				.first()
+			if (!shared) return c.body(null, 403)
+		}
+		// Inspection authorization above belongs to the caller; this grant belongs to the target.
+		if (caller !== null && caller !== id)
+			roles = (await getAccount(c.env.DB, id))?.hasStudio ? ['betastudio'] : []
+		const grant = await c.env.DB.prepare(
+			'SELECT flags,created_at,modified_at FROM avatar_studio_access WHERE account_id=?'
+		)
+			.bind(id)
+			.first<{ flags: number; created_at: string; modified_at: string }>()
+		const flags = roles?.includes('betastudio') ? (grant?.flags ?? 0) : 0
+		const now = new Date().toISOString()
+		return c.json({
+			AccountId: id,
+			StudioAccess: roles?.includes('betastudio') ? 1 : 2,
+			AvatarStudioAccess: flags,
+			CreatedAt: accessTimestamp(grant?.created_at, now),
+			ModifiedAt: accessTimestamp(grant?.modified_at, now),
+		})
+	})
+	// There is no circuit recommendation corpus on a fresh deployment. An empty
+	// list is the SDK's supported no-recommendations state, not a failed lookup.
+	.get('/commonQuery/rrstudio/chiprecommendations', (c) => c.json([]))
 
 	// The editor lists a room's cloud builds with
 	// GET /cloud-builds/for-room?roomId=&subRoomId=&skip=&take= on this host.
@@ -177,6 +259,28 @@ const app = new Hono<App>()
 
 	// Local Windows + Android bundles from the editor button under Upload.
 	.post('/cloud-builds/from-editor', (c) => postLocalCloudBuild(c))
+
+	// CloudBuildRateLimitConfigDTO reads these three fields directly (no Result
+	// envelope). Missing MaxBuildsPerInterval becomes zero and blocks the first build.
+	.get('/cloud-builds/get-rate-limit-config', (c) =>
+		c.json({
+			buildThrottleIntervalHours: 1,
+			warnAfterBuildsPerInterval: 90,
+			maxBuildsPerInterval: 100,
+		})
+	)
+
+	// Studio checks the authenticated user's counts before it starts a build. The
+	// 2026 editor treats a missing route as a fatal error and silently stops upload.
+	.get('/cloud-builds/get-build-count-for-user', async (c) => {
+		const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+		if (accountId == null) return c.body(null, 401)
+		return c.json({
+			success: true,
+			error: null,
+			value: await getUserBuildCount(c.env.DB, accountId),
+		})
+	})
 
 	// Who of this room's co-owners is standing in this subroom right now. Studio
 	// shows them as "Co-owners in Room" and reads a Result<List<int>>: `success`

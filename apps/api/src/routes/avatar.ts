@@ -13,6 +13,7 @@ import {
 	MAX_BULK_OUTFIT_ACCOUNTS,
 	setOutfit,
 } from '@repo/domain'
+import { SNIFFED_IMAGE_FORMATS, sniffImage } from '@repo/hono-helpers'
 
 import {
 	createCustomAvatarItem,
@@ -473,13 +474,17 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			summary: 'Create a custom avatar item',
 			description:
 				'Multipart: a `metadata` JSON text field plus two file parts, `thumbnailImage` ' +
-				'(PNG) and `design` (the design blob). Inserts a `custom_avatar_item` row owned ' +
+				'(PNG) and `design` (the design PNG). Inserts a `custom_avatar_item` row owned ' +
 				'by the caller and answers with it in the PascalCase `{ Value, Success, Error, ' +
 				'error_id }` envelope. The item is filed under `OutfitType` 105, the custom shirt, ' +
 				'which is what the store’s user-generated-content tab searches for.\n\n' +
 				'The two files go to the shared image bucket (`recflare-img`) under ' +
 				'`avatar-item/<date>/<id>-thumb.png` and `avatar-item/<date>/<id>-design.png`; those ' +
-				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row.\n\n' +
+				'keys are the `ThumbnailImageFilename` / `DesignFilename` on the row. Each file is ' +
+				'identified by its bytes — the client posts them under `.bin` names — and must be a ' +
+				'PNG or JPEG; the key’s extension and the stored content-type come ' +
+				'from that signature, and anything else is refused with a 400 before either file is ' +
+				'written.\n\n' +
 				'`Price` is capped at 1000 tokens (`MAX_PLAYER_ITEM_PRICE`); one above it, or below ' +
 				'0, is refused with a 400 rather than clamped.',
 			security: AUTHED,
@@ -488,7 +493,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				200: json(CustomAvatarItemResponse, 'The created item'),
 				400: json(
 					CustomAvatarItemResponse,
-					'Missing or malformed metadata / files, or a `Price` outside 0–1000'
+					'Missing or malformed metadata / files, a file that is not an image, or a `Price` outside 0–1000'
 				),
 				401: UNAUTHORIZED_RESPONSE,
 				413: json(CustomAvatarItemResponse, 'Either file exceeds the configured per-file limit'),
@@ -550,19 +555,30 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				)
 			}
 
+			// The parts' filenames and content-types are the uploader's claims (the client
+			// posts both as `.bin`); the `img` worker serves each back under whatever type is
+			// stored, so the extension and the stored type come from the bytes. Both are
+			// checked before either is written, so a refusal leaves nothing in R2.
+			const thumbnailBytes = new Uint8Array(await body.thumbnailImage.arrayBuffer())
+			const thumbnail = sniffImage(thumbnailBytes)
+			if (!thumbnail) return fail(`thumbnailImage is not a ${SNIFFED_IMAGE_FORMATS} image`)
+			const designBytes = new Uint8Array(await body.design.arrayBuffer())
+			const design = sniffImage(designBytes)
+			if (!design) return fail(`design is not a ${SNIFFED_IMAGE_FORMATS} image`)
+
 			// Both files go to the shared image bucket, foldered by upload date and keyed by
 			// the item's id (chosen here so the keys can carry it). The `img` worker serves
 			// them back by key.
 			const customAvatarItemId = crypto.randomUUID()
 			const prefix = `avatar-item/${new Date().toISOString().slice(0, 10)}/${customAvatarItemId}`
-			const thumbnailImageFilename = `${prefix}-thumb.png`
-			const designFilename = `${prefix}-design.png`
+			const thumbnailImageFilename = `${prefix}-thumb${thumbnail.extension}`
+			const designFilename = `${prefix}-design${design.extension}`
 			await Promise.all([
-				c.env.IMAGES.put(thumbnailImageFilename, await body.thumbnailImage.arrayBuffer(), {
-					httpMetadata: { contentType: body.thumbnailImage.type || 'image/png' },
+				c.env.IMAGES.put(thumbnailImageFilename, thumbnailBytes, {
+					httpMetadata: { contentType: thumbnail.contentType },
 				}),
-				c.env.IMAGES.put(designFilename, await body.design.arrayBuffer(), {
-					httpMetadata: { contentType: body.design.type || 'image/png' },
+				c.env.IMAGES.put(designFilename, designBytes, {
+					httpMetadata: { contentType: design.contentType },
 				}),
 			])
 
@@ -1732,8 +1748,9 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	)
 
 	// Invention search/browse: published inventions matching `value` (matched against
-	// name + description; absent → browse everything published), newest first.
-	// Paginated via skip/take (take defaults to 100). Returns a bare array.
+	// name + description; absent → browse everything published; `@username` → that
+	// player's published inventions), newest first. Paginated via skip/take (take
+	// defaults to 100). Returns a bare array.
 	//
 	// Filtered, ordered and paged in SQL — it must not read the catalogue into memory to
 	// answer one page.
@@ -1746,10 +1763,16 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'Published inventions matching `value`, newest first. `value` is split into terms ' +
 				'and every term must match, each against the name and the description. An absent ' +
 				'`value` browses everything published — that is the browse screen’s initial ' +
-				'request. Tags are NOT searched: a `#tag` term from the browse screen’s filter ' +
-				'chips is treated as text and matches nothing.',
+				'request. A `value` starting with `@` names a player: `@djdevin` lists that ' +
+				'player’s PUBLISHED inventions (the same set `v1/fromcreators` serves), resolved by ' +
+				'username case-insensitively, with any further terms narrowing them as text; an ' +
+				'unknown username is an empty array. Tags are NOT searched: a `#tag` term from the ' +
+				'browse screen’s filter chips is treated as text and matches nothing.',
 			parameters: [
-				stringQuery('value', 'Search text; absent browses everything'),
+				stringQuery(
+					'value',
+					'Search text; absent browses everything; `@username` is a player’s inventions'
+				),
 				...pageParams(100),
 			],
 			responses: { 200: json(InventionDto.array(), 'The matching inventions') },

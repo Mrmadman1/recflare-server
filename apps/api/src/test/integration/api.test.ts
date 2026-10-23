@@ -95,6 +95,9 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** The PNG signature — the least an upload route accepts as an image. */
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
 // `/api/rooms/v1/verifyRole` reads room roles from the shared recflare D1. Set
 // up the schema (matching the rooms worker's migration) + a couple of rooms.
 const TEST_ROOMS = [
@@ -286,7 +289,7 @@ describe('public endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/config/v1/backtrace`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { ReportBudget: number; VersionRegex: string }
-		expect(body).toMatchObject({ ReportBudget: 125, VersionRegex: '.*' })
+		expect(body).toMatchObject({ ReportBudget: 0, ANRThresholdMs: 0, VersionRegex: '' })
 	})
 
 	test('GET /api/versioncheck/v4 reports current for the matching build', async () => {
@@ -301,6 +304,18 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('GET /api/versioncheck/v4 ignores the point release: every .NN of a supported build is current', async () => {
+		// The list holds bare dates; the client reports `YYYYMMDD.NN`, and the `.NN` is a
+		// same-day rebuild of the same build. All of these are the beta build.
+		for (const version of ['20250718.01', '20250718.2', '20250718', '20250718.99']) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			expect(await res.json(), version).toMatchObject({ VersionStatus: 0 })
+		}
+		// ...and a point release of a build that ISN'T supported is still not.
+		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101.01`)
+		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
+	})
+
 	test('GET /api/versioncheck/v4 flags a mismatched build', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101`)
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
@@ -309,6 +324,56 @@ describe('public endpoints', () => {
 	test('GET /api/versioncheck/v4 flags a client that sends no build', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4`)
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
+	})
+
+	// The list is the operator's SUPPORTED_GAME_VERSIONS var when set, plus every build
+	// under rollout (ROLLOUT_GAME_VERSIONS) — the same lists `auth` gates tokens on, so a
+	// build told to update here is refused there too.
+	test('GET /api/versioncheck/v4 reads the lists from vars', async () => {
+		const status = async (version: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			return ((await res.json()) as { VersionStatus: number }).VersionStatus
+		}
+		const originals = {
+			SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+			ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+		}
+		try {
+			// Forced upgrade: the 2025 build drops out, every point release of it.
+			env.SUPPORTED_GAME_VERSIONS = '20230414,20260323'
+			expect(await status('20250718.01')).toBe(1)
+			expect(await status('20250718')).toBe(1)
+			expect(await status(GAME_VERSION)).toBe(0)
+			expect(await status('20260323.14')).toBe(0)
+			// Alphas not named in the var are gone too: the var replaces the default list.
+			expect(await status('20231207')).toBe(1)
+
+			// A build under rollout is current even when the var omits it: who may sign in on
+			// it is `auth`'s call, and the version check must not send a supporter to update.
+			env.SUPPORTED_GAME_VERSIONS = '20230414'
+			expect(await status('20260323.14')).toBe(0)
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await status('20260323.14')).toBe(1)
+			env.ROLLOUT_GAME_VERSIONS = '20250718'
+			expect(await status('20250718.01')).toBe(0)
+
+			// Entries are builds: a copied point release matches, and `off` empties the list.
+			env.ROLLOUT_GAME_VERSIONS = undefined
+			env.SUPPORTED_GAME_VERSIONS = '20250718.01'
+			expect(await status('20250718.2')).toBe(0)
+			expect(await status(GAME_VERSION)).toBe(1)
+			env.SUPPORTED_GAME_VERSIONS = 'off'
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(1)
+
+			// Blank is unset: the default list.
+			env.SUPPORTED_GAME_VERSIONS = ''
+			env.ROLLOUT_GAME_VERSIONS = ''
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(0)
+		} finally {
+			env.SUPPORTED_GAME_VERSIONS = originals.SUPPORTED_GAME_VERSIONS
+			env.ROLLOUT_GAME_VERSIONS = originals.ROLLOUT_GAME_VERSIONS
+		}
 	})
 
 	// Two catalogs, picked off the token's `rn.ver`: a build newer than GAME_VERSION gets
@@ -331,6 +396,9 @@ describe('public endpoints', () => {
 
 	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the target build', async () => {
 		expect(await gameConfigKeys(GAME_VERSION)).not.toContain(KEY_2025_ONLY)
+		// A same-day point release of the target is the target build: compared as a build,
+		// not as a string that happens to sort after `20230414`.
+		expect(await gameConfigKeys(`${GAME_VERSION}.01`)).not.toContain(KEY_2025_ONLY)
 	})
 
 	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to an older build', async () => {
@@ -1723,8 +1791,8 @@ describe('public endpoints', () => {
 				...metadata,
 			})
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'f.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'f.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer(creator),
@@ -2066,12 +2134,73 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(400)
 	})
 
-	test('GET /api/progressionEvents/active is a bare 0 (no auth)', async () => {
-		// 0 is the "no active event" value; the client reads it as "no event running" and
-		// skips the event UI. A 404 would stall its load instead.
-		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/active`)
+	test('GET /api/players/v1/progression/xpEarnedToday is a bare 0', async () => {
+		// A plain int on the client. It must not fall through to `/progression/:id`, which
+		// would read the path segment as an account id and answer a progression OBJECT.
+		const res = await exports.default.fetch(`${ORIGIN}/api/players/v1/progression/xpEarnedToday`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toBe(0)
+	})
+
+	test('GET /api/progressionEvents/active is a bare 18 (no auth)', async () => {
+		// A hardcoded stub: the id of an archived event (0 would mean "no active event").
+		// A 404 would stall the client's load instead.
+		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/active`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(18)
+	})
+
+	test('GET /api/progressionEvents/event/:id serves the archived event verbatim', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/18`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toMatchObject({
+			ProgressionEventId: 18,
+			Name: 'Yetis Challenge',
+			Rewards: [],
+			KeepsakeRoomLists: [],
+			EventLeaderboardId: 18,
+		})
+
+		// A keepsake room's id is 64-bit: it has to reach the client as written, not as the
+		// nearest double (…705361 parses to …705000), so the body is checked as text.
+		const base = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/8`)
+		expect(await base.text()).toContain('"RoomId": 8364812036745705361')
+
+		// The archive has gaps, and an id it doesn't hold is a 404.
+		const missing = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/4`)
+		expect(missing.status).toBe(404)
+	})
+
+	test('GET /api/progressionEvents/record/:id is an empty record for the caller', async () => {
+		const url = `${ORIGIN}/api/progressionEvents/record/18`
+		expect((await exports.default.fetch(url)).status).toBe(401)
+
+		const res = await exports.default.fetch(url, { headers: await bearer('2') })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({
+			AccountId: 2,
+			ProgressionEventId: 18,
+			Xp: 0,
+			GameMinutesToday: 0,
+			RewardsCollected: 0,
+			BonusRewardsCollected: 0,
+			XpBoostLastPurchasedAt: null,
+			PremiumRewardsCollected: 0,
+			LimitedRewardCollectionState: 0,
+		})
+
+		// The id is echoed, whichever event is asked for.
+		const other = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/record/7`, {
+			headers: await bearer('2'),
+		})
+		expect(await other.json()).toMatchObject({ ProgressionEventId: 7 })
+	})
+
+	test('GET /api/purchasableXpBoosts/activations is the empty page', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/purchasableXpBoosts/activations`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({ Results: [], TotalResults: 0 })
 	})
 
 	test('GET /api/rooms/v1/filters returns an object with filter arrays', async () => {
@@ -3458,9 +3587,9 @@ describe('public endpoints', () => {
 				body: JSON.stringify({ inventionDataFilename: 'a.inv', ...fields }),
 			})
 
-		// A name is 3–24 characters of letters, digits, spaces, dashes and colons.
+		// A name is 3–40 characters of letters, digits, spaces, dashes and colons.
 		expect((await save({ name: 'ab' })).status).toBe(400)
-		expect((await save({ name: 'a'.repeat(25) })).status).toBe(400)
+		expect((await save({ name: 'a'.repeat(41) })).status).toBe(400)
 		expect((await save({ name: 'Rocket!' })).status).toBe(400)
 		expect((await save({ name: 'Café Lamp' })).status).toBe(400)
 		const ok = await save({ name: 'Rocket Sofa-Bed 2' })
@@ -3669,6 +3798,55 @@ describe('public endpoints', () => {
 
 		const miss = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/search?value=nomatch`)
 		expect(await miss.json()).toEqual([])
+	})
+
+	test('GET /api/inventions/v2/search with `@username` lists that player’s published inventions', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 8082, username: 'DJDevin' }))
+			.run()
+		const invention = (id: number, creator: number, name: string): SavedInvention =>
+			({
+				InventionId: id,
+				ReplicationId: crypto.randomUUID(),
+				CreatorPlayerId: creator,
+				Name: name,
+				Description: '',
+				ImageName: '',
+				CurrentVersionNumber: 1,
+				CurrentVersion: { InventionId: id, VersionNumber: 1, BlobName: '' },
+				IsPublished: true,
+				HideFromPlayer: false,
+				CreatedAt: `2026-07-${String(id - 100).padStart(2, '0')}T00:00:00Z`,
+			}) as unknown as SavedInvention
+		for (const inv of [
+			invention(111, 8082, 'Devin Sofa'),
+			invention(112, 8082, 'Devin Lamp'),
+			// Another creator mentioning the name is NOT this player's invention.
+			{ ...invention(113, 8083, 'Tribute to @djdevin'), Description: 'by @djdevin' },
+			// Unpublished and hidden ones stay private, even to a search for the creator.
+			{ ...invention(114, 8082, 'Devin Draft'), IsPublished: false },
+			{ ...invention(115, 8082, 'Devin Hidden'), HideFromPlayer: true },
+		]) {
+			await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+				.bind(JSON.stringify(inv))
+				.run()
+		}
+		const ids = async (value: string): Promise<number[]> => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v2/search?value=${encodeURIComponent(value)}&skip=0&take=100`
+			)
+			expect(res.status).toBe(200)
+			return ((await res.json()) as SavedInvention[]).map((i) => i.InventionId)
+		}
+
+		// The player's published inventions, newest first; the username is case-insensitive.
+		expect(await ids('@djdevin')).toEqual([112, 111])
+		expect(await ids('@DJDevin')).toEqual([112, 111])
+		// Further terms narrow within that player's inventions.
+		expect(await ids('@djdevin lamp')).toEqual([112])
+		// An unknown player is nothing — not a text search for the literal "@nobody".
+		expect(await ids('@nobody')).toEqual([])
+		expect(await ids('@')).toEqual([])
 	})
 
 	test('GET /api/inventions/v2/search filters and pages in SQL, and does not search tags', async () => {
@@ -4631,6 +4809,59 @@ describe('public endpoints', () => {
 		})
 	})
 
+	describe('POST /api/sanitize/v2/isAllowed/bulk', () => {
+		const bulk = async (body: URLSearchParams | FormData, authed = true) =>
+			exports.default.fetch(`${ORIGIN}/api/sanitize/v2/isAllowed/bulk`, {
+				method: 'POST',
+				headers: authed ? await bearer('42') : {},
+				body,
+			})
+
+		test('401s without a token', async () => {
+			expect((await bulk(new URLSearchParams('Values=hello'), false)).status).toBe(401)
+		})
+
+		test('preserves repeated values, order, empty text and duplicates in the Studio envelope', async () => {
+			const body = new URLSearchParams()
+			for (const text of ['MakerRoom', 'fuck this', '', 'Scunthorpe', 'MakerRoom', 'sh1t'])
+				body.append('Values', text)
+			const res = await bulk(body)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [true, false, true, true, true, false] },
+			})
+		})
+
+		test('accepts a single multipart value and an empty batch', async () => {
+			const body = new FormData()
+			body.append('Values', 'a$$hole')
+			expect(await (await bulk(body)).json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [false] },
+			})
+			expect(await (await bulk(new URLSearchParams())).json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [] },
+			})
+		})
+
+		test('rejects file values rather than marking them clean', async () => {
+			const body = new FormData()
+			body.append('Values', new Blob(['hello']), 'text.txt')
+			const res = await bulk(body)
+			expect(res.status).toBe(400)
+			expect(await res.json()).toEqual({
+				Success: false,
+				Error: 'Values must be strings.',
+				Value: null,
+			})
+		})
+	})
+
 	describe('POST /api/sanitize/v1/isPure', () => {
 		const isPure = async (Value?: string, authed = true) =>
 			exports.default.fetch(`${ORIGIN}/api/sanitize/v1/isPure`, {
@@ -4738,11 +4969,8 @@ describe('custom avatar items', () => {
 				Accessibility: 0,
 			})
 		)
-		form.set(
-			'thumbnailImage',
-			new File([new Uint8Array([1, 2, 3])], 'file.bin', { type: 'image/png' })
-		)
-		form.set('design', new File([new Uint8Array([4, 5, 6])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer('205'),
@@ -4789,14 +5017,10 @@ describe('custom avatar items', () => {
 
 		// Both uploads landed in the image bucket under those keys.
 		const thumb = await env.IMAGES.get(body.Value.ThumbnailImageFilename as string)
-		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([1, 2, 3])
-		)
+		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 		expect(thumb!.httpMetadata?.contentType).toBe('image/png')
 		const design = await env.IMAGES.get(body.Value.DesignFilename as string)
-		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([4, 5, 6])
-		)
+		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 
 		// The row is the record as JSON, with the queried fields generated off it.
 		const row = await env.DB.prepare(
@@ -4885,8 +5109,8 @@ describe('custom avatar items', () => {
 				'metadata',
 				JSON.stringify({ Name: 'Pricey', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff', Price })
 			)
-			form.set('thumbnailImage', new File([new Uint8Array([1])], 't.png', { type: 'image/png' }))
-			form.set('design', new File([new Uint8Array([2])], 'd.png', { type: 'image/png' }))
+			form.set('thumbnailImage', new File([PNG_BYTES], 't.png', { type: 'image/png' }))
+			form.set('design', new File([PNG_BYTES], 'd.png', { type: 'image/png' }))
 			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
 				headers: await bearer('205'),
@@ -5025,8 +5249,8 @@ describe('custom avatar items', () => {
 			'metadata',
 			JSON.stringify({ Name: 'Gone', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'file.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const created = (await (
 			await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
@@ -5129,6 +5353,48 @@ describe('custom avatar items', () => {
 		} finally {
 			env.RECFLARE_MAX_API_UPLOAD_BYTES = previous
 		}
+	})
+
+	// Both files are identified by their bytes — the client posts them as `.bin` under
+	// `image/png` — and the `img` worker serves each under its stored type, so a non-image
+	// is refused before either file or the row is written.
+	test('POST refuses a file whose bytes are not an image, writing nothing', async () => {
+		const objectsBefore = (await env.IMAGES.list({ prefix: 'avatar-item/' })).objects.length
+		const upload = async (thumbnail: string | Uint8Array, design: string | Uint8Array) => {
+			const form = new FormData()
+			form.set(
+				'metadata',
+				JSON.stringify({ Name: 'not-image', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
+			)
+			form.set('thumbnailImage', new File([thumbnail], 'f.bin', { type: 'image/png' }))
+			form.set('design', new File([design], 'f.bin', { type: 'image/png' }))
+			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+				method: 'POST',
+				headers: await bearer('205'),
+				body: form,
+			})
+		}
+		const html = '<script>alert(1)</script>'
+
+		const badThumbnail = await upload(html, PNG_BYTES)
+		expect(badThumbnail.status).toBe(400)
+		expect(await badThumbnail.json()).toMatchObject({
+			Success: false,
+			Error: 'thumbnailImage is not a PNG or JPEG image',
+		})
+
+		const badDesign = await upload(PNG_BYTES, html)
+		expect(badDesign.status).toBe(400)
+		expect(await badDesign.json()).toMatchObject({
+			Success: false,
+			Error: 'design is not a PNG or JPEG image',
+		})
+
+		const row = await env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM custom_avatar_item WHERE json_extract(data, '$.Name') = 'not-image'"
+		).first<{ n: number }>()
+		expect(row?.n).toBe(0)
+		expect((await env.IMAGES.list({ prefix: 'avatar-item/' })).objects).toHaveLength(objectsBefore)
 	})
 
 	test('POST 401s without a token', async () => {
@@ -6656,7 +6922,7 @@ describe('rooms', () => {
 
 describe('images', () => {
 	test('POST /api/images/v4/uploadsaved stores the file in R2 and returns its name', async () => {
-		const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4])
+		const bytes = new Uint8Array([...PNG_BYTES, 1, 2, 3, 4])
 		const fd = new FormData()
 		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 })) // ShareCamera
 		fd.append('image', new File([bytes], 'avatar.png', { type: 'image/png' }))
@@ -6687,6 +6953,42 @@ describe('images', () => {
 		// `Id`, not `SavedImageId` — v6 serves the raw record, unlike the player lists.
 		expect(typeof meta.Id).toBe('number')
 		expect(meta.CheerCount).toBe(0)
+	})
+
+	// The part's filename and content-type are the uploader's claims, and the `img`
+	// worker serves the object under whatever type is stored — so an HTML body under an
+	// image name would be a page on the image origin. The bytes decide, and only images
+	// get in.
+	test('POST /api/images/v4/uploadsaved refuses a file whose bytes are not an image', async () => {
+		const objectsBefore = (await env.IMAGES.list()).objects.length
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		fd.append('image', new File(['<script>alert(1)</script>'], 'photo.jpg', { type: 'image/jpeg' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ error: 'image is not a PNG or JPEG image' })
+		expect((await env.IMAGES.list()).objects).toHaveLength(objectsBefore)
+	})
+
+	test('POST /api/images/v4/uploadsaved stores the type and extension the bytes say, not the claim', async () => {
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		// A real PNG posted as a JPEG under an HTML name.
+		fd.append('image', new File([PNG_BYTES], 'photo.html', { type: 'text/html' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(200)
+		const { ImageName } = (await res.json()) as { ImageName: string }
+		expect(ImageName).toMatch(/\.png$/)
+		const stored = await env.IMAGES.get(ImageName)
+		expect(stored?.httpMetadata?.contentType).toBe('image/png')
 	})
 
 	test('GET /api/images/v1/slideshow is public and joins username + room name', async () => {
@@ -6804,20 +7106,37 @@ describe('images', () => {
 
 		// Request order, not id order — the client lines the answers up with what it asked for.
 		const both = await bulk(`?ids=${two.Id}&ids=${one.Id}`)
-		expect(both.map((i) => i.Id)).toEqual([two.Id, one.Id])
-		// The RAW SavedImage: `Id`/`Type`, and TaggedPlayerIds present — not the
-		// SavedImageId/SavedImageType projection the player photo lists serve.
+		expect(both.map((i) => i.SavedImageId)).toEqual([two.Id, one.Id])
+		// The ImagesPlayer projection plus ClubId — not the raw SavedImage (`Id`/`Type`,
+		// `TaggedPlayerIds`).
+		expect(Object.keys(both[0]).sort()).toEqual(
+			[
+				'SavedImageId',
+				'ImageName',
+				'PlayerId',
+				'RoomId',
+				'PlayerEventId',
+				'ClubId',
+				'Description',
+				'Accessibility',
+				'AccessibilityLocked',
+				'SavedImageType',
+				'CreatedAt',
+				'CheerCount',
+				'CommentCount',
+			].sort()
+		)
 		expect(both[0]).toMatchObject({
-			Id: two.Id,
-			Type: two.Type,
+			SavedImageId: two.Id,
+			SavedImageType: two.Type,
 			ImageName: 'bulktwo.jpg',
 			PlayerId: 7102,
-			TaggedPlayerIds: [],
+			ClubId: null,
 		})
 
 		// An unknown id and a non-public one are absent rather than errors or holes, so the
 		// answer can be shorter than the request.
-		expect((await bulk(`?ids=${one.Id}&ids=999999&ids=${hidden.Id}`)).map((i) => i.Id)).toEqual([
+		expect((await bulk(`?ids=${one.Id}&ids=999999&ids=${hidden.Id}`)).map((i) => i.SavedImageId)).toEqual([
 			one.Id,
 		])
 
@@ -6826,7 +7145,7 @@ describe('images', () => {
 
 		// More ids than D1 will bind in one query (100) — the lookup has to split.
 		const many = [...Array.from({ length: 130 }, (_, i) => 800000 + i), one.Id, two.Id]
-		expect((await bulk(`?${many.map((id) => `ids=${id}`).join('&')}`)).map((i) => i.Id)).toEqual([
+		expect((await bulk(`?${many.map((id) => `ids=${id}`).join('&')}`)).map((i) => i.SavedImageId)).toEqual([
 			one.Id,
 			two.Id,
 		])
@@ -7150,7 +7469,7 @@ describe('images', () => {
 				accessibility: 2,
 			})
 		)
-		fd.append('image', new File([new Uint8Array([1, 2, 3])], 'pic.png', { type: 'image/png' }))
+		fd.append('image', new File([PNG_BYTES], 'pic.png', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
 			method: 'POST',
 			headers: await bearer('42'),
@@ -10122,9 +10441,13 @@ describe('openapi', () => {
 			'GET /api/playerevents/v1/{eventId}/responses',
 			'GET /api/playerevents/v2/{eventId}',
 			'GET /api/players/v1/playerPhotoTaggingSetting',
+			'GET /api/players/v1/progression/xpEarnedToday',
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/progressionEvents/active',
+			'GET /api/progressionEvents/event/{id}',
+			'GET /api/progressionEvents/record/{id}',
+			'GET /api/purchasableXpBoosts/activations',
 			'GET /api/quickPlay/v1/getandclear',
 			'GET /api/referee/files',
 			'GET /api/relationships/mutualfriends',
@@ -10214,6 +10537,7 @@ describe('openapi', () => {
 			'POST /api/rooms/v1/verifyRole',
 			'POST /api/sanitize/v1',
 			'POST /api/sanitize/v1/isPure',
+			'POST /api/sanitize/v2/isAllowed/bulk',
 			'POST /api/v1/progression/bulk',
 			'POST /outfits/bulk',
 			'POST /statsigUserProperties',

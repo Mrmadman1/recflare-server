@@ -40,17 +40,29 @@ See [RecFlare Client](https://github.com/djdevin/recflare-client) for the offici
 
 These game builds are supported:
 
-| Build         | Manifest              | Support                                                                                 |
-| ------------- | --------------------- | --------------------------------------------------------------------------------------- |
-| `20230414`    | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
-| `20250718.01` | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
-| `20250424.01` |                       | Alpha                                                                                   |
-| `20231207`    |                       | Alpha                                                                                   |
-| `20230616`    |                       | Alpha                                                                                   |
+| Build      | Client version | Manifest              | Support                                                                                 |
+| ---------- | -------------- | --------------------- | --------------------------------------------------------------------------------------- |
+| `20230414` | `20230414`     | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
+| `20250718` | `20250718.01`  | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
+| `20260323` | `20260323.14`  |                       | Alpha                                                                                   |
+| `20250424` | `20250424.01`  |                       | Alpha                                                                                   |
+| `20231207` | `20231207`     |                       | Alpha                                                                                   |
+| `20230616` | `20230616`     |                       | Alpha                                                                                   |
+
+A build is the `YYYYMMDD` date of the client version; the `.NN` after it is a same-day
+point release and is ignored everywhere, so `20250718.01`, `20250718.2` and `20250718`
+are all the beta build and share game sessions.
 
 Alpha builds get past the version check and largely work, but nothing else in the
 stack targets them, so expect protocol differences. Other client or game versions
 may expect different endpoints and response shapes and are not supported.
+
+The table is the default. An operator narrows it with `RECFLARE_SUPPORTED_GAME_VERSIONS`
+in `.env` (a build left out is told to update and refused a sign-in, which is how players
+are moved to a newer build), and `RECFLARE_ROLLOUT_GAME_VERSIONS` names the builds under
+staged rollout to Discord supporters — `20260323` by default, `off` to open it to
+everyone (`RECFLARE_TACHYON_ROLLOUT_GAME_VERSIONS` keeps a build on the rollout voice
+servers past that). See `.env.example`.
 
 Generally speaking any client that effectively rewrites the nameserver with the
 right mods (see [RecNet Plugin](https://github.com/djdevin/recnet-plugin), [2025 patch](https://github.com/recflare/patch-2025)) can be used with this server.

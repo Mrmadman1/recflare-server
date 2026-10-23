@@ -1,8 +1,8 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { GAME_VERSION, isSupportedGameVersion } from '@repo/domain'
-import { validateAndGetVersion } from '@repo/jwt'
+import { GAME_VERSION, isSupportedGameVersion, supportedGameBuilds } from '@repo/domain'
+import { validateAndGetBuild } from '@repo/jwt'
 
 import apiConfigV2 from '../../static/api-config-v2.json'
 import gameConfigsV1All2025 from '../../static/gameconfigs-v1-all-2025.json'
@@ -73,15 +73,15 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) =>
 			c.json({
-				ReportBudget: 125,
+				ReportBudget: 0,
 				FilterType: 0,
-				SampleRate: 1,
-				LogLineCount: 50,
-				CaptureNativeCrashes: 1,
-				AMRThresholdMS: 0,
-				MessageCount: 1000,
-				MessageRegex: '^.*$',
-				VersionRegex: '.*',
+				SampleRate: 0,
+				LogLineCount: 0,
+				CaptureNativeCrashes: 0,
+				ANRThresholdMs: 0,
+				MessageCount: 0,
+				MessageRegex: '',
+				VersionRegex: '',
 			})
 	)
 	// ShareBaseUrl is derived from the deploy-time base domain; the rest of the
@@ -106,13 +106,17 @@ export const configRoutes = new Hono<App>({ strict: false })
 			summary: 'Client version check',
 			description:
 				'Whether the client build is current. Compares the client’s `?v=` build against ' +
-				'the builds we serve (`SUPPORTED_GAME_VERSIONS`): `VersionStatus` is 0 when the ' +
-				'client is on one of them, 1 when it is on some other build.',
+				'the builds we serve — the operator’s `SUPPORTED_GAME_VERSIONS` var (or the ' +
+				'default list in `@repo/domain`) plus every build under rollout ' +
+				'(`ROLLOUT_GAME_VERSIONS`): `VersionStatus` is 0 when the client is on one of ' +
+				'them, 1 when it is on some other build. The same lists decide which builds ' +
+				'`auth` hands a token to, so a build dropped from them is told to update here ' +
+				'and refused there.',
 			responses: { 200: json(VersionCheck, 'Version status') },
 		}),
 		(c) =>
 			c.json({
-				VersionStatus: isSupportedGameVersion(c.req.query('v')) ? 0 : 1,
+				VersionStatus: isSupportedGameVersion(c.req.query('v'), supportedGameBuilds(c.env)) ? 0 : 1,
 				UpdateNotificationStage: 0,
 				IsVersionIslanded: false,
 				IsCrossPlayDisabled: false,
@@ -140,8 +144,9 @@ export const configRoutes = new Hono<App>({ strict: false })
 	// Which one a caller gets is decided by the token's `rn.ver` claim — the build the
 	// client posted at login — since the request itself carries no version. Anything NEWER
 	// than `GAME_VERSION` (20230414) gets the 2025 catalog; that build and anything older
-	// get the 2023 one. Builds are date-stamped (`20230414`, `20250718.01`), so they order
-	// as strings, the same comparison `match` makes for cross-build joins.
+	// get the 2023 one. Builds are date-stamped (`20230414`, `20250718`), so they order as
+	// strings, the same comparison `match` makes for cross-build joins — compared as BUILDS,
+	// so a same-day point release of the target (`20230414.01`) stays on the 2023 catalog.
 	//
 	// A request with no readable token version gets the 2023 catalog, the same body this
 	// route has always served: unauthenticated is not evidence of a newer client, and this
@@ -163,8 +168,8 @@ export const configRoutes = new Hono<App>({ strict: false })
 			responses: { 200: json(JsonObject, 'The game config catalog for the caller’s build') },
 		}),
 		async (c) => {
-			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-			const newerThanTarget = version !== null && version > GAME_VERSION
+			const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+			const newerThanTarget = build !== null && build > GAME_VERSION
 			return c.json(newerThanTarget ? gameConfigsV1All2025 : gameConfigsV1All)
 		}
 	)

@@ -13,19 +13,23 @@ import {
 	countRoomsUsingInvention,
 	createRoomInstance,
 	decodeInventionUsage,
+	getRoomById,
 	getRoomInstance,
 	MessageType,
 	NOTIFICATION_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	publicStudioBundleFilename,
 	putUnityAsset,
+	recordRoomVisit,
+	removeRoomRole,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	ROOM_XP_SCHEMA_DDL,
+	roomRoleWrites,
 	seedRoomWithSubRooms,
-	sha256HexToBase64,
-	STUDIO_UNITY_ASSET_SCHEMA_DDL,
+	setRoomRole,
+	STUDIO_CLOUD_BUILD_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
 	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
@@ -183,6 +187,13 @@ describe('rooms endpoints', () => {
 		expect(body).toHaveProperty('CurrentSnapshotId', null)
 		expect(body).toHaveProperty('CCU', null)
 		expect(body).not.toHaveProperty('FriendlyName')
+	})
+
+	// A stub: boosts aren't implemented, so the count is a bare 0 for any room and player.
+	it('GET /rooms/:id/boosts/:playerId/count answers a bare 0', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/112/boosts/205/count`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(0)
 	})
 
 	// Pinned whole: these are the numbers the client's publish UI counts against, and
@@ -449,8 +460,20 @@ describe('rooms endpoints', () => {
 	})
 
 	it('GET /rooms/contributedby/me lists rooms the caller owns or has a role in', async () => {
+		// The roles half reads `room_role`, so a seeded room's roles go there too, as every
+		// write in rooms-db does.
 		const seed = (data: Record<string, unknown>) =>
-			env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)).run()
+			env.DB.batch([
+				env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)),
+				...roomRoleWrites(env.DB, Number(data.RoomId), data as Room),
+			])
+		const contributed = async (accountId: string) => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`, {
+				headers: await bearer(accountId),
+			})
+			const rooms = (await res.json()) as Array<{ RoomId: number }>
+			return rooms.map((r) => r.RoomId).sort((a, b) => a - b)
+		}
 
 		// A room somebody else made, where 820 is a co-owner...
 		await seed({
@@ -538,9 +561,24 @@ describe('rooms endpoints', () => {
 		// Auth-scoped: `me` is the token, so no token is a 401.
 		expect((await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`)).status).toBe(401)
 
+		// Role changes move a room in and out of the list: granting 829 a role in 30404
+		// lists it for them, and taking the role back drops it again.
+		const other = (await getRoomById(env.DB, 30404))!
+		const granted = await setRoomRole(env.DB, 30404, 829, 10, 821, other)
+		expect(await contributed('829')).toEqual([30404])
+		// The row carries the whole entry, as the blob does.
+		expect(
+			await env.DB.prepare(
+				'SELECT role, invited_role, last_changed_by_account_id FROM room_role WHERE room_id = 30404 AND account_id = 829'
+			).first()
+		).toEqual({ role: 10, invited_role: 0, last_changed_by_account_id: 821 })
+		await removeRoomRole(env.DB, 30404, 829, 821, granted!)
+		expect(await contributed('829')).toEqual([])
+
 		// The DB is shared across this file, and these are the only player-made public rooms
 		// in it — leaving them behind changes what the `new`/`community` room feeds serve.
 		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
+		await env.DB.prepare('DELETE FROM room_role WHERE room_id BETWEEN 30401 AND 30407').run()
 	})
 
 	it('GET /rooms/:roomId/experience serves the room’s stored XP settings, no auth', async () => {
@@ -743,19 +781,25 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
-	it('GET /rooms/visitedby/me returns a bare array of rooms the caller has interacted with (auth-scoped)', async () => {
+	it('GET /rooms/visitedby/me returns a bare array of rooms the caller has visited (auth-scoped)', async () => {
 		const headers = await bearer('779')
 
-		// No interactions yet → empty array.
+		// No visits yet → empty array.
 		const empty = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers })
 		).json()) as unknown[]
 		expect(empty).toEqual([])
 
-		// Interacting (cheer/favorite) records a last-visit on those rooms.
+		// Cheering/favoriting is not a visit — only `match` entering the room stamps one.
 		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, { method: 'PUT', headers })
 		await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me/favorite`, { method: 'PUT', headers })
+		const afterToggles = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers })
+		).json()) as unknown[]
+		expect(afterToggles).toEqual([])
 
+		await recordRoomVisit(env.DB, 2, 779)
+		await recordRoomVisit(env.DB, 12, 779)
 		const body = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me?skip=0&take=100`, { headers })
 		).json()) as Array<{ RoomId: number }>
@@ -776,16 +820,10 @@ describe('rooms endpoints', () => {
 	})
 
 	it('GET /rooms/visitedby/:playerId serves any player’s visited rooms to any authed caller', async () => {
-		// Give 790 a visit history (cheering/favoriting stamps a last-visit).
+		// Give 790 a visit history.
 		const subject = await bearer('790')
-		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, {
-			method: 'PUT',
-			headers: subject,
-		})
-		await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me/favorite`, {
-			method: 'PUT',
-			headers: subject,
-		})
+		await recordRoomVisit(env.DB, 2, 790)
+		await recordRoomVisit(env.DB, 12, 790)
 
 		// Anyone with a token reads it — a bare array. Friendship is not required: a
 		// player's history is as public as the rooms on their profile.
@@ -1205,7 +1243,7 @@ describe('rooms endpoints', () => {
 			IsDorm: false,
 			SubRooms: [],
 		})
-		// Same room, opted out.
+		// Same room, opted out of the feeds.
 		await seed({
 			RoomId: 30802,
 			Name: 'OptedOut',
@@ -1213,6 +1251,16 @@ describe('rooms endpoints', () => {
 			Accessibility: 1,
 			IsDorm: false,
 			ExcludeFromLists: true,
+			SubRooms: [],
+		})
+		// And one opted out of SEARCH instead — the other flag, which the feeds ignore.
+		await seed({
+			RoomId: 30803,
+			Name: 'Unsearchable',
+			CreatorAccountId: 830,
+			Accessibility: 1,
+			IsDorm: false,
+			ExcludeFromSearch: true,
 			SubRooms: [],
 		})
 
@@ -1225,13 +1273,22 @@ describe('rooms endpoints', () => {
 		for (const feed of ['/rooms/hot?take=200', '/rooms/recommendations?take=200']) {
 			expect(await namesIn(feed)).toContain('NoExcludeKey')
 			expect(await namesIn(feed)).not.toContain('OptedOut')
+			// `ExcludeFromSearch` is search's flag, not the feeds': the room still lists.
+			expect(await namesIn(feed)).toContain('Unsearchable')
 		}
 
-		// SEARCH is the wider filter (PUBLIC_WHERE): a room can opt out of the browse feeds
-		// and still be findable by name, so this must not have narrowed with the feeds.
+		// SEARCH is its own filter (SEARCHABLE_WHERE): a room can opt out of the browse feeds
+		// and still be findable by name, so this must not have narrowed with the feeds…
 		expect(await namesIn('/rooms/search?query=optedout')).toContain('OptedOut')
+		// …while a room opted out of SEARCH is not found, by name or by the missing key's
+		// opposite — and the suggestion box, which draws from the same rooms, never offers it.
+		expect(await namesIn('/rooms/search?query=unsearchable')).toEqual([])
+		expect(await namesIn('/rooms/search?query=noexcludekey')).toContain('NoExcludeKey')
+		expect(
+			await (await SELF.fetch(`${ORIGIN}/rooms/autocomplete_search?query=unsearch&take=10`)).json()
+		).toEqual([])
 
-		await env.DB.prepare('DELETE FROM room WHERE room_id IN (30801, 30802)').run()
+		await env.DB.prepare('DELETE FROM room WHERE room_id IN (30801, 30802, 30803)').run()
 	})
 
 	// Served only to the client builds that render it — the 2023 client's other room
@@ -1256,6 +1313,15 @@ describe('rooms endpoints', () => {
 		expect(body.Rooms.every((r) => typeof r.RoomName === 'string')).toBe(true)
 		// The dorm (RoomId 1) is non-public, so it's never featured.
 		expect(body.Rooms.some((r) => r.RoomId === 1)).toBe(false)
+
+		// The allow-list holds the BUILD (the bare date), so every point release of it is
+		// served: a `.2` rebuild of the 2025 client renders the group the same as `.01`.
+		for (const version of ['20250718.2', '20250718']) {
+			const point = await SELF.fetch(`${ORIGIN}/featuredrooms/current`, {
+				headers: await bearer('1', undefined, version),
+			})
+			expect(point.status, version).toBe(200)
+		}
 	})
 
 	it('GET /featuredrooms/current serves at most 10 rooms', async () => {
@@ -1724,9 +1790,9 @@ describe('rooms endpoints', () => {
 		expect(interactions!.n).toBe(0)
 	})
 
-	it('DELETE /rooms/:id also lets staff through — the website’s takedown — but only there', async () => {
-		// Somebody else's room. A moderator token may delete it; the same token may NOT
-		// rename it, which is what a misapplied check once allowed.
+	it('DELETE /rooms/:id also lets developers through — the website’s takedown — but only there', async () => {
+		// Somebody else's room. A developer token may delete it (a moderator's may not); the
+		// same token may NOT rename it, which is what a misapplied check once allowed.
 		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
 			.bind(
 				JSON.stringify({
@@ -1740,7 +1806,7 @@ describe('rooms endpoints', () => {
 				})
 			)
 			.run()
-		const staff = await bearer('999', ['gameClient', 'moderator'])
+		const staff = await bearer('999', ['gameClient', 'developer'])
 		const roomExists = async () =>
 			(await env.DB.prepare('SELECT 1 FROM room WHERE room_id = 9501').first()) !== null
 
@@ -1751,10 +1817,14 @@ describe('rooms endpoints', () => {
 		})
 		expect(await bodyOf(rename)).toMatchObject({ Success: false, ErrorId: 'Rooms.NotOwner' })
 
-		// A plain player is still refused; the moderator gets through.
+		// A plain player and a moderator are refused; the developer gets through.
 		const del = async (headers: Record<string, string>) =>
 			bodyOf(await SELF.fetch(`${ORIGIN}/rooms/9501`, { method: 'DELETE', headers }))
 		expect(await del(await bearer('2', ['gameClient']))).toMatchObject({
+			Success: false,
+			ErrorId: 'Rooms.NotOwner',
+		})
+		expect(await del(await bearer('998', ['gameClient', 'moderator']))).toMatchObject({
 			Success: false,
 			ErrorId: 'Rooms.NotOwner',
 		})
@@ -1778,6 +1848,81 @@ describe('rooms endpoints', () => {
 			creatorAccountId: 1,
 			accessibility: 1,
 		})
+	})
+
+	it('PUT /rooms/:id/exclude is the staff listing toggle — both flags, together, staff only', async () => {
+		// A public room its owner lists. Not a game endpoint: the real service set these two
+		// flags from an admin tool, so the website's room page calls this with a staff token.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					RoomId: 9502,
+					Name: 'Delisted',
+					CreatorAccountId: 1,
+					IsDorm: false,
+					Accessibility: 1,
+					ImageName: '',
+					SubRooms: [],
+				})
+			)
+			.run()
+		const put = async (excluded: string, headers: Record<string, string>) =>
+			SELF.fetch(`${ORIGIN}/rooms/9502/exclude`, {
+				method: 'PUT',
+				headers: { ...headers, 'content-type': 'application/x-www-form-urlencoded' },
+				body: `excluded=${excluded}`,
+			})
+		const flags = async () => {
+			const row = await env.DB.prepare('SELECT data FROM room WHERE room_id = 9502').first<{
+				data: string
+			}>()
+			const room = JSON.parse(row!.data) as Record<string, unknown>
+			return { lists: room.ExcludeFromLists, search: room.ExcludeFromSearch }
+		}
+
+		// No token is a 401; the OWNER is refused like any other player — this is moderation,
+		// not a room setting they have.
+		expect((await put('true', {})).status).toBe(401)
+		expect((await put('true', await bearer('1', ['gameClient']))).status).toBe(403)
+		expect(await flags()).toEqual({ lists: undefined, search: undefined })
+
+		const staff = await bearer('999', ['gameClient', 'moderator'])
+		const hidden = await put('true', staff)
+		expect(hidden.status).toBe(200)
+		expect(await hidden.json()).toMatchObject({
+			success: true,
+			error: '',
+			value: { RoomId: 9502, ExcludeFromLists: true, ExcludeFromSearch: true },
+		})
+		// Proper JSON booleans, not 1/0 — the virtual columns and the feeds read them as such.
+		expect(await flags()).toEqual({ lists: true, search: true })
+
+		// Hidden means hidden from search too, not just the feeds.
+		const search = await SELF.fetch(`${ORIGIN}/rooms/search?query=Delisted`)
+		const found = ((await search.json()) as { Results: Array<{ RoomId: number }> }).Results
+		expect(found.find((r) => r.RoomId === 9502)).toBeUndefined()
+
+		// And it flips back, both at once.
+		expect(await (await put('false', staff)).json()).toMatchObject({
+			success: true,
+			value: { ExcludeFromLists: false, ExcludeFromSearch: false },
+		})
+		expect(await flags()).toEqual({ lists: false, search: false })
+
+		// Anything but true/false is a rejection in the envelope, and writes nothing.
+		expect(await (await put('maybe', staff)).json()).toMatchObject({ success: false })
+		expect(await flags()).toEqual({ lists: false, search: false })
+
+		// Each staff write is audited against the moderator, with what it did.
+		const { results: audit } = await env.DB.prepare(
+			'SELECT player_id, data FROM audit_log WHERE action = ?1 ORDER BY audit_log_id'
+		)
+			.bind('room_exclude')
+			.all<{ player_id: number; data: string }>()
+		expect(audit.map((row) => ({ by: row.player_id, ...JSON.parse(row.data) }))).toEqual([
+			{ by: 999, roomId: 9502, name: 'Delisted', creatorAccountId: 1, excluded: true },
+			{ by: 999, roomId: 9502, name: 'Delisted', creatorAccountId: 1, excluded: false },
+		])
 	})
 
 	it('PUT /rooms/:id/roles/:accountId grants a helper role outright, but never co-owner', async () => {
@@ -2707,6 +2852,49 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id IN (2, 3)').run()
 	})
 
+	it('POST/DELETE /rooms/:id/leaderboards/:lid refuse with an HTTP status for 2026', async () => {
+		// 20260323 never reads these bodies, so a 200 `Success: false` would read as success.
+		const as2026 = async (sub: string) => ({
+			...(await bearer(sub, undefined, '20260323.14')),
+		})
+		const body = { leaderboardTitle: 'full name', statFormat: '1', sortAscending: 'False' }
+		const form = new URLSearchParams(body).toString()
+		const send = async (method: string, path: string, headers: Record<string, string>) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method,
+				headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+				...(method === 'POST' && { body: form }),
+			})
+
+		// Unknown room: 404 for 2026, both verbs, never 200 + Success:false.
+		const create = await send('POST', '/rooms/99999/leaderboards/1', await as2026('1'))
+		expect(create.status).toBe(404)
+		expect((await send('DELETE', '/rooms/99999/leaderboards/1', await as2026('1'))).status).toBe(
+			404
+		)
+
+		// 2025 keeps the 200 failure envelope it parses.
+		const legacy = await send(
+			'POST',
+			'/rooms/99999/leaderboards/1',
+			await bearer('1', undefined, '20250718.01')
+		)
+		expect(legacy.status).toBe(200)
+		expect(await legacy.json()).toEqual({
+			Success: false,
+			Error: 'This room does not exist!',
+			error_id: null,
+		})
+
+		// A real create still succeeds for 2026, and the denial paths stay 401/403.
+		expect((await send('POST', '/rooms/2/leaderboards/1', await as2026('1'))).status).toBe(200)
+		expect((await send('POST', '/rooms/2/leaderboards/1', await as2026('999'))).status).toBe(403)
+		// An unconfigured slot is already gone, which is what the delete asked for.
+		expect((await send('DELETE', '/rooms/2/leaderboards/7', await as2026('1'))).status).toBe(200)
+
+		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id = 2').run()
+	})
+
 	it('POST /rooms/:id/experience sets a room’s progression, which the GETs read back', async () => {
 		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
 		const getXp = async (roomId: number, sub?: string) =>
@@ -3630,6 +3818,9 @@ describe('rooms endpoints', () => {
 
 		// The save is a camelCase projection, NOT the PascalCase CurrentSave shape.
 		expect(saved.value.subRoomDataSave).toEqual({
+			persistenceVersion: 41,
+			omVersion: 0,
+			ugcSubVersion: 0,
 			subRoomDataSaveId: expect.any(Number),
 			subRoomId: 2,
 			unityAssetId: null,
@@ -4621,7 +4812,7 @@ describe('rooms endpoints', () => {
 		expect(otherGet).toMatchObject({ Cheered: false, Favorited: false })
 	})
 
-	it('room Stats aggregate cheers/favorites from the interaction table', async () => {
+	it('room Stats count cheers/favorites on the room row, kept by the toggles', async () => {
 		type Stats = {
 			CheerCount: number
 			FavoriteCount: number
@@ -4669,6 +4860,21 @@ describe('rooms endpoints', () => {
 			VisitorCount: 0,
 			VisitCount: 0,
 		})
+
+		// The counts are columns on the room, not an aggregate taken on read — the toggles
+		// keep them. A repeated clear changes nothing (the flag was already off), and neither
+		// does clearing a flag a player never set, so neither counts down again.
+		await interact('562', 'cheer', 'DELETE')
+		await interact('563', 'favorite', 'DELETE')
+		expect(await direct()).toMatchObject({ CheerCount: 1, FavoriteCount: 1 })
+		expect(
+			await env.DB.prepare('SELECT cheers, favorites FROM room WHERE room_id = 15').first()
+		).toEqual({ cheers: 1, favorites: 1 })
+		// Toggling off and on again lands back where it started.
+		await interact('561', 'cheer', 'PUT')
+		expect(await direct()).toMatchObject({ CheerCount: 0 })
+		await interact('561', 'cheer', 'PUT')
+		expect(await direct()).toMatchObject({ CheerCount: 1 })
 
 		// VisitCount is the `room.visits` column (what match bumps on each matchmake),
 		// served on every read of the room — here and in the search results — and it
@@ -5689,6 +5895,15 @@ describe('rooms endpoints', () => {
 		expect((await get(light, '999')).status).toBe(200)
 		await clearPresence(999)
 		expect((await get(light, '999')).status).toBe(403)
+
+		// Staff read it from anywhere: the client asks for this list BEFORE it matchmakes a
+		// private instance, so a developer with no role on the room and no presence in it
+		// would otherwise be refused the instance.
+		const staff = async (roles: string[]) =>
+			SELF.fetch(`${ORIGIN}${light}`, { headers: await bearer('999', roles) })
+		expect((await staff(['gameClient', 'developer'])).status).toBe(200)
+		expect((await staff(['gameClient', 'moderator'])).status).toBe(200)
+		expect((await staff(['gameClient'])).status).toBe(403)
 	})
 
 	it('GET /rooms/:id/subrooms/:sid/saves/:saveId is the detail behind a history row', async () => {
@@ -5953,6 +6168,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/bans',
 			'GET /rooms/{roomId}/bans/history',
 			'GET /rooms/{roomId}/bans/{playerId}/isBanned',
+			'GET /rooms/{roomId}/boosts/{playerId}/count',
 			'GET /rooms/{roomId}/experience',
 			'GET /rooms/{roomId}/experience/player',
 			'GET /rooms/{roomId}/interactionby/me',
@@ -5966,6 +6182,7 @@ describe('rooms endpoints', () => {
 			'GET /roomserver/rooms/createdby/me',
 			'GET /showcase/{playerId}',
 			'POST /rooms/bulk',
+			'POST /rooms/create',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
 			'POST /rooms/{roomId}/experience',
@@ -5981,6 +6198,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/cloning',
 			'PUT /rooms/{roomId}/creator',
 			'PUT /rooms/{roomId}/description',
+			'PUT /rooms/{roomId}/exclude',
 			'PUT /rooms/{roomId}/image',
 			'PUT /rooms/{roomId}/interactionby/me/cheer',
 			'PUT /rooms/{roomId}/interactionby/me/favorite',
@@ -5995,6 +6213,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/modify',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions',
 			'PUT /rooms/{roomId}/tags',
+			'PUT /rooms/{roomId}/v2/restrictions',
 			'PUT /rooms/{roomId}/warning',
 		])
 
@@ -6006,17 +6225,16 @@ describe('rooms endpoints', () => {
 	})
 })
 
-// A Rec Room Studio build is a unity asset on the save. The game loads the scene from
-// `CurrentSave.DataBlob` and the bundles from `UnitySubAssets`. Maker-pen saves stay
-// empty arrays, and a missing studio table must not fail the room read.
+// A Rec Room Studio build is a unity asset on the save: `unity_asset` rows the studio
+// worker wrote. The game loads the scene from `CurrentSave.DataBlob` and the bundles from
+// `UnitySubAssets`. Maker-pen saves stay empty arrays, and a missing studio cloud-build
+// table must not fail the room read.
 describe('studio room bundles', () => {
-	const ASSET = '11111111-2222-4333-8444-555555555555'
-	const WIN_HEX = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-	const ANDROID_HEX = 'ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb'
-	const winName = publicStudioBundleFilename(ASSET, 'windows', 'main')
-	const androidName = publicStudioBundleFilename(ASSET, 'android', 'main')
-	const winHash = sha256HexToBase64(WIN_HEX)
-	const androidHash = sha256HexToBase64(ANDROID_HEX)
+	const ASSET = 'aa111111-2222-4333-8444-555555555555'
+	const winName = publicStudioBundleFilename(9901, ASSET, 'windows', 'main')
+	const androidName = publicStudioBundleFilename(9901, ASSET, 'android', 'main')
+	const winHash = '47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='
+	const androidHash = 'ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs='
 
 	const save = (unityAssetId?: string) => ({
 		UnitySubAssets: [],
@@ -6034,12 +6252,17 @@ describe('studio room bundles', () => {
 		Tags: [],
 		ModerationState: 0,
 		CreatedAt: '2026-10-03T00:00:00.000Z',
-		...(unityAssetId ? { UnityAssetId: unityAssetId } : {}),
+		...(unityAssetId
+			? {
+					UnityAssetId: unityAssetId,
+					StudioSourceAsset: { Filename: 'source-manifest.json', Hash: 'source-hash' },
+				}
+			: {}),
 	})
 
 	async function reset() {
-		await env.DB.prepare('DROP TABLE IF EXISTS studio_unity_asset_file').run()
 		await env.DB.prepare('DROP TABLE IF EXISTS studio_cloud_build').run()
+		await env.DB.prepare('DELETE FROM unity_asset WHERE unity_asset_id = ?1').bind(ASSET).run()
 		await env.DB.prepare('DELETE FROM subroom_save WHERE sub_room_id IN (99011, 99021)').run()
 		await env.DB.prepare('DELETE FROM subroom WHERE room_id IN (9901, 9902)').run()
 		await env.DB.prepare('DELETE FROM room WHERE room_id IN (9901, 9902)').run()
@@ -6080,7 +6303,7 @@ describe('studio room bundles', () => {
 	}
 
 	async function storeFiles() {
-		for (const sql of STUDIO_UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(sql).run()
+		for (const sql of STUDIO_CLOUD_BUILD_SCHEMA_DDL) await env.DB.prepare(sql).run()
 		await env.DB.prepare(
 			`INSERT INTO studio_cloud_build
 				 (cloud_build_id, room_id, sub_room_id, sub_room_data_save_id, unity_asset_id,
@@ -6090,22 +6313,19 @@ describe('studio room bundles', () => {
 		)
 			.bind(ASSET)
 			.run()
-		const insert = async (platform: string, kind: string, filename: string, sha256: string) => {
-			await env.DB.prepare(
-				`INSERT INTO studio_unity_asset_file
-					 (unity_asset_id, platform, kind, filename, sha256, byte_length, r2_key)
-					 VALUES (?1, ?2, ?3, ?4, ?5, 4, ?6)`
+		const insert = (target: number, kind: 'main' | 'stripped', filename: string, hash: string) =>
+			putUnityAsset(
+				env.DB,
+				{ UnityAssetId: ASSET, Target: target, Version: 1, Filename: filename, Hash: hash },
+				kind
 			)
-				.bind(ASSET, platform, kind, filename, sha256, `studio-room-bundles/${filename}`)
-				.run()
-		}
-		await insert('windows', 'main', winName, WIN_HEX)
-		await insert('android', 'main', androidName, ANDROID_HEX)
+		await insert(0, 'main', winName, winHash)
+		await insert(2, 'main', androidName, androidHash)
 		await insert(
-			'windows',
+			0,
 			'stripped',
-			publicStudioBundleFilename(ASSET, 'windows', 'stripped'),
-			WIN_HEX
+			publicStudioBundleFilename(9901, ASSET, 'windows', 'stripped'),
+			winHash
 		)
 	}
 
@@ -6174,20 +6394,24 @@ describe('studio room bundles', () => {
 				{ unityAssetId: ASSET, target: 0, version: 1, filename: winName },
 				{ unityAssetId: ASSET, target: 2, version: 1, filename: androidName },
 			],
-			filename: winName,
-			hash: winHash,
+			filename: 'source-manifest.json',
+			hash: 'source-hash',
 		})
-		expect((await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/unityasset`)).status).toBe(404)
+		expect((await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/unityasset`)).status).toBe(200)
 		expect(
 			(
 				await SELF.fetch(
-					`${ORIGIN}/rooms/9901/subrooms/99011/unityasset?unityAssetId=00000000-0000-4000-8000-000000000000`
+					`${ORIGIN}/rooms/9901/subrooms/99011/unityasset?unityAssetId=00000000-0000-4000-8000-000000000000`,
+					{ headers: await bearer('1') }
 				)
 			).status
 		).toBe(404)
 		expect(
-			(await SELF.fetch(`${ORIGIN}/rooms/9902/subrooms/99021/unityasset?unityAssetId=${ASSET}`))
-				.status
+			(
+				await SELF.fetch(`${ORIGIN}/rooms/9902/subrooms/99021/unityasset?unityAssetId=${ASSET}`, {
+					headers: await bearer('1'),
+				})
+			).status
 		).toBe(404)
 
 		const detail = await SELF.fetch(
@@ -6196,15 +6420,12 @@ describe('studio room bundles', () => {
 		)
 		expect(detail.status).toBe(200)
 		// The detail lifts the Windows bundle to the top level when no target is named, and
-		// names every bundle the client's way — `UnityAsset`/`UnityAssetHash`, not the stored
-		// `Filename`/`Hash`.
+		// lists only dependencies in UnitySubAssets. Repeating the root there makes the
+		// game load it twice and Unity rejects the second load with room error 8714.
 		expect(await detail.json()).toMatchObject({
 			UnityAsset: winName,
 			UnityAssetHash: winHash,
-			UnitySubAssets: [
-				{ UnityAssetId: ASSET, UnityAsset: winName, UnityAssetHash: winHash },
-				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
-			],
+			UnitySubAssets: [],
 		})
 
 		const questDetail = await SELF.fetch(
@@ -6214,9 +6435,7 @@ describe('studio room bundles', () => {
 		expect(await questDetail.json()).toMatchObject({
 			UnityAsset: androidName,
 			UnityAssetHash: androidHash,
-			UnitySubAssets: [
-				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
-			],
+			UnitySubAssets: [],
 		})
 
 		const light = await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/saves/no_unity_assets`, {
@@ -6236,6 +6455,82 @@ describe('studio room bundles', () => {
 			UnityAssetHash: null,
 			UnitySubAssets: [],
 		})
+	})
+
+	it('never loads the main bundle again as a dependency, including mixed-case GUIDs', async () => {
+		await reset()
+		await storeFiles()
+		await env.DB.prepare(
+			"UPDATE subroom_save SET data=json_set(data, '$.UnityAssetId', ?1) WHERE sub_room_id=99011"
+		)
+			.bind(ASSET.toUpperCase())
+			.run()
+		const row = await env.DB.prepare(
+			'SELECT current_save_id FROM subroom WHERE sub_room_id=99011'
+		).first<{ current_save_id: number }>()
+		for (const [query, filename] of [
+			['', winName],
+			['?unityAssetTarget=0', winName],
+			['?unityAssetTarget=2', androidName],
+			['?unityAssetTarget=1', null],
+		] as const) {
+			const response = await SELF.fetch(
+				`${ORIGIN}/rooms/9901/subrooms/99011/saves/${row!.current_save_id}${query}`,
+				{ headers: await bearer('1') }
+			)
+			expect(response.status).toBe(200)
+			expect(await response.json()).toMatchObject({
+				UnityAsset: filename,
+				UnitySubAssets: [],
+			})
+		}
+	})
+
+	// A FIRST-PARTY room's bundle — captured from the official game and loaded by hand
+	// under its `unity/<roomId>/` layout — shares `unity_asset` with Studio builds but is
+	// not UGC, and must not be folded onto the save: the 2025 client handed it inline
+	// takes it instead of asking the bulk lookup, cannot name it, and loads nothing (every
+	// imported room broke when the splice moved from the Studio-only table to `unity_asset`).
+	// The bulk lookup is where that client resolves it, and still serves it.
+	it('leaves a first-party bundle to the bulk lookup rather than the room read', async () => {
+		await reset()
+		const firstParty = 'unity/9901/8iaf2yemao2d1zurblo875cn2.assetbundle'
+		await putUnityAsset(env.DB, {
+			UnityAssetId: ASSET,
+			Target: 0,
+			Version: 3,
+			Filename: firstParty,
+			Hash: winHash,
+		})
+
+		type Loaded = {
+			SubRooms: Array<{ CurrentSave: { UnitySubAssets: unknown[]; SubRoomDataSaveId: number } }>
+		}
+		for (const query of ['', '?unityAssetTarget=0']) {
+			const room = (await (await SELF.fetch(`${ORIGIN}/rooms/9901${query}`)).json()) as Loaded
+			expect(room.SubRooms[0]!.CurrentSave.UnitySubAssets, query).toEqual([])
+		}
+
+		const saveId = ((await (await SELF.fetch(`${ORIGIN}/rooms/9901`)).json()) as Loaded)
+			.SubRooms[0]!.CurrentSave.SubRoomDataSaveId
+		const detail = await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/saves/${saveId}`, {
+			headers: await bearer('1'),
+		})
+		expect(await detail.json()).toMatchObject({
+			UnityAsset: null,
+			UnityAssetHash: null,
+			UnitySubAssets: [],
+		})
+
+		const bulk = await SELF.fetch(`${ORIGIN}/unity_assets/baked/bulk`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ target: '0', version: '3', id: ASSET }).toString(),
+		})
+		expect(bulk.status).toBe(200)
+		expect(await bulk.json()).toEqual([
+			{ UnityAssetId: ASSET, Target: 0, Version: 3, Filename: firstParty, Hash: winHash },
+		])
 	})
 })
 
@@ -6397,4 +6692,520 @@ describe('sweep cron', () => {
 		expect(await voterIds()).toEqual([])
 		expect(await inviterIds()).toEqual([])
 	})
+})
+
+it('2026 room experience retains upstream progression in the native object shape', async () => {
+	await seedRoomWithSubRooms(env.DB, {
+		RoomId: 900092,
+		Name: '2026ExperienceTest',
+		CreatorAccountId: 42,
+		SubRooms: [],
+	})
+	const res = await SELF.fetch(`${ORIGIN}/rooms/900092/experience/player`, {
+		headers: await bearer('42', undefined, '20260323.14'),
+	})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		RoomExperienceEnabled: false,
+		Experience: 0,
+		ConcurrencyCode: expect.any(String),
+	})
+})
+
+describe('Studio baked Unity asset downloads', () => {
+	const mainId = 'aa0320e1-2e47-4cf5-9129-5366c3c5f824'
+	const childId = 'e6da76fb-f990-4299-8724-d786f5723a5a'
+	const filename = 'imports/test-room/main.SubRoom.Main.0.5.assetbundle'
+	const path = '/unity_assets/baked/bulk'
+	beforeAll(async () => {
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 900090,
+			Name: 'StudioDownloadTest',
+			CreatorAccountId: 1,
+			Accessibility: 1,
+			SubRooms: [
+				{
+					SubRoomId: 900090,
+					RoomId: 900090,
+					Name: 'Home',
+					CurrentSave: {
+						UnityAssetId: mainId,
+						UnityAsset: filename,
+						UnityAssetHash: 'main-hash',
+						DataBlob: 'scene.room',
+						UnitySubAssets: [
+							{
+								UnityAssetId: childId,
+								UnityAsset: 'child.SubRoom.SubAsset.0.5.assetbundle',
+								UnityAssetHash: 'child-hash',
+							},
+						],
+					},
+				},
+			],
+		})
+	})
+	async function bulk(body: unknown, authenticated = true) {
+		return SELF.fetch(ORIGIN + path, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(authenticated ? await bearer('2') : {}) },
+			body: JSON.stringify(body),
+		})
+	}
+	it('resolves the main and subasset GUIDs with their exact target and version', async () => {
+		const res = await bulk({
+			UnityAssetIds: [mainId.toUpperCase(), childId, mainId],
+			Target: 0,
+			Version: 5,
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([
+			{ UnityAssetId: mainId, Target: 0, Version: 5, Filename: filename, Hash: 'main-hash' },
+			{
+				UnityAssetId: childId,
+				Target: 0,
+				Version: 5,
+				Filename: 'child.SubRoom.SubAsset.0.5.assetbundle',
+				Hash: 'child-hash',
+			},
+		])
+	})
+	it('returns the Studio loader DTO with its main bundle and dependencies', async () => {
+		const row = await env.DB.prepare(
+			'SELECT current_save_id FROM subroom WHERE sub_room_id=900090'
+		).first<{ current_save_id: number }>()
+		const res = await SELF.fetch(
+			`${ORIGIN}/rooms/900090/subrooms/900090/saves/${row!.current_save_id}`,
+			{ headers: await bearer('1') }
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({
+			UnityAsset: filename,
+			UnityAssetHash: 'main-hash',
+			UnitySubAssets: [
+				{
+					UnityAssetId: childId,
+					UnityAsset: 'child.SubRoom.SubAsset.0.5.assetbundle',
+					UnityAssetHash: 'child-hash',
+				},
+			],
+		})
+	})
+	it('does not substitute Windows bundles for an unavailable target or version', async () => {
+		for (const options of [
+			{ Target: 2, Version: 5 },
+			{ Target: 0, Version: 6 },
+		]) {
+			expect(await (await bulk({ UnityAssetIds: [mainId], ...options })).json()).toEqual([])
+		}
+	})
+	it('rejects unauthenticated and malformed requests', async () => {
+		expect((await bulk({ UnityAssetIds: [mainId] }, false)).status).toBe(401)
+		expect((await bulk({ UnityAssetIds: ['invalid'] })).status).toBe(400)
+	})
+	it('does not expose private-room assets to an unrelated caller', async () => {
+		await env.DB.prepare(
+			"UPDATE room SET data=json_set(data, '$.Accessibility', 0) WHERE room_id=900090"
+		).run()
+		expect(await (await bulk({ UnityAssetIds: [mainId] })).json()).toEqual([])
+	})
+})
+
+describe('Studio room management contracts', () => {
+	it('lists private co-owned rooms, but excludes hosts and pending invites', async () => {
+		for (const [id, role, invited] of [
+			[91001, 30, 0],
+			[91002, 10, 0],
+			[91003, 0, 30],
+		]) {
+			await seedRoomWithSubRooms(env.DB, {
+				RoomId: id,
+				Name: `StudioRole${id}`,
+				CreatorAccountId: 999,
+				Accessibility: 0,
+				Roles: [{ AccountId: 880, Role: role, InvitedRole: invited }],
+				SubRooms: [],
+			})
+		}
+		const rooms = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/ownedby/me`, { headers: await bearer('880') })
+		).json()) as Array<{ RoomId: number }>
+		expect(rooms.map((r) => r.RoomId)).toEqual([91001])
+		expect(
+			await (
+				await SELF.fetch(`${ORIGIN}/rooms/createdby/me`, { headers: await bearer('880') })
+			).json()
+		).toEqual([])
+	})
+	it('returns null for Studio name validation and preserves the legacy empty object', async () => {
+		expect(
+			await (await SELF.fetch(`${ORIGIN}/rooms?name=StudioUnusedName&include=525581`)).json()
+		).toBeNull()
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms?name=StudioUnusedName`)).json()).toEqual({})
+	})
+	it('creates a private empty R2 room and rejects a case-insensitive duplicate', async () => {
+		const create = async (name: string, auth = true) =>
+			SELF.fetch(`${ORIGIN}/rooms/create`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					...(auth ? await bearer('880') : {}),
+				},
+				body: new URLSearchParams({ name, ugcVersion: '2' }).toString(),
+			})
+		expect((await create('StudioFreshRoom', false)).status).toBe(401)
+		const response = await create('StudioFreshRoom')
+		expect(response.status).toBe(200)
+		const room = (await response.json()) as Room
+		expect(room).toMatchObject({
+			Name: 'StudioFreshRoom',
+			UgcVersion: 2,
+			Accessibility: 0,
+			CreatorAccountId: 880,
+			Tags: [],
+			LoadScreens: [],
+			RestrictedCircuitsAllowListNames: [],
+			PublishedAt: null,
+		})
+		expect(room.SubRooms).toEqual([
+			expect.objectContaining({
+				Name: 'Home',
+				CreatorAccountId: 880,
+				CurrentSave: expect.objectContaining({ DataBlob: null, OMVersion: 198 }),
+				UnitySceneId: '5d4e40d8-f289-4295-a6e1-4f907835007d',
+			}),
+		])
+		const added = await SELF.fetch(`${ORIGIN}/rooms/${Number(room.RoomId)}/subrooms`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(await bearer('880')) },
+			body: 'name=Second',
+		})
+		expect(added.status).toBe(200)
+		const lookup = await SELF.fetch(`${ORIGIN}/rooms/${Number(room.RoomId)}?include=525581`)
+		const refreshed = await lookup.json<
+			Room & { SubRooms: Array<{ SubRoomId: number; CurrentSave: unknown }> }
+		>()
+		expect(refreshed.SubRooms).toHaveLength(2)
+		for (const sub of refreshed.SubRooms) {
+			expect(sub.CurrentSave).toMatchObject({ DataBlob: null, OMVersion: 198 })
+		}
+		const initial = refreshed.SubRooms[0]!.CurrentSave as { SubRoomDataSaveId: number }
+		const subRoomId = Number(refreshed.SubRooms[0]!.SubRoomId)
+		const initialSave = await SELF.fetch(
+			`${ORIGIN}/rooms/${Number(room.RoomId)}/subrooms/${subRoomId}/saves/${initial.SubRoomDataSaveId}`,
+			{ headers: await bearer('880') }
+		)
+		expect(initialSave.status).toBe(200)
+		expect(await initialSave.json()).toMatchObject({ DataBlob: null, OMVersion: 198 })
+		for (const fields of [{ OMVersion: 197, UgcSubVersion: 3 }, {}]) {
+			const saved = await SELF.fetch(
+				`${ORIGIN}/rooms/${Number(room.RoomId)}/subrooms/${subRoomId}/data`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', ...(await bearer('880')) },
+					body: JSON.stringify({ ...fields, AutoPublish: true }),
+				}
+			)
+			expect(saved.status).toBe(200)
+			const updated = await (
+				await SELF.fetch(`${ORIGIN}/rooms/${Number(room.RoomId)}?include=525581`)
+			).json<Room & { SubRooms: Array<{ CurrentSave: unknown }> }>()
+			expect(updated.SubRooms[0]!.CurrentSave).toMatchObject({ OMVersion: 197, UgcSubVersion: 3 })
+		}
+		expect((await create('studiofreshroom')).status).toBe(409)
+		expect((await create('bad name')).status).toBe(400)
+		expect(
+			(
+				await SELF.fetch(`${ORIGIN}/rooms/${Number(room.RoomId)}`, {
+					method: 'DELETE',
+					headers: await bearer('880'),
+				})
+			).status
+		).toBe(200)
+	})
+	it('keeps fresh R1 rooms owned and their new subrooms visible to the Studio picker', async () => {
+		const response = await SELF.fetch(`${ORIGIN}/rooms/create`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(await bearer('880')) },
+			body: new URLSearchParams({ name: 'StudioFreshR1', ugcVersion: '1' }).toString(),
+		})
+		expect(response.status).toBe(200)
+		const created = await response.json<Room>()
+		const roomId = Number(created.RoomId)
+		expect(created.Roles).toEqual([expect.objectContaining({ AccountId: 880, Role: 255 })])
+		const added = await SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(await bearer('880')) },
+			body: 'name=Second',
+		})
+		expect(added.status).toBe(200)
+		const lookup = await SELF.fetch(`${ORIGIN}/rooms?name=StudioFreshR1&include=525581`)
+		const room = await lookup.json<Room & { SubRooms: Array<{ SubRoomId: number }> }>()
+		expect(room.SubRooms).toEqual([
+			expect.objectContaining({
+				Name: 'Home',
+				CurrentSave: null,
+				UnitySceneId: 'a75f7547-79eb-47c6-8986-6767abcb4f92',
+			}),
+			expect.objectContaining({
+				Name: 'Second',
+				CurrentSave: null,
+				UnitySceneId: 'a75f7547-79eb-47c6-8986-6767abcb4f92',
+			}),
+		])
+		for (const path of ['/rooms/ownedby/me', '/rooms/createdby/me']) {
+			const rooms = await (
+				await SELF.fetch(ORIGIN + path, { headers: await bearer('880') })
+			).json<Room[]>()
+			expect(rooms.some((entry) => entry.RoomId === created.RoomId)).toBe(true)
+		}
+		const history = await SELF.fetch(
+			`${ORIGIN}/rooms/${roomId}/subrooms/${room.SubRooms[0]!.SubRoomId}/saves/no_unity_assets`,
+			{ headers: await bearer('880') }
+		)
+		expect(history.status).toBe(200)
+		expect(await history.json()).toMatchObject({ Results: [] })
+		expect(
+			(
+				await SELF.fetch(`${ORIGIN}/rooms/${roomId}`, {
+					method: 'DELETE',
+					headers: await bearer('880'),
+				})
+			).status
+		).toBe(200)
+	})
+
+	it('saves the Studio age rating through v2 restrictions with ownership checks', async () => {
+		const before = await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json<Room>()
+		const update = async (body: string, account?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/2/v2/restrictions`, {
+				method: 'PUT',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					...(account ? await bearer(account) : {}),
+				},
+				body,
+			})
+		expect((await update('ageRating=1')).status).toBe(401)
+		expect((await update('ageRating=1', '999')).status).toBe(403)
+		const result = await update('ageRating=1&supportsScreens=True&supportsWalkVR=False', '1')
+		expect(result.status).toBe(200)
+		expect(await result.json()).toMatchObject({
+			Success: true,
+			Error: null,
+			Value: {
+				AgeRating: 1,
+				SupportsScreens: true,
+				SupportsWalkVR: false,
+				LoadScreens: before.LoadScreens,
+			},
+		})
+		const invalid = await update('ageRating=99', '1')
+		expect(await invalid.json()).toEqual({
+			Success: false,
+			Error: 'Invalid age rating.',
+			Value: null,
+		})
+		expect((await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json<Room>()).AgeRating).toBe(1)
+		await update('ageRating=2&supportsWalkVR=True', '1')
+	})
+
+	it('does not advertise an archived baked asset as editable source', async () => {
+		const id = '11111111-2222-4333-8444-555555555555'
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 91004,
+			Name: 'StudioArchivedGame',
+			CreatorAccountId: 880,
+			Roles: [],
+			SubRooms: [
+				{
+					SubRoomId: 91004,
+					Name: 'Home',
+					CurrentSave: {
+						UnityAssetId: id,
+						DataBlob: 'original-game.room',
+						SavedOnPlatform: 0,
+						SavedOnDeviceClass: 2,
+						SavedByAccountId: 880,
+						CreatedAt: '2026-01-01T00:00:00Z',
+					},
+				},
+			],
+		})
+		const headers = await bearer('880')
+		const url = `${ORIGIN}/rooms/91004/subrooms/91004/saves/no_unity_assets`
+		const studio = (await (
+			await SELF.fetch(url, { headers: { ...headers, 'User-Agent': 'RRStudio' } })
+		).json()) as { Results: Array<Record<string, unknown>> }
+		expect(studio.Results[0]).toMatchObject({ UnityAssetId: null, DataBlob: 'original-game.room' })
+		const legacy = (await (await SELF.fetch(url, { headers })).json()) as typeof studio
+		expect(legacy.Results[0]!.UnityAssetId).toBe(id)
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/91004/subrooms/91004/unityasset?unityAssetId=${id}`))
+				.status
+		).toBe(404)
+		const original = (await (await SELF.fetch(`${ORIGIN}/rooms/91004`)).json()) as {
+			SubRooms: Array<{ CurrentSave: Record<string, unknown> }>
+		}
+		expect(original.SubRooms[0]!.CurrentSave.UnityAssetId).toBe(id)
+	})
+	it('persists source manifests and returns them independently of baked builds', async () => {
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 91005,
+			Name: 'StudioSourceRoom',
+			CreatorAccountId: 880,
+			Roles: [],
+			SubRooms: [{ SubRoomId: 91005, Name: 'Home', CurrentSave: null }],
+		})
+		const id = '22222222-3333-4444-8555-666666666666'
+		const saved = await SELF.fetch(`${ORIGIN}/rooms/91005/subrooms/91005/data`, {
+			method: 'POST',
+			headers: { ...(await bearer('880')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				UnityAssetId: id,
+				UnityAsset: { Filename: 'manifest.json', Hash: 'source-hash' },
+				SubRoomData: { Filename: 'maker.room' },
+				AutoPublish: true,
+			}),
+		})
+		expect(saved.status).toBe(200)
+		const source = await (
+			await SELF.fetch(`${ORIGIN}/rooms/91005/subrooms/91005/unityasset?unityAssetId=${id}`)
+		).json()
+		expect(source).toMatchObject({
+			unityAssetId: id,
+			filename: 'manifest.json',
+			hash: 'source-hash',
+			bakedUnityAssets: [],
+		})
+		const history = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/91005/subrooms/91005/saves/no_unity_assets`, {
+				headers: { ...(await bearer('880')), 'User-Agent': 'RRStudio' },
+			})
+		).json()) as { Results: Array<Record<string, unknown>> }
+		expect(history.Results[0]).toMatchObject({
+			UnityAssetId: id,
+			SavedOnPlatform: null,
+			SavedOnDeviceClass: null,
+		})
+	})
+})
+
+describe('Studio source revision permissions', () => {
+	it('keeps drafts and historical source behind save-history permissions', async () => {
+		const roomId = 987650
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: roomId,
+			Name: 'PrivateStudioDraft',
+			CreatorAccountId: 987650,
+			Accessibility: 0,
+			Roles: [{ AccountId: 987651, Role: 30 }],
+			SubRooms: [{ SubRoomId: roomId, Name: 'Home', CurrentSave: null }],
+		})
+		const url = `${ORIGIN}/rooms/${roomId}/subrooms/${roomId}/unityasset`
+		const save = async (id: string, filename: string, autoPublish: boolean) => {
+			const response = await SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${roomId}/data`, {
+				method: 'POST',
+				headers: { ...(await bearer(String(roomId))), 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					UnityAssetId: id,
+					UnityAsset: { Filename: filename, Hash: 'source-hash' },
+					SubRoomData: { Filename: 'draft.room' },
+					AutoPublish: autoPublish,
+				}),
+			})
+			expect(response.status).toBe(200)
+		}
+		const oldId = '11111111-3333-4444-8555-666666666666'
+		const currentId = '22222222-3333-4444-8555-666666666666'
+		const draftId = '33333333-3333-4444-8555-666666666666'
+		await save(oldId, 'old.json', true)
+		await save(currentId, 'published.json', true)
+		await save(draftId, 'draft.json', false)
+		for (const headers of [{}, await bearer('987652')]) {
+			for (const query of ['', `?unityAssetId=${currentId}`]) {
+				const response = await SELF.fetch(url + query, { headers })
+				expect(response.status).toBe(200)
+				expect(await response.json()).toMatchObject({ filename: 'published.json' })
+			}
+		}
+		for (const id of [draftId, oldId]) {
+			expect((await SELF.fetch(url + `?unityAssetId=${id}`)).status).toBe(401)
+			expect(
+				(await SELF.fetch(url + `?unityAssetId=${id}`, { headers: await bearer('987652') })).status
+			).toBe(403)
+			for (const account of ['987650', '987651']) {
+				const response = await SELF.fetch(url + `?unityAssetId=${id}`, {
+					headers: await bearer(account),
+				})
+				expect(response.status).toBe(200)
+				expect(await response.json()).toMatchObject({
+					filename: id === draftId ? 'draft.json' : 'old.json',
+				})
+			}
+		}
+		for (const account of ['987650', '987651']) {
+			const response = await SELF.fetch(url, { headers: await bearer(account) })
+			expect(await response.json()).toMatchObject({ filename: 'draft.json' })
+		}
+		// A reused asset ID must not make a newer draft public or hide it from its owner.
+		await save(currentId, 'replacement-draft.json', false)
+		const publicSource = await SELF.fetch(url + `?unityAssetId=${currentId}`)
+		expect(await publicSource.json()).toMatchObject({ filename: 'published.json' })
+		const ownerSource = await SELF.fetch(url + `?unityAssetId=${currentId}`, {
+			headers: await bearer('987650'),
+		})
+		expect(await ownerSource.json()).toMatchObject({ filename: 'replacement-draft.json' })
+	})
+	it('does not expose an unpublished first revision through default lookup', async () => {
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 987660,
+			Name: 'UnpublishedStudioSource',
+			CreatorAccountId: 987660,
+			Roles: [],
+			SubRooms: [{ SubRoomId: 987660, Name: 'Home', CurrentSave: null }],
+		})
+		const url = `${ORIGIN}/rooms/987660/subrooms/987660`
+		const saved = await SELF.fetch(url + '/data', {
+			method: 'POST',
+			headers: { ...(await bearer('987660')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				UnityAssetId: '44444444-3333-4444-8555-666666666666',
+				UnityAsset: { Filename: 'first-draft.json', Hash: null },
+				AutoPublish: false,
+			}),
+		})
+		expect(saved.status).toBe(200)
+		expect((await SELF.fetch(url + '/unityasset')).status).toBe(404)
+		expect(
+			(await SELF.fetch(url + '/unityasset', { headers: await bearer('987661') })).status
+		).toBe(404)
+		const source = await SELF.fetch(url + '/unityasset', { headers: await bearer('987660') })
+		expect(source.status).toBe(200)
+		expect(await source.json()).toMatchObject({ filename: 'first-draft.json' })
+	})
+})
+
+it('omits hydrated Badges when persisting a room settings edit', async () => {
+	await seedRoomWithSubRooms(env.DB, {
+		RoomId: 987670,
+		Name: 'BadgeSerialization',
+		CreatorAccountId: 987670,
+		SubRooms: [],
+	})
+	await env.DB.prepare(
+		"UPDATE room SET data=json_set(data,'$.Badges',json(?)) WHERE room_id=987670"
+	)
+		.bind(JSON.stringify([{ Name: 'derived badge' }]))
+		.run()
+	const response = await SELF.fetch(`${ORIGIN}/rooms/987670/warning`, {
+		method: 'PUT',
+		headers: await bearer('987670'),
+		body: new URLSearchParams({ warningMask: '1' }),
+	})
+	expect(response.status).toBe(200)
+	const stored = await env.DB.prepare('SELECT data FROM room WHERE room_id=987670').first<{
+		data: string
+	}>()
+	expect(JSON.parse(stored!.data)).not.toHaveProperty('Badges')
 })

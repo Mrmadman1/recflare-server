@@ -505,7 +505,8 @@ const app = new Hono<App>()
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
 				400: {
-					description: 'Empty, over 15 characters, non-alphanumeric, or profane (empty body)',
+					description:
+						'Empty, over 15 characters, outside the display name charset, or profane (empty body)',
 				},
 				401: UNAUTHORIZED_RESPONSE,
 			},

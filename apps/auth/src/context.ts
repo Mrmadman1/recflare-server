@@ -50,6 +50,40 @@ export type Env = SharedHonoEnv & {
 	 */
 	BAN_EVASION_MATCH?: string
 	/**
+	 * The Discord role ids that may sign in on a ROLLOUT-GATED client build (see
+	 * `ROLLOUT_GAME_VERSIONS` in @repo/domain) — numeric snowflakes, separated by commas
+	 * and/or whitespace, exactly like `www`'s DISCORD_BENEFITS_ROLE_IDS. ANY one of them
+	 * qualifies. A login whose posted `ver` is a gated build is refused unless the account's
+	 * Discord link (`platform_account`, platform 101, written by the website's benefits
+	 * claim) records one of these roles — or the account is STAFF (developer or moderator),
+	 * who are always let in, configured roles or not.
+	 *
+	 * Unset — or parsing to no ids — leaves the gate CLOSED: nobody but staff gets a token on
+	 * a gated build. That is the safe reading of "supporters only" when no supporter role has been
+	 * named, and it keeps a build that isn't ready from being reachable by accident.
+	 * Logins on every other build are never touched by this.
+	 */
+	DISCORD_ROLLOUT_ROLE_IDS?: string
+	/**
+	 * The client builds a `/connect/token` grant may post as `ver` and still get a token:
+	 * a comma-separated list of builds (`20230414,20250718`), or `off` for none. Unset means
+	 * the default `SUPPORTED_GAME_VERSIONS` in @repo/domain. Set for every worker from the
+	 * root `.env` (`RECFLARE_SUPPORTED_GAME_VERSIONS`), so this refuses exactly the builds
+	 * `api`'s `/api/versioncheck/v4` tells to update — dropping a build from the list is how
+	 * its players are made to upgrade. Read through `supportedGameBuilds`, which also folds
+	 * in every build under rollout (below). A grant posting no `ver` is never gated.
+	 */
+	SUPPORTED_GAME_VERSIONS?: string
+	/**
+	 * The builds under staged rollout — the ones the Discord-role gate above applies to —
+	 * overriding `ROLLOUT_GAME_VERSIONS` in @repo/domain: same format, or `off` to end the
+	 * rollout and open those builds to every account. Set for every worker
+	 * (`RECFLARE_ROLLOUT_GAME_VERSIONS`), so `match`'s rollout voice pool follows the same
+	 * list. A build here is served whether or not `SUPPORTED_GAME_VERSIONS` names it. Read
+	 * through `rolloutGameBuilds`.
+	 */
+	ROLLOUT_GAME_VERSIONS?: string
+	/**
 	 * Base domain, e.g. `recflare.net`. Injected for every worker at deploy time
 	 * (`--var DOMAIN`). Studio's device-login response points the browser at
 	 * `www.<domain>/device`, so auth has to know the same domain `ns` advertises.

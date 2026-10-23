@@ -10,13 +10,58 @@
 
 import { sign, verify } from 'hono/jwt'
 
-import { GAME_VERSION } from '@repo/domain'
+import { GAME_VERSION, gameBuild } from '@repo/domain'
 
 // Token lifetime in seconds (mirrored in the `expires_in` response field).
 // @todo Allegedly, the game is supposed to refresh tokens every 3600 seconds, but it doesn't.
 // It's possible our refresh_token implementation is broken, but for now we just make the token
 // last a day so the client doesn't have to refresh it.
 export const TOKEN_TTL_SECONDS = 86400
+
+/** A build host can validate content and its job's grants, but cannot act as an account. */
+export async function generateStudioBuildValidationToken(
+	buildId: string,
+	secret: string
+): Promise<string> {
+	return sign(
+		{
+			aud: 'studio-build-validation',
+			scope: 'studio.build.validate',
+			buildId,
+			exp: Math.floor(Date.now() / 1000) + 8 * 3600,
+		},
+		secret,
+		'HS256'
+	)
+}
+
+export async function validateStudioBuildValidationToken(
+	request: Request,
+	secret: string
+): Promise<boolean> {
+	return (await studioBuildValidationId(request, secret)) !== null
+}
+
+/** Signed job identity for read-only, job-scoped validation routes. */
+export async function studioBuildValidationId(
+	request: Request,
+	secret: string
+): Promise<string | null> {
+	const header = request.headers.get('Authorization') ?? ''
+	if (!header.startsWith('Bearer ')) return null
+	try {
+		const payload = await verify(header.slice(7), secret, 'HS256')
+		return payload.sub === undefined &&
+			payload.aud === 'studio-build-validation' &&
+			payload.scope === 'studio.build.validate' &&
+			typeof payload.buildId === 'string' &&
+			/^[1-9]\d*$/.test(payload.buildId)
+			? (payload.buildId as string)
+			: null
+	} catch {
+		return null
+	}
+}
 
 /**
  * Validate an HS256 token and return its `sub` (account id) claim, or `null` when
@@ -133,6 +178,20 @@ export async function validateAndGetVersion(
 	} catch {
 		return null
 	}
+}
+
+/**
+ * {@link validateAndGetVersion} reduced to the BUILD it names — `gameBuild`'s bare
+ * `YYYYMMDD`, so `20250718.01` and `20250718.2` both read `20250718`. `null` for the
+ * same reasons as the version, and when the claim is empty. The form every build gate
+ * wants: a point release is the same build and must be served the same way, so nothing
+ * should compare the raw claim against a build.
+ */
+export async function validateAndGetBuild(
+	request: Request,
+	secret: string
+): Promise<string | null> {
+	return gameBuild(await validateAndGetVersion(request, secret))
 }
 
 /** Scopes stamped onto every token (as a claim array). */

@@ -222,25 +222,55 @@ export const RRPlusSignUpBonus = z.object({
 /**
  * `GET /api/influencerpartnerprogram/influencers` — the ids of every influencer in the
  * partner program, which the client uses to badge them wherever they appear. An object
- * around the list, not a bare array.
+ * around the list, not a bare array. `ContinuationToken` is the paging cursor; always null
+ * here, the whole list fitting in one page.
  */
 export const InfluencerIdsResponse = z.object({
 	InfluencerIds: z
 		.array(z.int())
-		.describe('Account ids in the partner program. Empty — no programme runs here'),
+		.describe('Account ids in the partner program — every account flagged `isInfluencer`'),
+	ContinuationToken: z
+		.null()
+		.describe('Paging cursor for the next page. Always null — the list is served whole'),
 })
 
 /**
- * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — one account's
- * standing in the partner program.
+ * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — the account id of
+ * the influencer an account supports.
  *
- * A BARE NUMBER, not an object: the body is the literal `0`, which is the "not an
- * influencer" tier. Nobody on this server is one, so 0 is the answer for every account, the
- * caller's own included.
+ * A BARE NUMBER, not an object: the body is the literal id, or `0` when the account
+ * supports nobody. The write (`POST …/support`) does NOT answer in this shape; see
+ * `SupportInfluencerResponse`.
  */
-export const InfluencerTierResponse = z
-	.literal(0)
-	.describe('The account’s partner tier. Always 0 — nobody here is an influencer')
+export const SupportedInfluencerResponse = z
+	.int()
+	.describe('The account id of the influencer this account supports; 0 for nobody')
+
+/** `POST /api/influencerpartnerprogram/support` — the influencer the caller picks. */
+export const SupportInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to support. Must be flagged `isInfluencer`'),
+})
+
+/** `POST /api/influencerpartnerprogram/remove` — the influencer the caller stops supporting. */
+export const RemoveInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to stop supporting — the caller’s current pick'),
+})
+
+/**
+ * The reply to `POST /api/influencerpartnerprogram/support` and `…/remove` — a bare
+ * `{ Success, Error, error_id }` status envelope with NO `Value`: the pick is read back from
+ * `…/myinfluencer`, not from this reply. The same mixed casing as `RoomCurrencyEnvelope`
+ * (PascalCase `Success`/`Error` beside a lowercase `error_id`), minus the payload.
+ */
+export const SupportInfluencerResponse = z.object({
+	Success: z.boolean().describe('Always true — every refusal is an empty 400 instead'),
+	Error: z.null().describe('Always null'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
 
 /**
  * `GET /api/incentivizedreferrals/progress` — how far the caller has got with the
@@ -603,6 +633,18 @@ export const ItemPurchaseInfosRequest = z.object({
 	),
 })
 
+/** `POST /api/storefronts/v1/purchasableitems` — store listings by id. */
+export const PurchasableItemsRequest = z.object({
+	PurchasableItemIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('The listings to resolve, by `PurchasableItemId`'),
+	GiftDropIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('Sent by the client (observed null); accepted and ignored'),
+})
+
 /** One `Prices[]` entry: what the item costs in one currency, and any sale on top. */
 export const ItemPriceDto = z.object({
 	CurrencyType: z.number().int().describe('2 = RecCenterTokens — what UGC items are priced in'),
@@ -735,6 +777,13 @@ export const RoomKeyDto = z.object({
 	CreatedAt: z.string().describe('ISO-8601 UTC'),
 	ImageName: z.string().nullable().describe('The key’s art; null until an edit sets one'),
 	Type: z.int().describe('The key type’s ordinal: 0 `Key`, the only one seen'),
+})
+
+/** A held key as `GET /api/roomkeys/v1/mine` serves it — the room key plus two fields. */
+export const HeldRoomKeyDto = RoomKeyDto.extend({
+	ImageName: z.string().describe('The key’s art; "" when it has none (NOT null, unlike the list)'),
+	IsGiftable: z.boolean().describe('Always false — gifting keys is not modelled'),
+	Visibility: z.int().describe('Always 0 — not modelled'),
 })
 
 /**
@@ -1031,6 +1080,86 @@ export const AwardRoomConsumableResult = z.object({
 export const AwardRoomConsumableResultList = z.array(AwardRoomConsumableResult)
 
 /**
+ * The client's `RoomConsumableInventoryItem` — what a player owns of one consumable. The
+ * element of `GET …/roomConsumable/room/{roomId}/me` and the purchase's `InventoryItem`.
+ */
+export const RoomConsumableInventoryItemDto = z.object({
+	RoomConsumableId: z.string(),
+	AccountId: z.int().describe('Who owns them'),
+	Count: z.int().describe('The RESULTING total owned, never the change'),
+	ConcurrencyCode: z
+		.string()
+		.nullable()
+		.describe('The last `NewConcurrencyCode` written — stored, not checked'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC — the last write'),
+	Consumable: RoomConsumableDto.extend({
+		ImageName: z.string().describe('"" when the listing has no picture (NOT null)'),
+		IsGiftable: z.boolean().describe('Always false — not modelled'),
+		Visibility: z.int().describe('Always 0 — not modelled'),
+	}).describe('The listing — the catalogue element plus two fields'),
+})
+
+/**
+ * `PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{tokens|currency}` — the client's
+ * `RoomConsumablePurchaseRequest`, four keys in declaration order (from its formatter). One
+ * route for both kinds of price: `ExpectedPriceAndCurrency.CurrencyId` null is TOKENS.
+ */
+export const PurchaseRoomConsumableRequest = z.object({
+	ConcurrencyCodes: z
+		.object({
+			CurrentConcurrencyCode: z.string().nullable().optional(),
+			NewConcurrencyCode: z.string().nullable().optional(),
+		})
+		.optional()
+		.describe('Accepted and IGNORED — no optimistic concurrency is implemented yet'),
+	ExpectedPriceAndCurrency: z
+		.object({
+			Price: z.int().describe('The UNIT price the client rendered; must equal the listing’s'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The listing’s room currency, or null for a listing priced in tokens'),
+		})
+		.describe('What the client showed — refused unless it is the listing’s own'),
+	Quantity: z.int().describe('How many to buy; at least 1, at most `MaximumCountPerPurchase`'),
+	GiftRecipientAccountId: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('Who receives them; null for the buyer. The buyer pays either way'),
+})
+
+/**
+ * The consumable purchase's answer, observed from the live client. The refusal form (`Status`
+ * 1, a null `InventoryItem`) is an assumption — only success has been observed.
+ */
+export const PurchaseRoomConsumableResponse = z.object({
+	BalanceUpdateResult: z
+		.int()
+		.describe(
+			'An UpdateResponse: 0 OK, 2 NotEnoughCredit, 4 NoItemAvailable, ' +
+				'6 RequestedPriceDoesNotMatch, 7 RequestedAmountNotAllowed, 8 PlayerNotEligible'
+		),
+	CurrencyBalanceResponse: z
+		.object({
+			AccountId: z.int().describe('The BUYER — who paid, even for a gift'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The room currency paid in; null for a listing priced in tokens'),
+			Balance: z.int().describe('What the buyer holds of it afterwards — the RESULTING total'),
+			ModifiedAt: z.string().describe('ISO-8601 UTC'),
+		})
+		.describe('What the buyer now holds of what they paid in'),
+	OperationResult: z.object({
+		Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+		InventoryItem: RoomConsumableInventoryItemDto.nullable().describe(
+			'What the recipient now owns of the consumable; null on a refusal'
+		),
+	}),
+})
+
+/**
  * The envelope the consumable write answers in — the same
  * `{ Value, Success, Error, error_id }` the room-currency writes use.
  */
@@ -1071,9 +1200,17 @@ export const CreatePurchaseOfferRequest = z.object({
 	Order: z.string().optional().describe('Where it sits in the shop; defaults to 0'),
 })
 
+/** `POST /api/roomcurrencies/v1/deletePurchaseOffer` — form-encoded. */
+export const DeletePurchaseOfferRequest = z.object({
+	PurchaseOfferId: z
+		.string()
+		.describe('The offer to take down, by its `CurrencyPurchaseOfferId` (any letter case)'),
+})
+
 /**
- * The envelope the create-offer endpoint answers in — the same
- * `{ Value, Success, Error, error_id }` the currency writes use, with the offer in `Value`.
+ * The envelope the create- and delete-offer endpoints answer in — the same
+ * `{ Value, Success, Error, error_id }` the currency writes use, with the offer (as created,
+ * or as it stood when removed) in `Value`.
  */
 export const RoomCurrencyPurchaseOfferEnvelope = z.object({
 	Value: RoomCurrencyPurchaseOfferDto.nullable(),
@@ -1147,6 +1284,17 @@ export const PurchaseRoomCurrencyRequest = z.object({
 		.describe(
 			'What it costs in tokens; must equal the offer’s, except for the room’s owner and co-owners, who are shown 0 and pay nothing'
 		),
+})
+
+/**
+ * What a player holds of one room currency, as `GET /api/roomcurrencies/v1/getBalance` answers
+ * it. `ModifiedAt` is the time of the response: `room_balance` keeps no modification time.
+ */
+export const RoomCurrencyBalance = z.object({
+	AccountId: z.int().describe('The player the balance belongs to'),
+	CurrencyId: z.string().describe('The room currency'),
+	Balance: z.int().describe('What the player holds of it; 0 when they have never earned any'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC; the time of the response'),
 })
 
 /**
@@ -1259,6 +1407,17 @@ export const BulkPurchaseRequest = z.object({
 export const ConsumeConsumableRequest = z.object({
 	Id: z.int().describe('The consumable row id to spend from'),
 	DeltaCount: z.int().optional().describe('How many to spend; defaults to 1'),
+})
+
+/**
+ * `POST /api/consumables/v1/query/bulk` form body — `descriptors` repeated once per
+ * consumable to look up.
+ */
+export const QueryConsumablesRequest = z.object({
+	descriptors: z
+		.union([z.string(), z.array(z.string())])
+		.optional()
+		.describe('A ConsumableItemDesc; the key repeats for each one asked about'),
 })
 
 /**

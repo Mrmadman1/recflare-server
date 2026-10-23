@@ -14,8 +14,10 @@ import {
 	deletePresence,
 	deleteRoomInvite,
 	GAME_VERSION,
+	gameBuild,
 	getAccount,
 	getClubSummary,
+	getExpiredPresenceAccountIds,
 	getExpiredPresenceInstanceIds,
 	getFriendIds,
 	getJoinableInstance,
@@ -37,15 +39,18 @@ import {
 	isClubMember,
 	isMatchmakingPolicy,
 	isPlayerBannedFromRoom,
+	isRolloutGameVersion,
 	MatchmakingErrorCode,
 	MessageType,
 	MOST_ACTIVE_CLUBHOUSE_LIMIT,
+	parseGameBuilds,
 	putPlayerSettingsIfChanged,
 	readPlayerSettings,
 	recordRoomVisit,
 	recordStat,
 	refreshInstanceFullness,
 	Role,
+	rolloutGameBuilds,
 	RoomInstanceType,
 	roomRoles,
 	setPresence,
@@ -98,6 +103,7 @@ import {
 	RoomInstanceSummaryDto,
 	StatusVisibilityRequest,
 	UNAUTHORIZED_RESPONSE,
+	VrMovementModeRequest,
 } from './openapi'
 
 import type { Context } from 'hono'
@@ -240,23 +246,62 @@ function tachyonServerFor(pool: TachyonServer[], roomInstanceId: number): Tachyo
 /**
  * The prefix of a sandbox server's generated id (see {@link tachyonPoolFor}) — `dev-1`,
  * `dev-2` rather than the live pool's `tachyon-N`, so the (cosmetic) id the client
- * displays says which pool it is on.
+ * displays says which pool it is on. The rollout pool's is `rollout-N` for the same reason.
  */
 const SANDBOX_TACHYON_SERVER_ID_PREFIX = 'dev-'
+const ROLLOUT_TACHYON_SERVER_ID_PREFIX = 'rollout-'
+
+/** What decides which Tachyon pool a caller is served from; see {@link tachyonPoolFor}. */
+interface TachyonCaller {
+	/** The account's `isSandbox` flag. */
+	isSandbox: boolean
+	/** Running a build served the rollout pool (`tachyonRolloutGameBuilds`, off the token's `rn.ver`). */
+	isRollout: boolean
+}
 
 /**
- * The pool the caller's instance is picked out of. A SANDBOX account runs against its own
- * Tachyon servers, apart from the live pool, so the whole list is swapped for
- * `TACHYON_HOST_PORT_SANDBOX` rather than any one entry: selection within it is the same
- * instance-id round-robin {@link tachyonServerFor} applies to the live pool. When that var
- * is unset a sandbox account falls back to the live pool, so an operator who runs no
- * sandbox servers doesn't leave those accounts without voice.
+ * The builds served the rollout Tachyon pool: the operator's `TACHYON_ROLLOUT_GAME_VERSIONS`
+ * when set (`off` for none), otherwise the builds under staged rollout
+ * ({@link rolloutGameBuilds}, the same list `auth` gates sign-in on). The override exists
+ * because the two lists part ways at general availability: `ROLLOUT_GAME_VERSIONS=off`
+ * opens the new build to everyone, and without this it would also move every player on it
+ * onto the live voice servers. Entries are reduced to builds by {@link parseGameBuilds},
+ * so `20260323.14` lists the same build as `20260323`, and the caller's version is
+ * compared the same way by {@link isRolloutGameVersion}.
  */
-function tachyonPoolFor(env: Env, isSandbox: boolean): TachyonServer[] {
+function tachyonRolloutGameBuilds(env: Env): string[] {
+	return parseGameBuilds(env.TACHYON_ROLLOUT_GAME_VERSIONS) ?? rolloutGameBuilds(env)
+}
+
+/**
+ * The pool the caller's instance is picked out of — one of three, each the same
+ * comma-separated list, with selection inside it the same instance-id round-robin
+ * {@link tachyonServerFor} applies to all of them:
+ *
+ *  - `TACHYON_HOST_PORT_SANDBOX` for a SANDBOX account, which runs against its own servers
+ *    apart from the live pool;
+ *  - `TACHYON_HOST_PORT_ROLLOUT` for a caller on a build in {@link tachyonRolloutGameBuilds}
+ *    — by default the build under staged rollout, which `auth` only lets Discord supporters
+ *    sign in on and which gets its own voice servers while it rolls out;
+ *    `TACHYON_ROLLOUT_GAME_VERSIONS` keeps a build there after the gate opens. Sessions are
+ *    already split by build ({@link callerGameVersion}), so a rollout instance's players
+ *    are all on that build and all land here together;
+ *  - `TACHYON_HOST_PORT`, the live pool, for everyone else.
+ *
+ * Sandbox wins when both apply: a sandbox account on the rollout build is still a sandbox
+ * account. Either special pool left unset falls back to the live one, so an operator who
+ * runs no sandbox or rollout servers doesn't leave those callers without voice.
+ */
+function tachyonPoolFor(env: Env, caller: TachyonCaller): TachyonServer[] {
 	const sandbox = varOr(env.TACHYON_HOST_PORT_SANDBOX, '')
-	return isSandbox && sandbox.trim() !== ''
-		? tachyonPool(sandbox, SANDBOX_TACHYON_SERVER_ID_PREFIX)
-		: tachyonPool(varOr(env.TACHYON_HOST_PORT, ''))
+	if (caller.isSandbox && sandbox.trim() !== '') {
+		return tachyonPool(sandbox, SANDBOX_TACHYON_SERVER_ID_PREFIX)
+	}
+	const rollout = varOr(env.TACHYON_HOST_PORT_ROLLOUT, '')
+	if (!caller.isSandbox && caller.isRollout && rollout.trim() !== '') {
+		return tachyonPool(rollout, ROLLOUT_TACHYON_SERVER_ID_PREFIX)
+	}
+	return tachyonPool(varOr(env.TACHYON_HOST_PORT, ''))
 }
 
 /**
@@ -362,16 +407,18 @@ async function callerVersion(c: Context<App>): Promise<string | null> {
 }
 
 /**
- * The build to matchmake the caller as — {@link callerVersion} with the server's own
- * `GAME_VERSION` standing in when the token doesn't say (the same fallback presence
- * uses, so a player's instance and their reported build agree).
+ * The BUILD to matchmake the caller as — {@link callerVersion} reduced to its date
+ * ({@link gameBuild}: `20250718.01` → `20250718`), with the server's own `GAME_VERSION`
+ * standing in when the token doesn't say (the same fallback presence uses, so a player's
+ * instance and their reported build agree). A point release is the same build: a
+ * `20250718.2` client lands in the `20250718` session, beside the `.01` who opened it.
  *
  * Unlike presence, this can never be left unset: it is the key an instance is created
  * under and searched by, and an empty one would pool every unknown-build player into a
  * shared "" bucket — exactly the mixed session the stamp exists to prevent.
  */
 async function callerGameVersion(c: Context<App>): Promise<string> {
-	return (await callerVersion(c)) ?? GAME_VERSION
+	return gameBuild(await callerVersion(c)) ?? GAME_VERSION
 }
 
 /**
@@ -476,6 +523,30 @@ async function readAvoidJuniorsBody(c: Context<App>): Promise<boolean | undefine
 	return key === undefined ? undefined : parseSettingBool((body as Record<string, unknown>)[key])
 }
 
+/**
+ * A non-negative integer the client posted under `field` — the shape of every presence
+ * status setter (`PUT /player/statusvisibility`, `PUT /player/vrmovementmode`). The
+ * client sends a form (`statusVisibility=2`); a query string, a JSON object keyed either
+ * way (`statusVisibility`/`StatusVisibility`), and a bare JSON number are accepted too.
+ * `NaN` when nothing readable was posted, so the caller can leave the row alone.
+ */
+async function readPostedInt(c: Context<App>, field: string): Promise<number> {
+	const body: unknown = c.req.header('content-type')?.includes('application/json')
+		? await c.req.json().catch(() => null)
+		: await c.req.parseBody().catch(() => null)
+	const pascal = field[0].toUpperCase() + field.slice(1)
+	const value =
+		c.req.query(field) ??
+		(body && typeof body === 'object'
+			? ((body as Record<string, unknown>)[field] ?? (body as Record<string, unknown>)[pascal])
+			: body)
+	return typeof value === 'number'
+		? value
+		: typeof value === 'string' && /^\d+$/.test(value)
+			? Number(value)
+			: NaN
+}
+
 /** A synthesized room instance (same shape for dorm and other rooms). */
 type RoomInstance = ReturnType<typeof roomInstanceFromRoom>
 
@@ -538,8 +609,8 @@ function redactInstanceForPresence(instance: RoomInstance) {
 /**
  * The SubscriptionUpdatePresence message a friend receives when the player changes rooms:
  * a presence snapshot of who, and the redacted instance they're now in (null when in no
- * room → `isOnline` false). `statusVisibility` is forced to 0 (Everyone) so the player
- * isn't hidden from friends. `appVersion` is the subject's own build (from their presence
+ * room → `isOnline` false). `statusVisibility` follows the saved preference so clients
+ * apply their native visibility rules. `appVersion` is the subject's own build (from their presence
  * row) and MUST be a string — the client's presence DTO reads it with a string reader, and
  * a numeric value aborts the whole SignalR frame ("expected String Begin Token"), dropping
  * the room/presence update.
@@ -547,11 +618,12 @@ function redactInstanceForPresence(instance: RoomInstance) {
 function presenceUpdateMessage(
 	playerId: number,
 	instance: RoomInstance | null,
-	appVersion?: string | null
+	appVersion?: string | null,
+	statusVisibility = 0
 ) {
 	return {
 		playerId,
-		statusVisibility: 0,
+		statusVisibility,
 		deviceClass: 0,
 		vrMovementMode: 0,
 		roomInstance: instance ? redactInstanceForPresence(instance) : null,
@@ -565,22 +637,30 @@ function presenceUpdateMessage(
 
 /**
  * Push a SubscriptionUpdatePresence to every online friend of `playerId` after their
- * presence changes (they entered a room). Mirrors the reference's PlayerPresenceChanged:
- * only currently-connected friends receive it (an offline friend gets nothing, not a
- * queued stale frame), so it's an ephemeral batch send. The room instance the friends
- * see is read from the player's stored presence — the authoritative record just written,
- * the same one the heartbeat replays. Best-effort: a hub or lookup failure is logged and
- * swallowed, so it never fails the matchmake that triggered it.
+ * presence changes (they entered a room, logged out, or lapsed). Mirrors the reference's
+ * PlayerPresenceChanged: only currently-connected friends receive it (an offline friend
+ * gets nothing, not a queued stale frame), so it's an ephemeral batch send. The room
+ * instance the friends see is read from the player's stored presence — the authoritative
+ * record just written, the same one the heartbeat replays; with the row gone (logout, or
+ * the cron sweep purging a lapsed row) the read is null and the frame is the offline
+ * snapshot (roomInstance null, isOnline false). Takes `Env` rather than a request context
+ * so the sweep, which has no request, sends the same frame. Best-effort: a hub or lookup
+ * failure is logged and swallowed, so it never fails the matchmake that triggered it.
  */
-async function notifyFriendsPresence(c: Context<App>, playerId: number): Promise<void> {
+async function notifyFriendsPresence(env: Env, playerId: number): Promise<void> {
 	try {
-		const friendIds = await getFriendIds(c.env.DB, playerId)
+		const friendIds = await getFriendIds(env.DB, playerId)
 		if (friendIds.length === 0) return
-		const presence = await getPresence<RoomInstance>(c.env.DB, playerId)
-		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+		const presence = await getPresence<RoomInstance>(env.DB, playerId)
+		await env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
 			friendIds,
 			NotificationType.SubscriptionUpdatePresence,
-			presenceUpdateMessage(playerId, presence?.roomInstance ?? null, presence?.appVersion)
+			presenceUpdateMessage(
+				playerId,
+				presence?.roomInstance ?? null,
+				presence?.appVersion,
+				presence?.statusVisibility
+			)
 		)
 	} catch (err) {
 		logger.error('failed to push SubscriptionUpdatePresence to friends', {
@@ -625,10 +705,11 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	// player landed in, and a matchmake is the only way into a room, so this is the one
 	// place a visit can be recorded once — whether they got here by room id, by subroom,
 	// by following a friend, from a club's clubhouse, or into their own dorm. Bumps the
-	// room's `visits` column, which is served as `Stats.VisitCount`. Best-effort: a
-	// counter is not worth failing the matchmake over.
+	// room's `visits` column, which is served as `Stats.VisitCount`, and stamps the
+	// player's `interaction.last_visited_at`, which puts the room on their visited
+	// history (dorms excepted). Best-effort: neither is worth failing the matchmake over.
 	try {
-		await recordRoomVisit(c.env.DB, roomInstance.roomId)
+		await recordRoomVisit(c.env.DB, roomInstance.roomId, id)
 	} catch (err) {
 		logger.error('failed to record room visit', {
 			roomId: roomInstance.roomId,
@@ -649,7 +730,7 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	// The player's presence changed — tell their online friends where they went, reading
 	// the instance back from the presence we just stored. Best-effort; never blocks or
 	// fails the matchmake.
-	await notifyFriendsPresence(c, id)
+	await notifyFriendsPresence(c.env, id)
 }
 
 /** Returned when a room isn't in the DB — and for every other opaque refusal. */
@@ -677,16 +758,20 @@ const BANNED_FROM_ROOM = MatchmakingErrorCode.BannedFromRoom
  * `UpdateRequired`, the one code that says "your client can't go there" and the honest
  * answer. There is no code for the other direction ("they must update"), so a caller on
  * the newer build gets the opaque NoSuchRoom every other unjoinable thing answers.
- * Builds are date-stamped (`20230414`, `20250718.01`), so they order as strings; an
- * instance carrying no version at all (written before the stamp existed) is nobody's
+ * Both sides are compared as BUILDS ({@link gameBuild}) — either may arrive as a full
+ * client version (a presence row's `appVersion` is verbatim) and a point release is the
+ * same build. Builds are date-stamped (`20230414`, `20250718`), so they order as strings;
+ * an instance carrying no version at all (written before the stamp existed) is nobody's
  * build and refuses both ways.
  */
 function crossBuildRefusal(
 	callerVersion: string,
 	instanceVersion: string
 ): MatchmakingErrorCode | null {
-	if (callerVersion === instanceVersion) return null
-	return instanceVersion > callerVersion ? MatchmakingErrorCode.UpdateRequired : NO_SUCH_ROOM
+	const caller = gameBuild(callerVersion) ?? ''
+	const instance = gameBuild(instanceVersion) ?? ''
+	if (caller === instance) return null
+	return instance > caller ? MatchmakingErrorCode.UpdateRequired : NO_SUCH_ROOM
 }
 
 /**
@@ -820,12 +905,12 @@ function nextLiveMessageId(): number {
 const GAME_INVITE_V2_MIN_BUILD = 20230414
 
 /**
- * The date portion of a client build (`20250718.01` → `20250718`) as a number, or null when
- * there's nothing parseable to compare. Builds are `<yyyymmdd>[.<n>]`, so the leading date
- * orders them; the point release after it never decides this gate.
+ * A client build ({@link gameBuild}: `20250718.01` → `20250718`) as a number, or null when
+ * there's nothing parseable to compare. The leading date orders builds; the point release
+ * after it never decides a gate.
  */
 function buildNumber(version: string | null): number | null {
-	const date = Number.parseInt(version?.split('.')[0] ?? '', 10)
+	const date = Number.parseInt(gameBuild(version) ?? '', 10)
 	return Number.isNaN(date) ? null : date
 }
 
@@ -1004,7 +1089,8 @@ function roomInstanceFromRoom(
 	isPrivate: boolean,
 	instanceId: number,
 	photonRoomId: string,
-	subRoomId?: number
+	subRoomId?: number,
+	eventId = 0
 ) {
 	const f = instanceFieldsFromRoom(room, subRoomId)
 	// The same region the connection info names its Photon apps for — see photonApps.
@@ -1016,7 +1102,7 @@ function roomInstanceFromRoom(
 		roomInstanceType: f.roomInstanceType,
 		location: f.location,
 		dataBlob: f.dataBlob,
-		eventId: 0,
+		eventId,
 		clubId: 0,
 		roomCode: '',
 		photonRegion: region,
@@ -1452,7 +1538,8 @@ async function resolveRoomInstance(
 	isPrivate: boolean,
 	ownerId: number,
 	requestedSubRoomId?: number,
-	gateOnAccessibility = false
+	gateOnAccessibility = false,
+	eventId = 0
 ): Promise<ResolvedInstance> {
 	const id = Number.parseInt(roomKey, 10)
 	const requested = Number.isNaN(id)
@@ -1529,16 +1616,21 @@ async function resolveRoomInstance(
 	const currentInstanceId = reusesInstance
 		? (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
 		: undefined
-	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
-	// the search below and is stamped on the instance when one is created, which is what
-	// keeps a session to a single client version.
-	const gameVersion = tokenVersion ?? GAME_VERSION
+	// The same BUILD (the date, with the client's point release dropped), with GAME_VERSION
+	// standing in for a token that names none. It scopes the search below and is stamped on
+	// the instance when one is created, which is what keeps a session to a single client
+	// build — and lets every point release of that build share it.
+	const gameVersion = gameBuild(tokenVersion) ?? GAME_VERSION
 	// Reuse an existing joinable instance *of the same subroom and the same build* —
 	// subrooms are separate places, so joining one must never land you in another, and
 	// neither must a session running a different version of the room. A published room
 	// reuses a public instance; an unpublished one reuses its single private session.
 	// A private matchmake into a published room always gets a fresh instance. Create
 	// one when there's nothing to join.
+	//
+	// An event's sessions are its own: an event matchmake reuses only an instance stamped
+	// with that event (and stamps the one it creates), and a room matchmake — `eventId` 0
+	// — never reuses an event's.
 	let instance = unpublished
 		? await getSharedPrivateInstance(
 				c.env.DB,
@@ -1549,7 +1641,14 @@ async function resolveRoomInstance(
 			)
 		: privateInstance
 			? null
-			: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
+			: await getJoinableInstance(
+					c.env.DB,
+					f.roomId,
+					gameVersion,
+					f.subRoomId,
+					currentInstanceId,
+					eventId
+				)
 	if (!instance) {
 		instance = await createRoomInstance(c.env.DB, {
 			ownerAccountId: ownerId,
@@ -1563,6 +1662,7 @@ async function resolveRoomInstance(
 			isPrivate: privateInstance || f.isDorm,
 			roomInstanceType: f.roomInstanceType,
 			gameVersion,
+			eventId,
 		})
 	}
 	return {
@@ -1572,7 +1672,8 @@ async function resolveRoomInstance(
 			privateInstance,
 			instance.roomInstanceId,
 			instance.photonRoomId,
-			f.subRoomId
+			f.subRoomId,
+			instance.eventId
 		),
 		errorCode: MatchmakingErrorCode.Success,
 	}
@@ -1822,6 +1923,23 @@ const app = new Hono<App>()
 		(c) => c.json({ errorCode: 0 })
 	)
 
+	// The client asks whether its `LoginLock` still holds the session. Nothing enforces the
+	// lock yet (see exclusivelogin), so every lock verifies: a bare 200, no body.
+	.post(
+		'/player/verifylock',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'Verify the session login lock (no-op)',
+			description: [
+				'Asks whether the session `LoginLock` is still the live one. Login locking is not',
+				'enforced, so this always acks. Empty ack — there is no response shape.',
+			].join(' '),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID'),
+			responses: { 200: EMPTY_OK },
+		}),
+		(c) => c.body(null, 200)
+	)
+
 	// Logout clears the player's presence so they read offline immediately and the
 	// instance they were in frees up (rather than waiting out the presence TTL).
 	//
@@ -1859,7 +1977,7 @@ const app = new Hono<App>()
 					// Their presence changed — tell online friends they went offline. Presence
 					// is already cleared, so notifyFriendsPresence reads null and sends the
 					// offline snapshot (roomInstance null, isOnline false).
-					await notifyFriendsPresence(c, id)
+					await notifyFriendsPresence(c.env, id)
 				}
 			}
 			return c.body(null, 200)
@@ -2073,15 +2191,72 @@ const app = new Hono<App>()
 		async (c) => {
 			const id = await authedId(c)
 			if (id !== null) {
-				const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
-				const sv =
-					typeof body.statusVisibility === 'string'
-						? Number.parseInt(body.statusVisibility, 10)
-						: NaN
+				const sv = await readPostedInt(c, 'statusVisibility')
 				const presence = await getPresence<RoomInstance>(c.env.DB, id)
-				if (presence && !Number.isNaN(sv)) {
+				if (presence && Number.isInteger(sv) && sv >= 0 && sv <= 3) {
 					presence.statusVisibility = sv
 					await setPresence(c.env.DB, presence)
+					// The settings menu reads the cached own-player presence. A heartbeat
+					// response alone does not refresh it; publish the native hub update.
+					try {
+						await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+							[id],
+							NotificationType.SubscriptionUpdatePresence,
+							playerPayload(id, presence)
+						)
+					} catch (error) {
+						logger.error('failed to push own visibility update', {
+							playerId: id,
+							error: String(error),
+						})
+					}
+					await notifyFriendsPresence(c.env, id)
+				}
+			}
+			return c.body(null, 200)
+		}
+	)
+
+	// The player's VR locomotion mode. It is PRESENCE state, not a `playersettings` key:
+	// every presence payload already carries `vrMovementMode` (the reference keeps it on
+	// its player-state row beside `statusVisibility`), and matchmaking reads it to refuse a
+	// room whose owner doesn't support the mode (result 32). The 2026 client posts it here
+	// when the player changes locomotion: `vrMovementMode=1` is walk, 0 teleport. Friends aren't told — the
+	// field is blanked to 0 in the presence frame they get anyway.
+	.put(
+		'/player/vrmovementmode',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'Set VR movement mode',
+			description: [
+				'Updates the stored presence’s `vrMovementMode`, which the heartbeat and the',
+				'`/player` lookups then echo. No-op when the player has no live presence, the value',
+				'isn’t a non-negative integer, or the token is missing/invalid — always acks 200.',
+			].join(' '),
+			requestBody: form(VrMovementModeRequest, 'The vrMovementMode value'),
+			responses: { 200: EMPTY_OK },
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id !== null) {
+				const mode = await readPostedInt(c, 'vrMovementMode')
+				const presence = await getPresence<RoomInstance>(c.env.DB, id)
+				if (presence && Number.isInteger(mode) && mode >= 0 && presence.vrMovementMode !== mode) {
+					presence.vrMovementMode = mode
+					await setPresence(c.env.DB, presence)
+					// Refresh the client's cached own-player presence, as statusvisibility does.
+					try {
+						await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+							[id],
+							NotificationType.SubscriptionUpdatePresence,
+							playerPayload(id, presence)
+						)
+					} catch (error) {
+						logger.error('failed to push own movement mode update', {
+							playerId: id,
+							error: String(error),
+						})
+					}
 				}
 			}
 			return c.body(null, 200)
@@ -2287,12 +2462,16 @@ const app = new Hono<App>()
 			}
 
 			const { joinMode, additionalPlayerIds } = await readMatchmakeBody(c)
+			// The event id scopes the session: the caller joins an instance already stamped
+			// with this event, or opens one that is — never the room's ordinary instances.
 			const { instance, errorCode } = await resolveRoomInstance(
 				c,
 				String(event.RoomId),
 				joinMode === 2,
 				id,
-				event.SubRoomId ?? undefined
+				event.SubRoomId ?? undefined,
+				false,
+				eventId
 			)
 			if (!instance) return matchmakeResult(c, errorCode, null)
 			await enterRoom(c, id, instance)
@@ -2820,7 +2999,8 @@ const app = new Hono<App>()
 				stored.isPrivate,
 				stored.roomInstanceId,
 				stored.photonRoomId,
-				stored.subRoomId
+				stored.subRoomId,
+				stored.eventId
 			)
 			await enterRoom(c, id, instance)
 			return matchmakeResult(c, 0, instance)
@@ -3052,8 +3232,13 @@ const app = new Hono<App>()
 				'`TACHYON_HOST_PORT` pool, chosen by instance id so every player in a session is',
 				'handed the same one, with a generated `voiceServerId` (`tachyon-1`, `tachyon-2`,',
 				'…). Both are empty when the pool is unset or the caller is in no instance. A',
-				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the same way,',
-				'with ids `dev-1`, `dev-2`, ….',
+				'sandbox account is picked out of the `TACHYON_HOST_PORT_SANDBOX` pool instead, the',
+				'same way, with ids `dev-1`, `dev-2`, …; a caller whose token’s `rn.ver` is a build',
+				'under staged rollout (`ROLLOUT_GAME_VERSIONS`, by default `20260323`; or whatever',
+				'`TACHYON_ROLLOUT_GAME_VERSIONS` names instead, so a build can keep its own voice',
+				'servers after its rollout ends) out of `TACHYON_HOST_PORT_ROLLOUT`, with ids',
+				'`rollout-1`, `rollout-2`, …. Sandbox wins when',
+				'both apply, and either special pool left unset falls back to the live one.',
 				'`experiments` carries the client’s networking flags.',
 			].join(' '),
 			security: AUTHED,
@@ -3094,9 +3279,13 @@ const app = new Hono<App>()
 			}
 			const account = await getAccount(c.env.DB, id)
 			// The instance's server, the same one every other player in it is handed — except
-			// that a SANDBOX account is picked out of the sandbox pool instead of the live one.
+			// that a SANDBOX account is picked out of the sandbox pool, and a caller on a
+			// rollout-pool build out of the rollout pool, instead of the live one.
 			const tachyon = tachyonServerFor(
-				tachyonPoolFor(c.env, account?.isSandbox === true),
+				tachyonPoolFor(c.env, {
+					isSandbox: account?.isSandbox === true,
+					isRollout: isRolloutGameVersion(await callerVersion(c), tachyonRolloutGameBuilds(c.env)),
+				}),
 				roomInstanceId
 			)
 
@@ -3506,13 +3695,25 @@ const app = new Hono<App>()
  * running after the purge above: this order is what makes a lapsed row count as a
  * departure. Fullness is recomputed last, so it works from the final head-count and
  * skips (returns null for) the instances just deleted.
+ *
+ * A lapsed row is also the player going offline, exactly as a logout is — the client just
+ * never got to post one (it crashed, or lost its connection). So the sweep tells each
+ * lapsed player's online friends what `POST /player/logout` would have: the offline
+ * SubscriptionUpdatePresence. Without it a crashed player's friends kept seeing them
+ * online until their own client re-read the friends list. The account ids are read
+ * before the purge (the rows are what remembers who lapsed) and the frames sent after
+ * it, so `notifyFriendsPresence` reads no presence and sends the offline snapshot.
  */
 async function sweepExpiredPresence(env: Env): Promise<void> {
 	const staleInstanceIds = await getExpiredPresenceInstanceIds(env.DB)
+	const lapsedPlayerIds = await getExpiredPresenceAccountIds(env.DB)
 	const removed = await deleteExpiredPresence(env.DB)
 	const emptyInstanceIds = await deleteEmptyRoomInstances(env.DB)
 	for (const instanceId of staleInstanceIds) {
 		await refreshInstanceFullness(env.DB, instanceId)
+	}
+	for (const playerId of lapsedPlayerIds) {
+		await notifyFriendsPresence(env, playerId)
 	}
 	// Sample the player count into `stat` — taken after the purge, so it's the live
 	// rows and not the ones that just lapsed. One row per cron run: the `online` series.

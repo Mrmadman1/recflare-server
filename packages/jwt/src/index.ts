@@ -1,9 +1,13 @@
 export {
 	validateAndGetAccountId,
+	validateAndGetBuild,
 	validateAndGetPlus,
 	validateAndGetRoles,
 	validateAndGetVersion,
 	generateToken,
+	generateStudioBuildValidationToken,
+	validateStudioBuildValidationToken,
+	studioBuildValidationId,
 	generatePhotonAuthToken,
 	TOKEN_TTL_SECONDS,
 } from './jwt'

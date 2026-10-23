@@ -14,12 +14,16 @@ import {
 	getPasswordHash,
 	getRoomById,
 	hashPassword,
+	isRolloutGameVersion,
+	isSupportedGameVersion,
+	rolloutGameBuilds,
 	RoomInstanceType,
 	setLastLoginTime,
 	setLoginContext,
 	setPasswordHash,
 	setPresence,
 	subRoomDataBlob,
+	supportedGameBuilds,
 	updateAccount,
 	verifyPassword,
 	writeAuditLog,
@@ -62,6 +66,7 @@ import {
 } from './openapi'
 import {
 	countAccountsForPlatformIdentity,
+	getLinksForAccount,
 	getLinksForPlatformId,
 	getLinksForPlatformIdentity,
 	isPlatformIdentityLinked,
@@ -172,6 +177,75 @@ const DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID = 3
 const DEFAULT_PASSWORD_SIGNUP = false
 const PASSWORD_SIGNUP_DISABLED_DESCRIPTION = 'password signup is disabled'
 
+/**
+ * The build gates on `/connect/token`, both keyed on the grant's posted `ver` and both
+ * driven by the operator's game-version vars (`SUPPORTED_GAME_VERSIONS`,
+ * `ROLLOUT_GAME_VERSIONS` — see context.ts and `supportedGameBuilds`/`rolloutGameBuilds`
+ * in @repo/domain, which `api` and `match` read the same way). A grant posting no `ver`
+ * (a refresh, the website) is untouched by either.
+ *
+ * 1. The SUPPORT gate: a build outside `supportedGameBuilds` is refused as `invalid_grant`
+ *    with UNSUPPORTED_BUILD_DESCRIPTION, for every grant and every account — staff
+ *    included. `api`'s `/api/versioncheck/v4` tells the same builds to update; this is what
+ *    makes the update prompt stick, since a client that got a token anyway would play on.
+ *    Dropping a build from the list is how its players are made to upgrade.
+ * 2. The ROLLOUT gate: a build under staged rollout is refused unless the account is STAFF
+ *    (developer or moderator) or its Discord link holds a role named in
+ *    `DISCORD_ROLLOUT_ROLE_IDS` (see `accountMayUseRolloutBuild`), as `invalid_grant` with
+ *    ROLLOUT_GATED_DESCRIPTION. `create_account` is refused before anything is minted: a
+ *    brand-new account has no Discord link to hold a role, so the player makes their
+ *    account on a released build, links Discord on the website, and comes back. Ending the
+ *    rollout (`ROLLOUT_GAME_VERSIONS=off`) opens the build to everyone.
+ *
+ * `ver` is client-reported and unverified, like everything else about the build. That is
+ * fine for what these are: rollout and upgrade gates, not a security boundary. A player
+ * who lies about their build gets a token the surfaces of the build they claim would have
+ * handed them anyway, and then runs a client the server isn't answering for.
+ */
+const ROLLOUT_GATED_DESCRIPTION =
+	'this build is limited to Discord supporters; link your Discord on the website first'
+const UNSUPPORTED_BUILD_DESCRIPTION =
+	'this game version is not supported by this server; update your game'
+
+/**
+ * `DISCORD_ROLLOUT_ROLE_IDS` as a list of role ids: snowflakes separated by commas and/or
+ * whitespace (the same grammar `www`'s parseRoleIds reads DISCORD_BENEFITS_ROLE_IDS with).
+ * Unset or blank parses to an empty list, which `accountMayUseRolloutBuild` treats as a
+ * gate closed to everyone but staff.
+ */
+function rolloutRoleIds(raw: string | undefined): string[] {
+	return (raw ?? '')
+		.split(/[\s,]+/)
+		.map((id) => id.trim())
+		.filter((id) => id !== '')
+}
+
+/**
+ * Whether an account may sign in on a rollout-gated build. STAFF — a developer or moderator
+ * flag on the account, the same two `staff_login` audits — always may, configured roles or
+ * not: they are who tests a build before it reaches supporters, so a closed gate stays open
+ * to them. Anyone else needs a Discord link (platform 101, written by the website's benefits
+ * claim and refreshed by `www`'s daily sweep) recording at least one of the configured
+ * roles. The roles are a SNAPSHOT (see PlatformLink.roles), so a role granted in Discord
+ * today opens the gate once the player re-claims or the sweep runs — not instantly.
+ *
+ * An empty role list skips the link read: with no supporter role named, nobody is a
+ * supporter.
+ */
+async function accountMayUseRolloutBuild(
+	db: D1Database,
+	accountId: number,
+	roleIds: readonly string[]
+): Promise<boolean> {
+	const account = await getAccount(db, accountId)
+	if (account && (holdsRole(account, 'developer') || holdsRole(account, 'moderator'))) return true
+	if (roleIds.length === 0) return false
+	const links = await getLinksForAccount(db, accountId)
+	return links.some(
+		(link) => link.platform === PlatformType.Discord && link.roles.some((r) => roleIds.includes(r))
+	)
+}
+
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
 const ORIENTATION_ROOM_ID = 13
 /**
@@ -242,7 +316,9 @@ async function authedId(c: Context<App>): Promise<number | null> {
 }
 
 /** Whether one account row holds a role. Absent/false both mean no role. */
-function holdsRole(account: Account, role: 'developer' | 'moderator'): boolean {
+function holdsRole(account: Account, role: 'developer' | 'moderator' | 'screenshare'): boolean {
+	// Matches accountTokenRoles: screenshare is a feature gate on every account token.
+	if (role === 'screenshare') return true
 	return (role === 'developer' ? account.isDeveloper : account.isModerator) === true
 }
 
@@ -252,7 +328,11 @@ function holdsRole(account: Account, role: 'developer' | 'moderator'): boolean {
  * mirroring the reference API. An id that is not a number is answered as unknown (404) rather
  * than as a 400: `/role/developer/nonsense` is just an id that matches nothing.
  */
-async function roleAnswer(c: Context<App>, role: 'developer' | 'moderator', id: string) {
+async function roleAnswer(
+	c: Context<App>,
+	role: 'developer' | 'moderator' | 'screenshare',
+	id: string
+) {
 	logger.info(`${role} role lookup`, { id })
 	const accountId = Number.parseInt(id, 10)
 	const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
@@ -295,11 +375,16 @@ async function roleFilterAnswer(c: Context<App>, role: 'developer' | 'moderator'
  *
  * `betastudio` rides on the account's `hasStudio` flag, and developer does not imply it.
  * RecFlare Studio treats that exact claim as Full access, which is what lets the editor
- * upload; staff set the flag from the website. Order is stable so tokens are
- * deterministic: screenshare, developer, moderator, junior, then betastudio.
+ * upload; staff set the flag from the website. `influencer` rides on `isInfluencer`
+ * (`runx admin grant-influencer`) and lives only in the token — no `/role/*` lookup
+ * answers it. Order is stable so tokens are deterministic: screenshare, developer,
+ * moderator, junior, betastudio, then influencer.
  */
 function accountRoles(
-	account: Pick<Account, 'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio'> | null
+	account: Pick<
+		Account,
+		'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio' | 'isInfluencer'
+	> | null
 ): string[] {
 	const roles = ['screenshare']
 	if (!account) return roles
@@ -307,6 +392,7 @@ function accountRoles(
 	if (account.isModerator) roles.push('moderator')
 	if (account.isJunior) roles.push('junior')
 	if (account.hasStudio) roles.push('betastudio')
+	if (account.isInfluencer) roles.push('influencer')
 	return roles
 }
 
@@ -913,6 +999,23 @@ const app = new Hono<App>()
 				'refused BEFORE it mints anything: making a NEW account to evade with is a different',
 				'act from signing into one. The description is deliberately vague — the signup',
 				'refused may belong to a housemate of the banned player rather than to them.',
+				'',
+				'**Support gate.** A grant whose `ver` names a build this server does not serve —',
+				'outside the operator’s `SUPPORTED_GAME_VERSIONS` (default: the list in `@repo/domain`)',
+				'and not under rollout — is refused as `invalid_grant` "this game version is not',
+				'supported by this server; update your game", for every grant and every account.',
+				'`api`’s `/api/versioncheck/v4` flags the same builds, so dropping a build from the',
+				'list is how its players are made to upgrade. Grants posting no `ver` are untouched.',
+				'',
+				'**Rollout gate.** A grant whose `ver` names a build under staged rollout',
+				'(`ROLLOUT_GAME_VERSIONS`, by default `20260323` — every point release of it; `off` ends',
+				'the rollout and opens the build to everyone) is refused as `invalid_grant` "this build is limited to',
+				'Discord supporters" unless the account is staff (developer or moderator) or its',
+				'Discord link (made by the website’s benefits claim) holds one of the roles in the',
+				'operator’s `DISCORD_ROLLOUT_ROLE_IDS`. With none configured the gate is closed to',
+				'everyone but staff. `create_account` on such a',
+				'build is refused before it mints anything, since a new account has no Discord link.',
+				'Grants posting no `ver` (a refresh, the website) and every other build are untouched.',
 			].join('\n'),
 			requestBody: form(
 				TokenRequest,
@@ -992,9 +1095,9 @@ const app = new Hono<App>()
 			// The client's own build (`ver`, e.g. `20250718.01`), stamped into the token's
 			// `rn.ver` claim so everything downstream reports the build the player is ACTUALLY
 			// running rather than this server's GAME_VERSION — `match` reads it back off the
-			// token when it writes presence. Unverified like the device fields, and only ever
-			// echoed, never trusted for a decision (the version CHECK is `api`'s
-			// `/api/versioncheck/v4`, against its own list).
+			// token when it writes presence. Unverified like the device fields: echoed, and
+			// gated (below, and the rollout gate further down), but never trusted as a
+			// credential.
 			//
 			// A grant that posts none — a refresh, or a caller that isn't the game — leaves it
 			// undefined and generateToken falls back to GAME_VERSION. An empty string is
@@ -1007,6 +1110,23 @@ const app = new Hono<App>()
 			// Recorded as the immutable `signupIp` at creation and as `lastLoginIp` on every
 			// login; both feed the per-IP signup cap. Absent (empty) outside the CF edge.
 			const clientIp = c.req.header('cf-connecting-ip') ?? ''
+
+			// The support gate (see UNSUPPORTED_BUILD_DESCRIPTION): a posted build this server
+			// doesn't serve gets no token, whatever the grant and whoever the account. Decided
+			// before any credential is read — it depends on nothing but the operator's list, so
+			// there is nothing about an account to probe here, and a closed door costs no D1
+			// round trip. The same list `api`'s `/api/versioncheck/v4` flags for an update.
+			if (version !== undefined && !isSupportedGameVersion(version, supportedGameBuilds(c.env))) {
+				logger.info('token refused: game version is not supported', {
+					grantType,
+					version,
+					ip: clientIp,
+				})
+				return c.json(
+					{ error: 'invalid_grant', error_description: UNSUPPORTED_BUILD_DESCRIPTION },
+					400
+				)
+			}
 
 			// A platform-authenticated login proves who you are with the platform itself, and
 			// we can verify exactly two: Steam (0), from its Steam-signed platform_auth ticket,
@@ -1107,6 +1227,21 @@ const app = new Hono<App>()
 			//    via create_account or /account/me/changepassword.
 			let accountId: string
 			if (grantType === 'create_account') {
+				// A rollout-gated build can't sign UP: the account it would mint has no Discord
+				// link, so it could never hold the role the gate wants. Refused before anything
+				// is read or minted, like the switch below — no row left behind, no cap slot
+				// burned.
+				if (isRolloutGameVersion(version, rolloutGameBuilds(c.env))) {
+					logger.info('signup refused: build is limited to Discord supporters', {
+						version,
+						ip: clientIp,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
+
 				// The password-account path (no platform) is a switch, off by default: see
 				// DEFAULT_PASSWORD_SIGNUP. Checked first, before anything is read or minted —
 				// a closed door costs no D1 round trip and burns no cap slot.
@@ -1332,6 +1467,33 @@ const app = new Hono<App>()
 				}
 				await setLastLoginTime(c.env.DB, resolvedId, new Date().toISOString())
 				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
+			}
+
+			// The rollout gate: a build under staged rollout (`rolloutGameBuilds`) is for staff
+			// and Discord supporters only, so the account signing in on it must be staff or hold
+			// one of the configured roles.
+			// Deliberately AFTER the credential checks, like the ban lookup below — a wrong
+			// password on a gated build is still "invalid account_id or password", so the
+			// gate can't be used to probe whether an account exists. Unlike a ban, this IS a
+			// refusal: there is no block screen to reach, and the client surfaces the
+			// description on its sign-in failure.
+			if (isRolloutGameVersion(version, rolloutGameBuilds(c.env))) {
+				const roleIds = rolloutRoleIds(c.env.DISCORD_ROLLOUT_ROLE_IDS)
+				if (!(await accountMayUseRolloutBuild(c.env.DB, Number(accountId), roleIds))) {
+					logger.info('login refused: build is limited to Discord supporters', {
+						accountId,
+						grantType,
+						version,
+						// The COUNT, not the ids: zero here means the gate is closed because
+						// nothing is configured, which reads very differently from "not a
+						// supporter".
+						roleIdCount: roleIds.length,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
 			}
 
 			// EVERY account gets its token, banned or not — a ban of its own, or a link to
@@ -1587,6 +1749,11 @@ const app = new Hono<App>()
 	// Moderator's bulk form, kept in step with developer's above.
 	.get('/role/moderator', describeRoute(roleFilter('moderator')), (c) =>
 		roleFilterAnswer(c, 'moderator')
+	)
+
+	// Studio queries each room owner's screenshare role before validating video players.
+	.get('/role/screenshare/:id', describeRoute(roleLookup('screenshare')), (c) =>
+		roleAnswer(c, 'screenshare', c.req.param('id'))
 	)
 
 	// @guess Oculus nonce. The client asks for this before a Meta login; the exact shape

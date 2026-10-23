@@ -47,15 +47,30 @@
 <game-clients>
 Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 (`packages/domain/src/presence-db.ts`); `GAME_VERSION` is the default the stack targets.
+Those lists are DEFAULTS: the `SUPPORTED_GAME_VERSIONS` and `ROLLOUT_GAME_VERSIONS` worker
+vars (`RECFLARE_*` in `.env`, reaching every worker) override them — read through
+`supportedGameBuilds(env)` / `rolloutGameBuilds(env)`, never the constants, in anything
+that gates on "is this build served / under rollout" (`auth` tokens, `api` versioncheck,
+`match` rollout voice pool). A build outside the supported set is told to update by `api`
+AND refused a token by `auth`; a rollout build is always served, but gated to staff and
+Discord roles until `ROLLOUT_GAME_VERSIONS=off`. The rollout VOICE pool
+(`TACHYON_HOST_PORT_ROLLOUT`) follows that list by default but `TACHYON_ROLLOUT_GAME_VERSIONS`
+overrides it (`tachyonRolloutGameBuilds` in `match`), so a build can stay on its own Tachyon
+servers after its rollout ends.
 
 - `20230414` — default, official. Manifest `7859140924515540835` (2023).
-- `20250718.01` — beta, official. Manifest `1151455856673601091`; reaches this server via
-  the [patch-2025](https://github.com/recflare/patch-2025) patch.
-- `20250424.01`, `20231207`, `20230616` — alpha.
+- `20250718` — beta, official (the `20250718.01` client). Manifest `1151455856673601091`;
+  reaches this server via the [patch-2025](https://github.com/recflare/patch-2025) patch.
+- `20260323` (`20260323.14`), `20250424` (`20250424.01`), `20231207`, `20230616` — alpha.
 
-Builds are date-stamped (`YYYYMMDD[.NN]`) so they order as plain strings; several
-surfaces gate on "newer than `20230414`" (econ storefront catalog, `api` event tags,
-`rooms` featured rooms) rather than on an explicit list.
+A client reports `YYYYMMDD[.NN]`; the `.NN` is a same-day point release of the same build
+and decides nothing. `gameBuild` strips it, the lists above hold bare dates, every gate
+compares builds (`validateAndGetBuild` in `@repo/jwt` is the token form), and the
+`room_instance` key is stored as the build so `20250718.01` and `20250718.2` share a
+session. The token's `rn.ver` and presence's `appVersion` still echo the client's full
+version. Builds order as plain strings; several surfaces gate on "newer than `20230414`"
+(econ storefront catalog, `api` event tags, `rooms` featured rooms) rather than on an
+explicit list.
 </game-clients>
 
 <code-style>
@@ -100,8 +115,8 @@ inconsistency here without checking the client first.
 - The room save (`rooms`: `POST /subrooms/:sid/data`) is the ONE exception to that shape:
   `value` is `{ room, subRoomDataSave }`, and `error` is NULL rather than `""`. The
   `subRoomDataSave` is camelCase with a different field set from the PascalCase
-  `CurrentSave` embedded in the room (no persistence/OM/UGC versions, no moderation state,
-  no asset arrays; but `unityAsset`/`unityAssetHash`). Don't unify the two projections.
+  `CurrentSave` embedded in the room (no moderation state or asset arrays;
+  version fields are camelCase, alongside `unityAsset`/`unityAssetHash`). Keep the projections distinct.
 - A subroom's saved scene loads from `CurrentSave.DataBlob` (`rooms`: `GET /rooms/:id`),
   NOT the flat `DataBlob` on the subroom — a subroom with no `CurrentSave` silently loads
   nothing. The key must be present (null before the first publish); read it via
@@ -118,17 +133,21 @@ inconsistency here without checking the client first.
   `GET …/saves/:saveId` is the detail behind a list row, under the same gate, and a
   PASCALCASE row like the list serves — NOT the camelCase projection the room save's
   response uses (served that, the client showed a save with every value missing). It
-  differs from the list row only in how it names bundles: each `UnitySubAssets` entry is
-  `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle is lifted to top-level
+  differs from the list row only in how it names bundles: dependency entries in `UnitySubAssets`
+  are `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle appears only at top-level
   `UnityAsset`/`UnityAssetHash`, and there is no `Tags`. Three shapes of one save; keep
   them straight.
 - The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
-  auth-gated and readable by the room's creator, a CO-OWNER, or anyone whose live `presence`
-  row puts them in that room. They list unpublished staged saves, so they aren't public; but
-  a co-owner opens the save history from the room's settings without being in the room
-  (creator-only showed them the buttons and a list that 403'd), and a visitor resolves which
-  version an instance is running from this list, so managers-only locks them out of loading
-  the room. The presence grant expires with the presence row.
+  auth-gated and readable by the room's creator, a CO-OWNER, anyone whose live `presence`
+  row puts them in that room, or STAFF (a `developer`/`moderator` token). They list
+  unpublished staged saves, so they aren't public; but a co-owner opens the save history from
+  the room's settings without being in the room (creator-only showed them the buttons and a
+  list that 403'd), and a visitor resolves which version an instance is running from this
+  list, so managers-only locks them out of loading the room. The presence grant expires with
+  the presence row. The client reads `…/saves/no_unity_assets` BEFORE it matchmakes a private
+  instance, when the caller has no presence in the room yet, so presence alone cannot let a
+  non-owner create one: a developer creating a private instance of a room they hold no role
+  on was 403'd there until staff were let through.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the
@@ -283,6 +302,16 @@ inconsistency here without checking the client first.
   other implementations set it at all, it names the start of a voice-chat timeout. Other
   implementations with timed bans keep their set-time private and serve the remainder on
   every read; `banned_at` here is the staff panel's audit trail, not the client's.
+- `unity_asset` holds two kinds of bundle under one shape: Rec Room Studio builds (UGC, the
+  `studio` worker writes them, filenames `studio/<roomId>/…`) and FIRST-PARTY bundles captured
+  from the official game and loaded by hand (`unity/<roomId>/…`). Only the Studio ones may be
+  folded onto `CurrentSave.UnitySubAssets` (`rooms`: `GET /rooms/:id`, the save reads) —
+  `attachStudioUnityAssets` filters on `isStudioBundleFilename`. The 2025 client resolves a
+  first-party bundle through `POST /unity_assets/baked/bulk` (which serves both kinds); handed
+  it inline in the five-key `{ Target, Version, Filename, Hash }` shape it takes that instead,
+  cannot name the file (its decoder wants `UnityAsset`/`UnityAssetHash`), and the room loads
+  nothing. Every imported first-party room broke when the splice moved from the Studio-only
+  table to `unity_asset`, with every response looking correct.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members
